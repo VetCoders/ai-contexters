@@ -1,0 +1,27 @@
+[package]
+name = "agent-memory"
+version = "0.1.0"
+edition = "2024"
+description = "Extract timeline and memory from AI agent sessions (Claude Code, Codex, Gemini)"
+authors = ["Maciej Gad <void@div0.space>", "Klaudiusz <the1st@whoai.am>"]
+license = "MIT"
+repository = "https://github.com/VetCoders/ai-contexters"
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+regex = "1"
+
+[[bin]]
+name = "agent-memory"
+path = "src/main.rs"
+
+[profile.release]
+lto = true
+strip = true
