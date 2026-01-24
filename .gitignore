@@ -1,3 +1,6 @@
 /target
 Cargo.lock
 /.loctree
+
+# agents
+agents/state/

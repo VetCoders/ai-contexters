@@ -1,6 +1,6 @@
 [package]
 name = "ai-contexters"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Extract timeline and memory from AI agent sessions (Claude Code, Codex, Gemini)"
 authors = ["Maciej Gad <void@div0.space>", "Klaudiusz <the1st@whoai.am>"]

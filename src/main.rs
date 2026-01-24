@@ -3,19 +3,23 @@
 //! Extracts timeline and decisions from AI agent session files:
 //! - Claude Code: ~/.claude/projects/*/*.jsonl
 //! - Codex: ~/.codex/history.jsonl
+//! - Gemini: ~/.gemini/tmp/<hash>/chats/session-*.json
 //!
-//! Output: Markdown timeline + JSON queryable format
+//! Features: incremental extraction, deduplication, rotation, append mode.
 //!
 //! Created by M&K (c)2026 VetCoders
 
-use anyhow::{Context, Result};
-use chrono::{DateTime, TimeZone, Utc};
+use anyhow::Result;
+use chrono::Utc;
 use clap::{Parser, Subcommand};
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+
+use ai_contexters::chunker::{self, ChunkerConfig};
+use ai_contexters::memex::{self, MemexConfig};
+use ai_contexters::output::{self, OutputConfig, OutputFormat, OutputMode, ReportMetadata};
+use ai_contexters::sources::{self, ExtractionConfig};
+use ai_contexters::state::StateManager;
+use ai_contexters::store;
 
 /// AI Contexters - timeline and decisions from AI sessions
 #[derive(Parser)]
@@ -46,11 +50,39 @@ enum Commands {
         /// Output format: md, json, both
         #[arg(short, long, default_value = "both")]
         format: String,
+
+        /// Append to a single timeline file instead of creating new files
+        #[arg(long)]
+        append_to: Option<PathBuf>,
+
+        /// Keep only last N output files (0 = unlimited)
+        #[arg(long, default_value = "0")]
+        rotate: usize,
+
+        /// Use incremental mode (skip already-processed entries)
+        #[arg(long)]
+        incremental: bool,
+
+        /// Include assistant messages (can be large)
+        #[arg(long)]
+        include_assistant: bool,
+
+        /// Include loctree snapshot in output
+        #[arg(long)]
+        loctree: bool,
+
+        /// Project root for loctree snapshot (defaults to cwd)
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+
+        /// Also chunk and sync to memex after extraction
+        #[arg(long)]
+        memex: bool,
     },
 
     /// Extract timeline from Codex history
     Codex {
-        /// Project/repo filter in message text
+        /// Project/repo filter
         #[arg(short, long)]
         project: Option<String>,
 
@@ -65,9 +97,33 @@ enum Commands {
         /// Output format: md, json, both
         #[arg(short, long, default_value = "both")]
         format: String,
+
+        /// Append to a single timeline file
+        #[arg(long)]
+        append_to: Option<PathBuf>,
+
+        /// Keep only last N output files (0 = unlimited)
+        #[arg(long, default_value = "0")]
+        rotate: usize,
+
+        /// Use incremental mode
+        #[arg(long)]
+        incremental: bool,
+
+        /// Include loctree snapshot
+        #[arg(long)]
+        loctree: bool,
+
+        /// Project root for loctree snapshot
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+
+        /// Also chunk and sync to memex after extraction
+        #[arg(long)]
+        memex: bool,
     },
 
-    /// Extract from all agents (Claude + Codex)
+    /// Extract from all agents (Claude + Codex + Gemini)
     All {
         /// Project filter
         #[arg(short, long)]
@@ -80,75 +136,77 @@ enum Commands {
         /// Output directory
         #[arg(short, long, default_value = ".")]
         output: PathBuf,
+
+        /// Append to a single timeline file
+        #[arg(long)]
+        append_to: Option<PathBuf>,
+
+        /// Keep only last N output files (0 = unlimited)
+        #[arg(long, default_value = "0")]
+        rotate: usize,
+
+        /// Use incremental mode
+        #[arg(long)]
+        incremental: bool,
+
+        /// Include assistant messages
+        #[arg(long)]
+        include_assistant: bool,
+
+        /// Include loctree snapshot
+        #[arg(long)]
+        loctree: bool,
+
+        /// Project root for loctree snapshot
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+
+        /// Also chunk and sync to memex after extraction
+        #[arg(long)]
+        memex: bool,
+    },
+
+    /// Store contexts in central store (~/.ai-contexters/) and optionally sync to memex
+    Store {
+        /// Project name (required for store organization)
+        #[arg(short, long)]
+        project: Option<String>,
+
+        /// Agent filter: claude, codex, gemini (default: all)
+        #[arg(short, long)]
+        agent: Option<String>,
+
+        /// Hours to look back (default: 48)
+        #[arg(short = 'H', long, default_value = "48")]
+        hours: u64,
+
+        /// Include assistant messages
+        #[arg(long)]
+        include_assistant: bool,
+
+        /// Also chunk and sync to memex
+        #[arg(long)]
+        memex: bool,
+    },
+
+    /// Sync stored chunks to rmcp-memex vector memory
+    MemexSync {
+        /// Namespace in vector store
+        #[arg(short, long, default_value = "ai-contexts")]
+        namespace: String,
+
+        /// Use per-chunk upsert instead of batch index
+        #[arg(long)]
+        per_chunk: bool,
+
+        /// Override LanceDB path
+        #[arg(long)]
+        db_path: Option<PathBuf>,
     },
 
     /// List available projects/sessions
-    List {
-        /// Agent type: claude, codex, all
-        #[arg(short, long, default_value = "all")]
-        agent: String,
-    },
+    List,
 }
-
-// ============================================================================
-// Data structures
-// ============================================================================
-
-/// Unified timeline entry (works for both Claude and Codex)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct TimelineEntry {
-    timestamp: DateTime<Utc>,
-    agent: String,        // "claude" or "codex"
-    session_id: String,
-    role: String,         // "user" or "assistant"
-    message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    branch: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    cwd: Option<String>,
-}
-
-/// Claude Code JSONL entry
-#[derive(Debug, Deserialize)]
-struct ClaudeEntry {
-    #[serde(rename = "type")]
-    entry_type: String,
-    #[serde(default)]
-    message: Option<serde_json::Value>,
-    #[serde(default)]
-    timestamp: Option<String>,
-    #[serde(rename = "sessionId")]
-    #[serde(default)]
-    session_id: Option<String>,
-    #[serde(rename = "gitBranch")]
-    #[serde(default)]
-    git_branch: Option<String>,
-    #[serde(default)]
-    cwd: Option<String>,
-}
-
-/// Codex history JSONL entry
-#[derive(Debug, Deserialize)]
-struct CodexEntry {
-    session_id: String,
-    text: String,
-    ts: i64,
-}
-
-/// Extracted report
-#[derive(Debug, Serialize)]
-struct Report {
-    generated_at: DateTime<Utc>,
-    project_filter: Option<String>,
-    hours_back: u64,
-    total_entries: usize,
-    sessions: Vec<String>,
-    entries: Vec<TimelineEntry>,
-}
-
-// ============================================================================
-// Main
-// ============================================================================
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -161,453 +219,413 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Claude { project, hours, output, format } => {
-            extract_claude(project, hours, &output, &format)?;
+        Commands::Claude {
+            project, hours, output, format, append_to,
+            rotate, incremental, include_assistant, loctree, project_root, memex,
+        } => {
+            run_extraction(
+                &["claude"],
+                project, hours, &output, &format, append_to,
+                rotate, incremental, include_assistant, loctree, project_root, memex,
+            )?;
         }
-        Commands::Codex { project, hours, output, format } => {
-            extract_codex(project, hours, &output, &format)?;
+        Commands::Codex {
+            project, hours, output, format, append_to,
+            rotate, incremental, loctree, project_root, memex,
+        } => {
+            run_extraction(
+                &["codex"],
+                project, hours, &output, &format, append_to,
+                rotate, incremental, false, loctree, project_root, memex,
+            )?;
         }
-        Commands::All { project, hours, output } => {
-            extract_all(project, hours, &output)?;
+        Commands::All {
+            project, hours, output, append_to,
+            rotate, incremental, include_assistant, loctree, project_root, memex,
+        } => {
+            run_extraction(
+                &["claude", "codex", "gemini"],
+                project, hours, &output, "both", append_to,
+                rotate, incremental, include_assistant, loctree, project_root, memex,
+            )?;
         }
-        Commands::List { agent } => {
-            list_sessions(&agent)?;
+        Commands::Store {
+            project, agent, hours, include_assistant, memex,
+        } => {
+            run_store(project, agent, hours, include_assistant, memex)?;
+        }
+        Commands::MemexSync {
+            namespace, per_chunk, db_path,
+        } => {
+            run_memex_sync(&namespace, per_chunk, db_path)?;
+        }
+        Commands::List => {
+            let sources = sources::list_available_sources()?;
+            if sources.is_empty() {
+                println!("No AI agent session sources found.");
+            } else {
+                println!("=== Available Sources ===\n");
+                for info in &sources {
+                    let size_mb = info.size_bytes as f64 / 1024.0 / 1024.0;
+                    println!(
+                        "  [{:>7}] {} ({} sessions, {:.1} MB)",
+                        info.agent,
+                        info.path.display(),
+                        info.sessions,
+                        size_mb,
+                    );
+                }
+            }
         }
     }
 
     Ok(())
 }
 
-// ============================================================================
-// Claude Code extraction
-// ============================================================================
-
-fn extract_claude(
-    project_filter: Option<String>,
+#[allow(clippy::too_many_arguments)]
+fn run_extraction(
+    agents: &[&str],
+    project: Option<String>,
     hours: u64,
-    output: &Path,
+    output_dir: &Path,
     format: &str,
+    append_to: Option<PathBuf>,
+    rotate: usize,
+    incremental: bool,
+    include_assistant: bool,
+    include_loctree: bool,
+    project_root: Option<PathBuf>,
+    sync_memex: bool,
 ) -> Result<()> {
-    let claude_dir = dirs::home_dir()
-        .context("No home dir")?
-        .join(".claude")
-        .join("projects");
-
-    if !claude_dir.exists() {
-        anyhow::bail!("Claude projects dir not found: {}", claude_dir.display());
-    }
+    // Load state for incremental/dedup
+    let mut state = StateManager::load();
 
     let cutoff = Utc::now() - chrono::Duration::hours(hours as i64);
-    let mut entries: Vec<TimelineEntry> = Vec::new();
-    let mut sessions: Vec<String> = Vec::new();
 
-    // Find matching project directories
-    for dir_entry in fs::read_dir(&claude_dir)? {
-        let dir_entry = dir_entry?;
-        let dir_name = dir_entry.file_name().to_string_lossy().to_string();
+    // Determine watermark (incremental mode uses per-source watermark)
+    let watermark = if incremental {
+        let source_key = format!(
+            "{}:{}",
+            agents.join("+"),
+            project.as_deref().unwrap_or("all")
+        );
+        state.get_watermark(&source_key)
+    } else {
+        None
+    };
 
-        // Filter by project if specified
-        if let Some(ref filter) = project_filter
-            && !dir_name.to_lowercase().contains(&filter.to_lowercase())
-        {
-            continue;
-        }
+    let config = ExtractionConfig {
+        project_filter: project.clone(),
+        cutoff,
+        include_assistant,
+        watermark,
+    };
 
-        let project_dir = dir_entry.path();
-        if !project_dir.is_dir() {
-            continue;
-        }
+    // Extract from requested sources
+    let mut entries = Vec::new();
 
-        // Process all JSONL files in this project
-        for file_entry in fs::read_dir(&project_dir)? {
-            let file_entry = file_entry?;
-            let path = file_entry.path();
+    for &agent in agents {
+        let agent_entries = match agent {
+            "claude" => sources::extract_claude(&config)?,
+            "codex" => sources::extract_codex(&config)?,
+            "gemini" => sources::extract_gemini(&config)?,
+            _ => Vec::new(),
+        };
 
-            if path.extension().is_some_and(|e| e == "jsonl") {
-                let session_entries = parse_claude_jsonl(&path, cutoff)?;
-                if !session_entries.is_empty() {
-                    if let Some(first) = session_entries.first() {
-                        sessions.push(first.session_id.clone());
-                    }
-                    entries.extend(session_entries);
-                }
-            }
-        }
+        eprintln!("  [{}] {} entries", agent, agent_entries.len());
+        entries.extend(agent_entries);
+    }
+
+    // Dedup via state
+    let pre_dedup = entries.len();
+    entries.retain(|e| {
+        let hash = StateManager::content_hash(&e.agent, &e.session_id, e.timestamp.timestamp(), &e.message);
+        state.is_new(hash)
+    });
+
+    if pre_dedup != entries.len() {
+        eprintln!(
+            "  Dedup: {} → {} entries (skipped {} seen)",
+            pre_dedup,
+            entries.len(),
+            pre_dedup - entries.len(),
+        );
     }
 
     // Sort by timestamp
     entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+
+    // Convert sources::TimelineEntry → output::TimelineEntry
+    let output_entries: Vec<output::TimelineEntry> = entries
+        .iter()
+        .map(|e| output::TimelineEntry {
+            timestamp: e.timestamp,
+            agent: e.agent.clone(),
+            session_id: e.session_id.clone(),
+            role: e.role.clone(),
+            message: e.message.clone(),
+            branch: e.branch.clone(),
+            cwd: e.cwd.clone(),
+        })
+        .collect();
+
+    // Collect unique sessions
+    let mut sessions: Vec<String> = entries.iter().map(|e| e.session_id.clone()).collect();
     sessions.sort();
     sessions.dedup();
 
-    let report = Report {
+    let metadata = ReportMetadata {
         generated_at: Utc::now(),
-        project_filter,
+        project_filter: project.clone(),
         hours_back: hours,
-        total_entries: entries.len(),
-        sessions,
-        entries,
+        total_entries: output_entries.len(),
+        sessions: sessions.clone(),
     };
 
-    write_output(&report, output, "claude", format)?;
+    // Build output config
+    let out_format = match format {
+        "md" => OutputFormat::Markdown,
+        "json" => OutputFormat::Json,
+        _ => OutputFormat::Both,
+    };
+
+    let mode = if let Some(ref path) = append_to {
+        OutputMode::AppendTimeline(path.clone())
+    } else {
+        OutputMode::NewFile
+    };
+
+    let out_config = OutputConfig {
+        dir: output_dir.to_path_buf(),
+        format: out_format,
+        mode,
+        max_files: rotate,
+        max_message_chars: 0, // no truncation
+        include_loctree,
+        project_root,
+    };
+
+    // Write output
+    let written = output::write_report(&out_config, &output_entries, &metadata)?;
+
+    for path in &written {
+        eprintln!("  → {}", path.display());
+    }
+
+    // Rotation
+    if rotate > 0 {
+        let prefix = agents.join("_");
+        let deleted = output::rotate_outputs(output_dir, &prefix, rotate)?;
+        if deleted > 0 {
+            eprintln!("  Rotated: deleted {} old files", deleted);
+        }
+    }
+
+    // Update state
+    if !entries.is_empty() {
+        for e in &entries {
+            let hash = StateManager::content_hash(&e.agent, &e.session_id, e.timestamp.timestamp(), &e.message);
+            state.mark_seen(hash);
+        }
+
+        if incremental {
+            let source_key = format!(
+                "{}:{}",
+                agents.join("+"),
+                project.as_deref().unwrap_or("all")
+            );
+            if let Some(latest) = entries.last() {
+                state.update_watermark(&source_key, latest.timestamp);
+            }
+        }
+
+        state.record_run(entries.len(), agents.iter().map(|s| s.to_string()).collect());
+        state.prune_old_hashes(50_000);
+        state.save()?;
+    }
 
     eprintln!(
-        "✓ Extracted {} entries from {} sessions",
-        report.total_entries,
-        report.sessions.len()
+        "✓ {} entries from {} sessions ({})",
+        output_entries.len(),
+        sessions.len(),
+        agents.join("+"),
     );
+
+    // Memex sync: chunk entries and push to vector store
+    if sync_memex && !output_entries.is_empty() {
+        let proj_name = project.as_deref().unwrap_or("unknown");
+        let agent_name = agents.join("+");
+
+        let chunker_config = ChunkerConfig::default();
+        let chunks = chunker::chunk_entries(&output_entries, proj_name, &agent_name, &chunker_config);
+
+        if !chunks.is_empty() {
+            let chunks_dir = store::chunks_dir()?;
+            chunker::write_chunks_to_dir(&chunks, &chunks_dir)?;
+            eprintln!("  Chunked: {} chunks ({}) → {}", chunks.len(), chunker::chunk_summary(&chunks), chunks_dir.display());
+
+            let memex_config = MemexConfig::default();
+            match memex::sync_new_chunks(&chunks_dir, &memex_config) {
+                Ok(result) => {
+                    eprintln!(
+                        "  Memex: {} pushed, {} skipped",
+                        result.chunks_pushed, result.chunks_skipped,
+                    );
+                    for err in &result.errors {
+                        eprintln!("  Memex error: {}", err);
+                    }
+                }
+                Err(e) => eprintln!("  Memex sync failed: {}", e),
+            }
+        }
+    }
 
     Ok(())
 }
 
-fn parse_claude_jsonl(path: &Path, cutoff: DateTime<Utc>) -> Result<Vec<TimelineEntry>> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-    let mut entries = Vec::new();
-
-    for line in reader.lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let entry: ClaudeEntry = match serde_json::from_str(&line) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-
-        // Only process user/assistant messages
-        if entry.entry_type != "user" && entry.entry_type != "assistant" {
-            continue;
-        }
-
-        // Parse timestamp
-        let timestamp = match &entry.timestamp {
-            Some(ts) => {
-                DateTime::parse_from_rfc3339(ts)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now())
-            }
-            None => continue,
-        };
-
-        // Filter by cutoff
-        if timestamp < cutoff {
-            continue;
-        }
-
-        // Extract message text
-        let message = extract_message_text(&entry.message);
-        if message.is_empty() {
-            continue;
-        }
-
-        entries.push(TimelineEntry {
-            timestamp,
-            agent: "claude".to_string(),
-            session_id: entry.session_id.unwrap_or_default(),
-            role: entry.entry_type,
-            message,
-            branch: entry.git_branch,
-            cwd: entry.cwd,
-        });
-    }
-
-    Ok(entries)
-}
-
-fn extract_message_text(message: &Option<serde_json::Value>) -> String {
-    match message {
-        Some(serde_json::Value::String(s)) => s.clone(),
-        Some(serde_json::Value::Array(arr)) => {
-            // Claude messages can be array of content blocks
-            arr.iter()
-                .filter_map(|item| {
-                    if let Some(obj) = item.as_object()
-                        && obj.get("type").and_then(|t| t.as_str()) == Some("text")
-                    {
-                        return obj.get("text").and_then(|t| t.as_str()).map(String::from);
-                    }
-                    None
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        }
-        Some(serde_json::Value::Object(obj)) => {
-            // Message is object with "content" field (can be string or array)
-            if let Some(content) = obj.get("content") {
-                match content {
-                    serde_json::Value::String(s) => s.clone(),
-                    serde_json::Value::Array(arr) => {
-                        // Content is array of blocks (assistant messages)
-                        arr.iter()
-                            .filter_map(|item| {
-                                if let Some(block) = item.as_object()
-                                    && block.get("type").and_then(|t| t.as_str()) == Some("text")
-                                {
-                                    return block.get("text").and_then(|t| t.as_str()).map(String::from);
-                                }
-                                None
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    }
-                    _ => String::new(),
-                }
-            } else if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
-                text.to_string()
-            } else {
-                String::new()
-            }
-        }
-        _ => String::new(),
-    }
-}
-
-// ============================================================================
-// Codex extraction
-// ============================================================================
-
-fn extract_codex(
-    project_filter: Option<String>,
+/// Store extracted contexts in central store and optionally sync to memex.
+fn run_store(
+    project: Option<String>,
+    agent: Option<String>,
     hours: u64,
-    output: &Path,
-    format: &str,
+    include_assistant: bool,
+    sync_memex: bool,
 ) -> Result<()> {
-    let codex_path = dirs::home_dir()
-        .context("No home dir")?
-        .join(".codex")
-        .join("history.jsonl");
+    let cutoff = Utc::now() - chrono::Duration::hours(hours as i64);
 
-    if !codex_path.exists() {
-        anyhow::bail!("Codex history not found: {}", codex_path.display());
-    }
-
-    let cutoff_ts = (Utc::now() - chrono::Duration::hours(hours as i64)).timestamp();
-    let mut entries: Vec<TimelineEntry> = Vec::new();
-    let mut sessions: Vec<String> = Vec::new();
-
-    let file = File::open(&codex_path)?;
-    let reader = BufReader::new(file);
-
-    for line in reader.lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let entry: CodexEntry = match serde_json::from_str(&line) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-
-        // Filter by timestamp
-        if entry.ts < cutoff_ts {
-            continue;
-        }
-
-        // Filter by project if specified
-        if let Some(ref filter) = project_filter
-            && !entry.text.to_lowercase().contains(&filter.to_lowercase())
-        {
-            continue;
-        }
-
-        let timestamp = Utc.timestamp_opt(entry.ts, 0).single().unwrap_or_else(Utc::now);
-
-        if !sessions.contains(&entry.session_id) {
-            sessions.push(entry.session_id.clone());
-        }
-
-        entries.push(TimelineEntry {
-            timestamp,
-            agent: "codex".to_string(),
-            session_id: entry.session_id,
-            role: "user".to_string(), // Codex only stores user messages
-            message: entry.text,
-            branch: None,
-            cwd: None,
-        });
-    }
-
-    entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
-
-    let report = Report {
-        generated_at: Utc::now(),
-        project_filter,
-        hours_back: hours,
-        total_entries: entries.len(),
-        sessions,
-        entries,
+    let agents: Vec<&str> = match agent.as_deref() {
+        Some("claude") => vec!["claude"],
+        Some("codex") => vec!["codex"],
+        Some("gemini") => vec!["gemini"],
+        _ => vec!["claude", "codex", "gemini"],
     };
 
-    write_output(&report, output, "codex", format)?;
+    let config = ExtractionConfig {
+        project_filter: project.clone(),
+        cutoff,
+        include_assistant,
+        watermark: None,
+    };
+
+    let mut all_entries = Vec::new();
+    for &ag in &agents {
+        let agent_entries = match ag {
+            "claude" => sources::extract_claude(&config)?,
+            "codex" => sources::extract_codex(&config)?,
+            "gemini" => sources::extract_gemini(&config)?,
+            _ => Vec::new(),
+        };
+        eprintln!("  [{}] {} entries", ag, agent_entries.len());
+        all_entries.extend(agent_entries);
+    }
+
+    all_entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+
+    if all_entries.is_empty() {
+        eprintln!("No entries found.");
+        return Ok(());
+    }
+
+    // Convert to output::TimelineEntry
+    let output_entries: Vec<output::TimelineEntry> = all_entries
+        .iter()
+        .map(|e| output::TimelineEntry {
+            timestamp: e.timestamp,
+            agent: e.agent.clone(),
+            session_id: e.session_id.clone(),
+            role: e.role.clone(),
+            message: e.message.clone(),
+            branch: e.branch.clone(),
+            cwd: e.cwd.clone(),
+        })
+        .collect();
+
+    // Group by agent+date and write to central store
+    let proj_name = project.as_deref().unwrap_or("unknown");
+    let mut index = store::load_index();
+    let mut stored_count = 0usize;
+
+    // Group entries by (agent, date)
+    let mut groups: std::collections::BTreeMap<(String, String), Vec<output::TimelineEntry>> =
+        std::collections::BTreeMap::new();
+
+    for entry in &output_entries {
+        let date = entry.timestamp.format("%Y-%m-%d").to_string();
+        groups
+            .entry((entry.agent.clone(), date))
+            .or_default()
+            .push(entry.clone());
+    }
+
+    for ((agent_name, date), group_entries) in &groups {
+        let path = store::write_context(proj_name, agent_name, date, group_entries)?;
+        store::update_index(&mut index, proj_name, agent_name, date, group_entries.len());
+        stored_count += group_entries.len();
+        eprintln!("  → {} ({} entries)", path.display(), group_entries.len());
+    }
+
+    store::save_index(&index)?;
+    eprintln!("✓ Stored {} entries in {} groups", stored_count, groups.len());
+
+    // Chunk and sync to memex if requested
+    if sync_memex && !output_entries.is_empty() {
+        let agent_label = agents.join("+");
+        let chunker_config = ChunkerConfig::default();
+        let chunks = chunker::chunk_entries(&output_entries, proj_name, &agent_label, &chunker_config);
+
+        if !chunks.is_empty() {
+            let chunks_dir = store::chunks_dir()?;
+            chunker::write_chunks_to_dir(&chunks, &chunks_dir)?;
+            eprintln!("  Chunked: {}", chunker::chunk_summary(&chunks));
+
+            let memex_config = MemexConfig::default();
+            match memex::sync_new_chunks(&chunks_dir, &memex_config) {
+                Ok(result) => {
+                    eprintln!("  Memex: {} pushed, {} skipped", result.chunks_pushed, result.chunks_skipped);
+                }
+                Err(e) => eprintln!("  Memex sync failed: {}", e),
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Sync stored chunks to rmcp-memex vector memory.
+fn run_memex_sync(namespace: &str, per_chunk: bool, db_path: Option<PathBuf>) -> Result<()> {
+    if !memex::check_memex_available() {
+        eprintln!("Error: rmcp-memex not found in PATH.");
+        eprintln!("Install with: cargo install rmcp-memex");
+        std::process::exit(1);
+    }
+
+    let chunks_dir = store::chunks_dir()?;
+    if !chunks_dir.exists() {
+        eprintln!("No chunks directory found at: {}", chunks_dir.display());
+        eprintln!("Run `ai-contexters store --memex` first to generate chunks.");
+        return Ok(());
+    }
+
+    let config = MemexConfig {
+        namespace: namespace.to_string(),
+        db_path,
+        batch_mode: !per_chunk,
+    };
+
+    eprintln!("Syncing chunks from: {}", chunks_dir.display());
+    eprintln!("  Namespace: {}", config.namespace);
+    eprintln!("  Mode: {}", if config.batch_mode { "batch" } else { "per-chunk" });
+
+    let result = memex::sync_new_chunks(&chunks_dir, &config)?;
 
     eprintln!(
-        "✓ Extracted {} entries from {} sessions",
-        report.total_entries,
-        report.sessions.len()
+        "✓ Memex sync: {} pushed, {} skipped",
+        result.chunks_pushed, result.chunks_skipped,
     );
 
-    Ok(())
-}
-
-// ============================================================================
-// Combined extraction
-// ============================================================================
-
-fn extract_all(project_filter: Option<String>, hours: u64, output: &Path) -> Result<()> {
-    eprintln!("Extracting Claude Code sessions...");
-    extract_claude(project_filter.clone(), hours, output, "both")?;
-
-    eprintln!("\nExtracting Codex history...");
-    extract_codex(project_filter, hours, output, "both")?;
-
-    Ok(())
-}
-
-// ============================================================================
-// List sessions
-// ============================================================================
-
-fn list_sessions(agent: &str) -> Result<()> {
-    if agent == "claude" || agent == "all" {
-        println!("=== Claude Code Projects ===\n");
-
-        let claude_dir = dirs::home_dir()
-            .context("No home dir")?
-            .join(".claude")
-            .join("projects");
-
-        if claude_dir.exists() {
-            for entry in fs::read_dir(&claude_dir)? {
-                let entry = entry?;
-                if entry.path().is_dir() {
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    // Decode path: -Users-maciejgad-hosted-VetCoders-CodeScribe
-                    let decoded = name.replace('-', "/").trim_start_matches('/').to_string();
-
-                    let jsonl_count = fs::read_dir(entry.path())?
-                        .filter(|e| {
-                            e.as_ref()
-                                .ok()
-                                .and_then(|e| e.path().extension().map(|ext| ext == "jsonl"))
-                                .unwrap_or(false)
-                        })
-                        .count();
-
-                    println!("  {} ({} sessions)", decoded, jsonl_count);
-                }
-            }
-        }
+    for err in &result.errors {
+        eprintln!("  Error: {}", err);
     }
-
-    if agent == "codex" || agent == "all" {
-        println!("\n=== Codex History ===\n");
-
-        let codex_path = dirs::home_dir()
-            .context("No home dir")?
-            .join(".codex")
-            .join("history.jsonl");
-
-        if codex_path.exists() {
-            let metadata = fs::metadata(&codex_path)?;
-            let size_mb = metadata.len() as f64 / 1024.0 / 1024.0;
-
-            // Count unique sessions
-            let file = File::open(&codex_path)?;
-            let reader = BufReader::new(file);
-            let mut sessions: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-            for line in reader.lines().take(10000).flatten() {
-                if let Ok(entry) = serde_json::from_str::<CodexEntry>(&line) {
-                    sessions.insert(entry.session_id);
-                }
-            }
-
-            println!("  history.jsonl: {:.1} MB, ~{} sessions", size_mb, sessions.len());
-        }
-    }
-
-    Ok(())
-}
-
-// ============================================================================
-// Output writers
-// ============================================================================
-
-fn write_output(report: &Report, output_dir: &Path, prefix: &str, format: &str) -> Result<()> {
-    fs::create_dir_all(output_dir)?;
-
-    let date_str = report.generated_at.format("%Y%m%d_%H%M%S");
-
-    if format == "json" || format == "both" {
-        let json_path = output_dir.join(format!("{}_memory_{}.json", prefix, date_str));
-        let mut file = File::create(&json_path)?;
-        serde_json::to_writer_pretty(&mut file, report)?;
-        eprintln!("  → {}", json_path.display());
-    }
-
-    if format == "md" || format == "both" {
-        let md_path = output_dir.join(format!("{}_memory_{}.md", prefix, date_str));
-        let mut file = File::create(&md_path)?;
-        write_markdown(&mut file, report)?;
-        eprintln!("  → {}", md_path.display());
-    }
-
-    Ok(())
-}
-
-fn write_markdown(file: &mut File, report: &Report) -> Result<()> {
-    writeln!(file, "# Agent Memory Timeline\n")?;
-    writeln!(file, "> Generated: {}", report.generated_at.format("%Y-%m-%d %H:%M:%S UTC"))?;
-    writeln!(file, "> Filter: {:?}", report.project_filter)?;
-    writeln!(file, "> Period: last {} hours", report.hours_back)?;
-    writeln!(file, "> Entries: {}", report.total_entries)?;
-    writeln!(file, "> Sessions: {}\n", report.sessions.len())?;
-    writeln!(file, "---\n")?;
-
-    // Group by date
-    let mut by_date: HashMap<String, Vec<&TimelineEntry>> = HashMap::new();
-    for entry in &report.entries {
-        let date = entry.timestamp.format("%Y-%m-%d").to_string();
-        by_date.entry(date).or_default().push(entry);
-    }
-
-    let mut dates: Vec<_> = by_date.keys().collect();
-    dates.sort();
-
-    for date in dates {
-        writeln!(file, "## {}\n", date)?;
-
-        for entry in by_date.get(date).unwrap() {
-            let time = entry.timestamp.format("%H:%M:%S");
-            let role_emoji = if entry.role == "user" { "👤" } else { "🤖" };
-            let agent_badge = if entry.agent == "claude" { "[Claude]" } else { "[Codex]" };
-
-            // Truncate long messages for MD (full in JSON)
-            // Use char_indices to avoid breaking UTF-8
-            let msg = if entry.message.chars().count() > 500 {
-                let truncated: String = entry.message.chars().take(500).collect();
-                format!("{}...", truncated)
-            } else {
-                entry.message.clone()
-            };
-
-            // Escape markdown and format as blockquote
-            let msg = msg.replace('\n', "\n> ");
-
-            writeln!(file, "### {} {} {} `{}`\n", time, role_emoji, agent_badge, &entry.session_id[..8.min(entry.session_id.len())])?;
-
-            if let Some(ref branch) = entry.branch {
-                writeln!(file, "Branch: `{}`\n", branch)?;
-            }
-
-            writeln!(file, "> {}\n", msg)?;
-        }
-    }
-
-    writeln!(file, "---\n*Generated by ai-contexters (c)2026 VetCoders*")?;
 
     Ok(())
 }
