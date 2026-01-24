@@ -134,16 +134,17 @@ pub fn extract_claude(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
     }
 
     let mut entries: Vec<TimelineEntry> = Vec::new();
+    let filter_lower = config.project_filter.as_ref().map(|f| f.to_lowercase());
 
     for dir_entry in fs::read_dir(&claude_dir)? {
         let dir_entry = dir_entry?;
         let dir_name = dir_entry.file_name().to_string_lossy().to_string();
 
         // Filter by project if specified
-        if let Some(ref filter) = config.project_filter {
+        if let Some(ref filter_lc) = filter_lower {
             let decoded = decode_claude_project_path(&dir_name);
-            if !decoded.to_lowercase().contains(&filter.to_lowercase())
-                && !dir_name.to_lowercase().contains(&filter.to_lowercase())
+            if !decoded.to_lowercase().contains(filter_lc)
+                && !dir_name.to_lowercase().contains(filter_lc)
             {
                 continue;
             }
