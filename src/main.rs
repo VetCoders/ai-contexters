@@ -9,9 +9,11 @@
 //!
 //! Created by M&K (c)2026 VetCoders
 
-use anyhow::Result;
-use chrono::Utc;
+use anyhow::{Context, Result};
+use chrono::{DateTime, Duration, Local, TimeZone, Utc};
 use clap::{Parser, Subcommand};
+use regex::Regex;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use ai_contexters::chunker::{self, ChunkerConfig};
@@ -20,6 +22,43 @@ use ai_contexters::output::{self, OutputConfig, OutputFormat, OutputMode, Report
 use ai_contexters::sources::{self, ExtractionConfig};
 use ai_contexters::state::StateManager;
 use ai_contexters::store;
+
+/// Calculate cutoff time based on today/yesterday flags or hours
+/// Returns (cutoff_start, cutoff_end_option, period_label)
+fn calc_cutoff(hours: u64, today: bool, yesterday: bool) -> Result<(DateTime<Utc>, Option<DateTime<Utc>>, String)> {
+    if today {
+        let now = Local::now();
+        let start_of_today = now.date_naive()
+            .and_hms_opt(0, 0, 0)
+            .context("Failed to create start of today timestamp")?;
+        let cutoff = Local.from_local_datetime(&start_of_today)
+            .single()
+            .context("Ambiguous or invalid local time (DST transition?)")?
+            .with_timezone(&Utc);
+        Ok((cutoff, None, "today".to_string()))
+    } else if yesterday {
+        let now = Local::now();
+        let yesterday_date = now.date_naive() - Duration::days(1);
+        let start_of_yesterday = yesterday_date
+            .and_hms_opt(0, 0, 0)
+            .context("Failed to create start of yesterday timestamp")?;
+        let end_of_yesterday = yesterday_date
+            .and_hms_opt(23, 59, 59)
+            .context("Failed to create end of yesterday timestamp")?;
+        let cutoff_start = Local.from_local_datetime(&start_of_yesterday)
+            .single()
+            .context("Ambiguous or invalid local time (DST transition?)")?
+            .with_timezone(&Utc);
+        let cutoff_end = Local.from_local_datetime(&end_of_yesterday)
+            .single()
+            .context("Ambiguous or invalid local time (DST transition?)")?
+            .with_timezone(&Utc);
+        Ok((cutoff_start, Some(cutoff_end), "yesterday".to_string()))
+    } else {
+        let cutoff = Utc::now() - Duration::hours(hours as i64);
+        Ok((cutoff, None, format!("last {} hours", hours)))
+    }
+}
 
 /// AI Contexters - timeline and decisions from AI sessions
 #[derive(Parser)]
@@ -43,6 +82,14 @@ enum Commands {
         #[arg(short = 'H', long, default_value = "48")]
         hours: u64,
 
+        /// Show only today's entries
+        #[arg(long, conflicts_with_all = ["hours", "yesterday"])]
+        today: bool,
+
+        /// Show only yesterday's entries
+        #[arg(long, conflicts_with_all = ["hours", "today"])]
+        yesterday: bool,
+
         /// Output directory
         #[arg(short, long, default_value = ".")]
         output: PathBuf,
@@ -50,6 +97,10 @@ enum Commands {
         /// Output format: md, json, both
         #[arg(short, long, default_value = "both")]
         format: String,
+
+        /// Search pattern (regex) - filter messages
+        #[arg(short = 'g', long)]
+        grep: Option<String>,
 
         /// Append to a single timeline file instead of creating new files
         #[arg(long)]
@@ -90,6 +141,14 @@ enum Commands {
         #[arg(short = 'H', long, default_value = "48")]
         hours: u64,
 
+        /// Show only today's entries
+        #[arg(long, conflicts_with_all = ["hours", "yesterday"])]
+        today: bool,
+
+        /// Show only yesterday's entries
+        #[arg(long, conflicts_with_all = ["hours", "today"])]
+        yesterday: bool,
+
         /// Output directory
         #[arg(short, long, default_value = ".")]
         output: PathBuf,
@@ -97,6 +156,10 @@ enum Commands {
         /// Output format: md, json, both
         #[arg(short, long, default_value = "both")]
         format: String,
+
+        /// Search pattern (regex) - filter messages
+        #[arg(short = 'g', long)]
+        grep: Option<String>,
 
         /// Append to a single timeline file
         #[arg(long)]
@@ -133,9 +196,21 @@ enum Commands {
         #[arg(short = 'H', long, default_value = "48")]
         hours: u64,
 
+        /// Show only today's entries
+        #[arg(long, conflicts_with_all = ["hours", "yesterday"])]
+        today: bool,
+
+        /// Show only yesterday's entries
+        #[arg(long, conflicts_with_all = ["hours", "today"])]
+        yesterday: bool,
+
         /// Output directory
         #[arg(short, long, default_value = ".")]
         output: PathBuf,
+
+        /// Search pattern (regex) - filter messages
+        #[arg(short = 'g', long)]
+        grep: Option<String>,
 
         /// Append to a single timeline file
         #[arg(long)]
@@ -164,6 +239,29 @@ enum Commands {
         /// Also chunk and sync to memex after extraction
         #[arg(long)]
         memex: bool,
+    },
+
+    /// Show statistics dashboard
+    Stats {
+        /// Agent type: claude, codex, all
+        #[arg(short, long, default_value = "all")]
+        agent: String,
+
+        /// Hours to look back (default: 168 = 7 days)
+        #[arg(short = 'H', long, default_value = "168")]
+        hours: u64,
+
+        /// Show only today's entries
+        #[arg(long, conflicts_with_all = ["hours", "yesterday"])]
+        today: bool,
+
+        /// Show only yesterday's entries
+        #[arg(long, conflicts_with_all = ["hours", "today"])]
+        yesterday: bool,
+
+        /// Project filter
+        #[arg(short, long)]
+        project: Option<String>,
     },
 
     /// Store contexts in central store (~/.ai-contexters/) and optionally sync to memex
@@ -220,34 +318,43 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Claude {
-            project, hours, output, format, append_to,
+            project, hours, today, yesterday, output, format, grep, append_to,
             rotate, incremental, include_assistant, loctree, project_root, memex,
         } => {
+            let (cutoff, cutoff_end, _period) = calc_cutoff(hours, today, yesterday)?;
             run_extraction(
                 &["claude"],
-                project, hours, &output, &format, append_to,
+                project, cutoff, cutoff_end, &output, &format, grep, append_to,
                 rotate, incremental, include_assistant, loctree, project_root, memex,
             )?;
         }
         Commands::Codex {
-            project, hours, output, format, append_to,
+            project, hours, today, yesterday, output, format, grep, append_to,
             rotate, incremental, loctree, project_root, memex,
         } => {
+            let (cutoff, cutoff_end, _period) = calc_cutoff(hours, today, yesterday)?;
             run_extraction(
                 &["codex"],
-                project, hours, &output, &format, append_to,
+                project, cutoff, cutoff_end, &output, &format, grep, append_to,
                 rotate, incremental, false, loctree, project_root, memex,
             )?;
         }
         Commands::All {
-            project, hours, output, append_to,
+            project, hours, today, yesterday, output, grep, append_to,
             rotate, incremental, include_assistant, loctree, project_root, memex,
         } => {
+            let (cutoff, cutoff_end, _period) = calc_cutoff(hours, today, yesterday)?;
             run_extraction(
                 &["claude", "codex", "gemini"],
-                project, hours, &output, "both", append_to,
+                project, cutoff, cutoff_end, &output, "both", grep, append_to,
                 rotate, incremental, include_assistant, loctree, project_root, memex,
             )?;
+        }
+        Commands::Stats {
+            agent, hours, today, yesterday, project,
+        } => {
+            let (cutoff, cutoff_end, period) = calc_cutoff(hours, today, yesterday)?;
+            show_stats(&agent, cutoff, cutoff_end, &period, project)?;
         }
         Commands::Store {
             project, agent, hours, include_assistant, memex,
@@ -286,9 +393,11 @@ fn main() -> Result<()> {
 fn run_extraction(
     agents: &[&str],
     project: Option<String>,
-    hours: u64,
+    cutoff: DateTime<Utc>,
+    cutoff_end: Option<DateTime<Utc>>,
     output_dir: &Path,
     format: &str,
+    grep_pattern: Option<String>,
     append_to: Option<PathBuf>,
     rotate: usize,
     incremental: bool,
@@ -297,10 +406,15 @@ fn run_extraction(
     project_root: Option<PathBuf>,
     sync_memex: bool,
 ) -> Result<()> {
+    // Compile grep regex if provided
+    let grep_re = grep_pattern
+        .as_ref()
+        .map(|p| Regex::new(&format!("(?i){}", p)))
+        .transpose()
+        .context("Invalid grep regex")?;
+
     // Load state for incremental/dedup
     let mut state = StateManager::load();
-
-    let cutoff = Utc::now() - chrono::Duration::hours(hours as i64);
 
     // Determine watermark (incremental mode uses per-source watermark)
     let watermark = if incremental {
@@ -352,6 +466,20 @@ fn run_extraction(
         );
     }
 
+    // Filter by cutoff_end (for --yesterday)
+    if let Some(end) = cutoff_end {
+        entries.retain(|e| e.timestamp <= end);
+    }
+
+    // Filter by grep pattern
+    if let Some(ref re) = grep_re {
+        let pre_grep = entries.len();
+        entries.retain(|e| re.is_match(&e.message));
+        if pre_grep != entries.len() {
+            eprintln!("  Grep: {} → {} entries", pre_grep, entries.len());
+        }
+    }
+
     // Sort by timestamp
     entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
 
@@ -374,10 +502,13 @@ fn run_extraction(
     sessions.sort();
     sessions.dedup();
 
+    // Calculate hours_back from cutoff for metadata
+    let hours_back = (Utc::now() - cutoff).num_hours() as u64;
+
     let metadata = ReportMetadata {
         generated_at: Utc::now(),
         project_filter: project.clone(),
-        hours_back: hours,
+        hours_back,
         total_entries: output_entries.len(),
         sessions: sessions.clone(),
     };
@@ -626,6 +757,121 @@ fn run_memex_sync(namespace: &str, per_chunk: bool, db_path: Option<PathBuf>) ->
     for err in &result.errors {
         eprintln!("  Error: {}", err);
     }
+
+    Ok(())
+}
+
+/// Show statistics dashboard
+fn show_stats(
+    agent: &str,
+    cutoff: DateTime<Utc>,
+    cutoff_end: Option<DateTime<Utc>>,
+    period: &str,
+    project_filter: Option<String>,
+) -> Result<()> {
+    let config = sources::ExtractionConfig {
+        project_filter: project_filter.clone(),
+        cutoff,
+        include_assistant: true,
+        watermark: None,
+    };
+
+    let mut total_messages = 0usize;
+    let mut user_messages = 0usize;
+    let mut assistant_messages = 0usize;
+    let mut sessions_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut by_date: HashMap<String, usize> = HashMap::new();
+    let mut by_project: HashMap<String, usize> = HashMap::new();
+
+    // Claude stats
+    if agent == "claude" || agent == "all" {
+        let entries = sources::extract_claude(&config).unwrap_or_default();
+        for entry in &entries {
+            // Filter by cutoff_end
+            if let Some(end) = cutoff_end {
+                if entry.timestamp > end {
+                    continue;
+                }
+            }
+            total_messages += 1;
+            if entry.role == "user" {
+                user_messages += 1;
+            } else {
+                assistant_messages += 1;
+            }
+            sessions_set.insert(entry.session_id.clone());
+
+            let date = entry.timestamp.format("%Y-%m-%d").to_string();
+            *by_date.entry(date).or_insert(0) += 1;
+
+            // Extract project from cwd
+            if let Some(ref cwd) = entry.cwd {
+                let short: String = cwd.chars().rev().take(40).collect::<String>().chars().rev().collect();
+                *by_project.entry(short).or_insert(0) += 1;
+            }
+        }
+    }
+
+    // Codex stats
+    if agent == "codex" || agent == "all" {
+        let entries = sources::extract_codex(&config).unwrap_or_default();
+        for entry in &entries {
+            if let Some(end) = cutoff_end {
+                if entry.timestamp > end {
+                    continue;
+                }
+            }
+            total_messages += 1;
+            user_messages += 1; // Codex only stores user messages
+            sessions_set.insert(entry.session_id.clone());
+
+            let date = entry.timestamp.format("%Y-%m-%d").to_string();
+            *by_date.entry(date).or_insert(0) += 1;
+            *by_project.entry("codex".to_string()).or_insert(0) += 1;
+        }
+    }
+
+    // Print stats
+    println!("\n╔══════════════════════════════════════════════════════════════╗");
+    println!("║                    AI CONTEXTERS STATS                       ║");
+    println!("╠══════════════════════════════════════════════════════════════╣");
+    println!("║  Period: {:52} ║", period);
+    if let Some(ref p) = project_filter {
+        println!("║  Filter: {:52} ║", p);
+    }
+    println!("╠══════════════════════════════════════════════════════════════╣");
+    println!("║  TOTALS                                                      ║");
+    println!("║     Sessions:    {:6}                                      ║", sessions_set.len());
+    println!("║     Messages:    {:6}                                      ║", total_messages);
+    println!("║       User:      {:6}                                      ║", user_messages);
+    println!("║       Agent:     {:6}                                      ║", assistant_messages);
+    println!("╠══════════════════════════════════════════════════════════════╣");
+
+    // Messages per day
+    if !by_date.is_empty() {
+        println!("║  ACTIVITY BY DAY                                             ║");
+        let mut dates: Vec<_> = by_date.iter().collect();
+        dates.sort_by(|a, b| a.0.cmp(b.0));
+        for (date, count) in dates.iter().rev().take(7) {
+            let bar_len = (**count).min(50);
+            let bar: String = "=".repeat(bar_len);
+            println!("║     {} {:4} {}{}║", date, count, bar, " ".repeat(50 - bar_len));
+        }
+    }
+
+    // Top projects
+    if !by_project.is_empty() {
+        println!("╠══════════════════════════════════════════════════════════════╣");
+        println!("║  TOP PROJECTS                                                ║");
+        let mut projects: Vec<_> = by_project.iter().collect();
+        projects.sort_by(|a, b| b.1.cmp(a.1));
+        for (project, count) in projects.iter().take(5) {
+            let short_name: String = project.chars().take(40).collect();
+            println!("║     {:40} {:6} msgs ║", short_name, count);
+        }
+    }
+
+    println!("╚══════════════════════════════════════════════════════════════╝\n");
 
     Ok(())
 }
