@@ -47,7 +47,7 @@ ai-contexters init --no-run
 ```
 
 Only `share/summary.md` and `share/timeline.md` are meant to be committed.  
-Everything else stays local.
+Everything else stays local. The agent is constrained to `.ai-context/` and reads artifacts from there (no prompt injection).
 
 ### Usage (classic extractors)
 

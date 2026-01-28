@@ -226,7 +226,7 @@ enum Commands {
         #[arg(short = 'H', long, default_value = "4800")]
         hours: u64,
 
-        /// Maximum lines per context section in the prompt
+        /// Maximum number of artifact file paths listed in the prompt
         #[arg(long, default_value = "1200")]
         max_lines: usize,
 

@@ -76,6 +76,7 @@ Flags: `-p` project filter, `-H` hours back, `-o` output dir, `-f` format (md/js
 ```
 
 Only `share/summary.md` and `share/timeline.md` are intended to be committed.
+Agents are constrained to `.ai-context/` and read artifacts from there.
 
 ---
 

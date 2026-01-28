@@ -7,9 +7,8 @@
 
 use anyhow::{Context, Result};
 use chrono::{Local, Utc};
-use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -20,6 +19,9 @@ const SUMMARY_START: &str = "===AI_CONTEXT_SUMMARY_START===";
 const SUMMARY_END: &str = "===AI_CONTEXT_SUMMARY_END===";
 const SUMMARY_MAX_LINES: usize = 500;
 const PROMPT_SIZE_WARN_BYTES: usize = 180_000;
+const DEFAULT_CLAUDE_TOOLS: &str = "Read";
+const DEFAULT_CLAUDE_ADD_DIR: &str = ".ai-context";
+const DEFAULT_CODEX_SANDBOX: &str = "read-only";
 
 #[derive(Debug, Clone)]
 pub struct InitOptions {
@@ -122,16 +124,10 @@ pub fn run_init(options: InitOptions) -> Result<()> {
         "== Step 4/4: build prompt -> {} ==",
         prompt_path.display()
     ));
-    let prompt_bytes = build_prompt(
-        &prompt_path,
-        &loct_path,
-        &paths.context,
-        options.max_lines,
-        &ts_local,
-    )?;
+    let prompt_bytes = build_prompt(&prompt_path, &root, &paths, options.max_lines, &ts_local)?;
     if prompt_bytes > PROMPT_SIZE_WARN_BYTES {
         log.warn(&format!(
-            "prompt is big ({}B). If agent fails, lower max lines (e.g., 600).",
+            "prompt is big ({}B). If agent fails, lower --max-lines.",
             prompt_bytes
         ));
     }
@@ -163,6 +159,7 @@ pub fn run_init(options: InitOptions) -> Result<()> {
     let model = options.model.as_deref();
 
     let report_path = paths.runs.join(format!("{}_report.md", run_id));
+    let agent_root = resolve_agent_root(&root);
     let report = run_agent(
         &root,
         &agent,
@@ -170,6 +167,7 @@ pub fn run_init(options: InitOptions) -> Result<()> {
         &prompt_path,
         &report_path,
         &paths.config,
+        &agent_root,
     )?;
 
     let (clean_report, summary_block) = split_summary_block(&report);
@@ -219,6 +217,30 @@ fn repo_root() -> Result<PathBuf> {
     }
 
     std::env::current_dir().context("Failed to get current dir")
+}
+
+fn resolve_agent_root(root: &Path) -> PathBuf {
+    let override_dir = std::env::var("AI_CONTEXT_DIR").ok();
+    let base = override_dir.unwrap_or_else(|| DEFAULT_CLAUDE_ADD_DIR.to_string());
+    let path = PathBuf::from(base);
+    if path.is_relative() {
+        root.join(path)
+    } else {
+        path
+    }
+}
+
+fn resolve_add_dir(root: &Path, agent_root: &Path) -> String {
+    let base = std::env::var("AI_CONTEXT_CLAUDE_ADD_DIR").ok();
+    let path = base
+        .map(PathBuf::from)
+        .unwrap_or_else(|| agent_root.to_path_buf());
+    let resolved = if path.is_relative() {
+        root.join(path)
+    } else {
+        path
+    };
+    resolved.to_string_lossy().to_string()
 }
 
 fn init_paths(root: &Path) -> Result<InitPaths> {
@@ -430,9 +452,9 @@ fn extract_context(out_dir: &Path, project: &str, hours: u64) -> Result<Vec<Time
 
 fn build_prompt(
     prompt_path: &Path,
-    loct_path: &Path,
-    context_dir: &Path,
-    max_lines: usize,
+    root: &Path,
+    paths: &InitPaths,
+    max_files: usize,
     ts_local: &str,
 ) -> Result<usize> {
     let mut file = File::create(prompt_path)?;
@@ -444,7 +466,7 @@ fn build_prompt(
     writeln!(file)?;
     writeln!(file, "Rules:")?;
     writeln!(file, "- No internet access.")?;
-    writeln!(file, "- Use only the context in this prompt.")?;
+    writeln!(file, "- Use only artifacts under .ai-context/.")?;
     writeln!(file, "- Do not guess facts that are not present.")?;
     writeln!(file)?;
     writeln!(file, "Tasks:")?;
@@ -481,45 +503,20 @@ fn build_prompt(
     writeln!(file, "{}", SUMMARY_END)?;
     writeln!(file, "Keep bullets short and factual.")?;
     writeln!(file)?;
-    writeln!(file, "CONTEXT (truncated):")?;
+    writeln!(
+        file,
+        "Read artifacts under .ai-context/ and focus on newest entries first."
+    )?;
+    writeln!(
+        file,
+        "If needed, go deeper into older files to understand history."
+    )?;
     writeln!(file)?;
+    writeln!(file, "Artifacts (newest first, max {} files):", max_files)?;
 
-    if loct_path.exists() {
-        writeln!(file, "## loct --for-ai (first {} lines)", max_lines)?;
-        append_first_lines(&mut file, loct_path, max_lines)?;
-        writeln!(file)?;
-    }
-
-    let mut context_files: Vec<PathBuf> = fs::read_dir(context_dir)?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|e| e == "md"))
-        .filter(|p| {
-            let name = p.file_name().unwrap_or(OsStr::new("")).to_string_lossy();
-            name.contains("memory_") || name.contains("timeline")
-        })
-        .collect();
-
-    context_files.sort_by(|a, b| {
-        let an = a
-            .file_name()
-            .map(|s| s.to_string_lossy())
-            .unwrap_or_default();
-        let bn = b
-            .file_name()
-            .map(|s| s.to_string_lossy())
-            .unwrap_or_default();
-        an.cmp(&bn)
-    });
-
-    for ctx in context_files {
-        let name = ctx
-            .file_name()
-            .map(|s| s.to_string_lossy())
-            .unwrap_or_default();
-        writeln!(file, "## {} (first {} lines)", name, max_lines)?;
-        append_first_lines(&mut file, &ctx, max_lines)?;
-        writeln!(file)?;
+    let artifacts = list_artifacts(root, paths, max_files)?;
+    for path in artifacts {
+        writeln!(file, "- {}", path)?;
     }
 
     file.flush()?;
@@ -527,17 +524,52 @@ fn build_prompt(
     Ok(bytes)
 }
 
-fn append_first_lines(w: &mut impl Write, path: &Path, max_lines: usize) -> Result<()> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-    for (idx, line) in reader.lines().enumerate() {
-        if idx >= max_lines {
-            break;
-        }
-        let line = line?;
-        writeln!(w, "{}", line)?;
+fn list_artifacts(root: &Path, paths: &InitPaths, max_files: usize) -> Result<Vec<String>> {
+    let mut items = Vec::new();
+
+    if paths.summary.exists() {
+        items.push(rel_path(root, &paths.summary));
     }
-    Ok(())
+    if paths.timeline.exists() {
+        items.push(rel_path(root, &paths.timeline));
+    }
+
+    let mut context_files: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
+    for entry in fs::read_dir(&paths.context)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if ext != "md" && ext != "json" {
+            continue;
+        }
+        let mtime = fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        context_files.push((path, mtime));
+    }
+
+    context_files.sort_by(|a, b| b.1.cmp(&a.1));
+    let limit = if max_files == 0 {
+        usize::MAX
+    } else {
+        max_files
+    };
+
+    for (path, _) in context_files.into_iter().take(limit) {
+        items.push(rel_path(root, &path));
+    }
+
+    Ok(items)
+}
+
+fn rel_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .to_string()
 }
 
 fn resolve_agent(agent: Option<String>) -> Result<String> {
@@ -629,22 +661,36 @@ fn run_agent(
     prompt_path: &Path,
     report_path: &Path,
     config_dir: &Path,
+    agent_root: &Path,
 ) -> Result<String> {
     match agent {
-        "claude" => run_claude(model, prompt_path, report_path, config_dir),
-        "codex" => run_codex(model, prompt_path, report_path, root),
+        "claude" => run_claude(
+            root,
+            model,
+            prompt_path,
+            report_path,
+            config_dir,
+            agent_root,
+        ),
+        "codex" => run_codex(model, prompt_path, report_path, root, agent_root),
         _ => anyhow::bail!("unknown agent: {}", agent),
     }
 }
 
 fn run_claude(
+    root: &Path,
     model: Option<&str>,
     prompt_path: &Path,
     report_path: &Path,
     config_dir: &Path,
+    agent_root: &Path,
 ) -> Result<String> {
     let prompt = fs::read_to_string(prompt_path)?;
     let mcp_config = ensure_mcp_config(config_dir)?;
+
+    let tools = std::env::var("AI_CONTEXT_CLAUDE_TOOLS")
+        .unwrap_or_else(|_| DEFAULT_CLAUDE_TOOLS.to_string());
+    let add_dir = resolve_add_dir(root, agent_root);
 
     let mut cmd = Command::new("claude");
     cmd.arg("-p")
@@ -652,8 +698,10 @@ fn run_claude(
         .arg("--mcp-config")
         .arg(mcp_config)
         .arg("--strict-mcp-config")
+        .arg("--add-dir")
+        .arg(add_dir)
         .arg("--tools")
-        .arg("")
+        .arg(tools)
         .arg("--output-format")
         .arg("text");
 
@@ -677,15 +725,27 @@ fn run_codex(
     prompt_path: &Path,
     report_path: &Path,
     root: &Path,
+    agent_root: &Path,
 ) -> Result<String> {
     let prompt_file = File::open(prompt_path)?;
+
+    let sandbox = std::env::var("AI_CONTEXT_CODEX_SANDBOX")
+        .unwrap_or_else(|_| DEFAULT_CODEX_SANDBOX.to_string());
+    let cwd = std::env::var("AI_CONTEXT_CODEX_CWD")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| agent_root.to_path_buf());
+    let cwd = if cwd.is_relative() {
+        root.join(cwd)
+    } else {
+        cwd
+    };
 
     let mut cmd = Command::new("codex");
     cmd.arg("exec")
         .arg("--sandbox")
-        .arg("read-only")
+        .arg(sandbox)
         .arg("-C")
-        .arg(root)
+        .arg(cwd)
         .arg("--output-last-message")
         .arg(report_path);
 
