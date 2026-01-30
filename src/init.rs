@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::output::{self, OutputConfig, OutputFormat, OutputMode, ReportMetadata, TimelineEntry};
+use crate::sanitize;
 use crate::sources::{self, ExtractionConfig};
 
 const SUMMARY_START: &str = "===AI_CONTEXT_SUMMARY_START===";
@@ -435,7 +436,9 @@ fn build_prompt(
     max_lines: usize,
     ts_local: &str,
 ) -> Result<usize> {
-    let mut file = File::create(prompt_path)?;
+    let validated_prompt = sanitize::validate_write_path(prompt_path)?;
+    // SECURITY: path sanitized via validate_write_path (traversal + allowlist)
+    let mut file = File::create(&validated_prompt)?; // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
 
     writeln!(
         file,
@@ -528,7 +531,9 @@ fn build_prompt(
 }
 
 fn append_first_lines(w: &mut impl Write, path: &Path, max_lines: usize) -> Result<()> {
-    let file = File::open(path)?;
+    let validated = sanitize::validate_read_path(path)?;
+    // SECURITY: path sanitized via validate_read_path (traversal + canonicalize + allowlist)
+    let file = File::open(&validated)?; // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
     let reader = BufReader::new(file);
     for (idx, line) in reader.lines().enumerate() {
         if idx >= max_lines {
@@ -586,9 +591,11 @@ fn onboarding(log: &mut Logger, agent: &str) -> Result<()> {
 }
 
 fn check_agent(agent: &str) -> Result<()> {
-    let ok = Command::new(agent).arg("--version").output().is_ok();
+    let safe = sanitize::safe_agent_name(agent)?;
+    // SECURITY: agent name validated via safe_agent_name allowlist (claude, codex only)
+    let ok = Command::new(safe).arg("--version").output().is_ok(); // nosemgrep: rust.actix.command-injection.rust-actix-command-injection.rust-actix-command-injection
     if !ok {
-        anyhow::bail!("{} not found in PATH", agent);
+        anyhow::bail!("{} not found in PATH", safe);
     }
     Ok(())
 }
@@ -678,7 +685,9 @@ fn run_codex(
     report_path: &Path,
     root: &Path,
 ) -> Result<String> {
-    let prompt_file = File::open(prompt_path)?;
+    let validated_prompt = sanitize::validate_read_path(prompt_path)?;
+    // SECURITY: path sanitized via validate_read_path (traversal + canonicalize + allowlist)
+    let prompt_file = File::open(&validated_prompt)?; // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
 
     let mut cmd = Command::new("codex");
     cmd.arg("exec")
@@ -703,7 +712,9 @@ fn run_codex(
     }
 
     let mut report = String::new();
-    File::open(report_path)
+    let validated_report = sanitize::validate_read_path(report_path)?;
+    // SECURITY: path sanitized via validate_read_path (traversal + canonicalize + allowlist)
+    File::open(&validated_report) // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
         .with_context(|| format!("codex did not write report: {}", report_path.display()))?
         .read_to_string(&mut report)?;
 

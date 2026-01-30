@@ -18,6 +18,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::sanitize;
+
 // ============================================================================
 // Types
 // ============================================================================
@@ -297,8 +299,10 @@ fn write_json_report(
         entries,
     };
 
-    let file =
-        File::create(path).with_context(|| format!("Failed to create: {}", path.display()))?;
+    let validated = sanitize::validate_write_path(path)?;
+    // SECURITY: path sanitized via validate_write_path (traversal + allowlist)
+    let file = File::create(&validated) // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+        .with_context(|| format!("Failed to create: {}", path.display()))?;
     serde_json::to_writer_pretty(file, &report)?;
     eprintln!("  -> {}", path.display());
     Ok(())
@@ -358,8 +362,10 @@ fn write_markdown_full(
     max_chars: usize,
     loctree_snapshot: Option<&str>,
 ) -> Result<()> {
-    let mut file =
-        File::create(path).with_context(|| format!("Failed to create: {}", path.display()))?;
+    let validated = sanitize::validate_write_path(path)?;
+    // SECURITY: path sanitized via validate_write_path (traversal + allowlist)
+    let mut file = File::create(&validated) // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+        .with_context(|| format!("Failed to create: {}", path.display()))?;
 
     write_markdown_header(&mut file, metadata)?;
 
@@ -443,7 +449,9 @@ fn append_markdown_timeline(
 }
 
 fn find_last_sync_timestamp(path: &Path) -> Result<Option<DateTime<Utc>>> {
-    let file = File::open(path)?;
+    let validated = sanitize::validate_read_path(path)?;
+    // SECURITY: path sanitized via validate_read_path (traversal + canonicalize + allowlist)
+    let file = File::open(&validated)?; // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
     let reader = BufReader::new(file);
 
     let mut last_sync: Option<DateTime<Utc>> = None;

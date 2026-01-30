@@ -15,6 +15,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::sanitize;
+
 // ============================================================================
 // Configuration
 // ============================================================================
@@ -135,8 +137,10 @@ pub fn sync_chunks_batch(chunks_dir: &Path, config: &MemexConfig) -> Result<Sync
         return Ok(SyncResult::default());
     }
 
-    // Count files before sync
-    let file_count = fs::read_dir(chunks_dir)?
+    let validated_dir = sanitize::validate_dir_path(chunks_dir)?;
+
+    // SECURITY: dir sanitized via validate_dir_path (traversal + canonicalize + allowlist)
+    let file_count = fs::read_dir(&validated_dir)? // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
         .filter_map(|e| e.ok())
         .filter(|e| e.path().extension().is_some_and(|ext| ext == "txt"))
         .count();
@@ -262,8 +266,10 @@ pub fn sync_new_chunks(chunks_dir: &Path, config: &MemexConfig) -> Result<SyncRe
         return Ok(SyncResult::default());
     }
 
-    // Find new chunk files
-    let all_files: Vec<PathBuf> = fs::read_dir(chunks_dir)?
+    let validated_dir = sanitize::validate_dir_path(chunks_dir)?;
+
+    // SECURITY: dir sanitized via validate_dir_path (traversal + canonicalize + allowlist)
+    let all_files: Vec<PathBuf> = fs::read_dir(&validated_dir)? // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|ext| ext == "txt"))
@@ -299,7 +305,14 @@ pub fn sync_new_chunks(chunks_dir: &Path, config: &MemexConfig) -> Result<SyncRe
                 .file_stem()
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_default();
-            let text = match fs::read_to_string(file) {
+            let validated_file = match sanitize::validate_read_path(file) {
+                Ok(p) => p,
+                Err(e) => {
+                    result.errors.push(format!("{}: {}", id, e));
+                    continue;
+                }
+            };
+            let text = match fs::read_to_string(&validated_file) {
                 Ok(t) => t,
                 Err(e) => {
                     result.errors.push(format!("{}: {}", id, e));

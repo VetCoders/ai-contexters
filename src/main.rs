@@ -79,6 +79,10 @@ enum Commands {
         /// Also chunk and sync to memex after extraction
         #[arg(long)]
         memex: bool,
+
+        /// Force full extraction, ignore dedup hashes
+        #[arg(long)]
+        force: bool,
     },
 
     /// Extract timeline from Codex history
@@ -122,6 +126,10 @@ enum Commands {
         /// Also chunk and sync to memex after extraction
         #[arg(long)]
         memex: bool,
+
+        /// Force full extraction, ignore dedup hashes
+        #[arg(long)]
+        force: bool,
     },
 
     /// Extract from all agents (Claude + Codex + Gemini)
@@ -165,6 +173,10 @@ enum Commands {
         /// Also chunk and sync to memex after extraction
         #[arg(long)]
         memex: bool,
+
+        /// Force full extraction, ignore dedup hashes
+        #[arg(long)]
+        force: bool,
     },
 
     /// Store contexts in central store (~/.ai-contexters/) and optionally sync to memex
@@ -207,6 +219,32 @@ enum Commands {
 
     /// List available projects/sessions
     List,
+
+    /// List context files from global store (references)
+    Refs {
+        /// Hours to look back (filter by file mtime)
+        #[arg(short = 'H', long, default_value = "48")]
+        hours: u64,
+
+        /// Project filter
+        #[arg(short, long)]
+        project: Option<String>,
+    },
+
+    /// Manage dedup state
+    State {
+        /// Reset all dedup hashes
+        #[arg(long)]
+        reset: bool,
+
+        /// Project to reset (with --reset)
+        #[arg(short, long)]
+        project: Option<String>,
+
+        /// Show state info/statistics
+        #[arg(long)]
+        info: bool,
+    },
 
     /// Initialize repo context and run an agent
     Init {
@@ -263,6 +301,7 @@ fn main() -> Result<()> {
             loctree,
             project_root,
             memex,
+            force,
         } => {
             run_extraction(
                 &["claude"],
@@ -277,6 +316,7 @@ fn main() -> Result<()> {
                 loctree,
                 project_root,
                 memex,
+                force,
             )?;
         }
         Commands::Codex {
@@ -290,6 +330,7 @@ fn main() -> Result<()> {
             loctree,
             project_root,
             memex,
+            force,
         } => {
             run_extraction(
                 &["codex"],
@@ -304,6 +345,7 @@ fn main() -> Result<()> {
                 loctree,
                 project_root,
                 memex,
+                force,
             )?;
         }
         Commands::All {
@@ -317,6 +359,7 @@ fn main() -> Result<()> {
             loctree,
             project_root,
             memex,
+            force,
         } => {
             run_extraction(
                 &["claude", "codex", "gemini"],
@@ -331,6 +374,7 @@ fn main() -> Result<()> {
                 loctree,
                 project_root,
                 memex,
+                force,
             )?;
         }
         Commands::Store {
@@ -387,6 +431,16 @@ fn main() -> Result<()> {
             };
             init::run_init(opts)?;
         }
+        Commands::Refs { hours, project } => {
+            run_refs(hours, project)?;
+        }
+        Commands::State {
+            reset,
+            project,
+            info,
+        } => {
+            run_state(reset, project, info)?;
+        }
     }
 
     Ok(())
@@ -406,9 +460,11 @@ fn run_extraction(
     include_loctree: bool,
     project_root: Option<PathBuf>,
     sync_memex: bool,
+    force: bool,
 ) -> Result<()> {
     // Load state for incremental/dedup
     let mut state = StateManager::load();
+    let project_name = project.as_deref().unwrap_or("_global").to_string();
 
     let cutoff = Utc::now() - chrono::Duration::hours(hours as i64);
 
@@ -446,17 +502,19 @@ fn run_extraction(
         entries.extend(agent_entries);
     }
 
-    // Dedup via state
+    // Dedup via state (skip if --force)
     let pre_dedup = entries.len();
-    entries.retain(|e| {
-        let hash = StateManager::content_hash(
-            &e.agent,
-            &e.session_id,
-            e.timestamp.timestamp(),
-            &e.message,
-        );
-        state.is_new(hash)
-    });
+    if !force {
+        entries.retain(|e| {
+            let hash = StateManager::content_hash(
+                &e.agent,
+                &e.session_id,
+                e.timestamp.timestamp(),
+                &e.message,
+            );
+            state.is_new(&project_name, hash)
+        });
+    }
 
     if pre_dedup != entries.len() {
         eprintln!(
@@ -520,11 +578,32 @@ fn run_extraction(
         project_root,
     };
 
-    // Write output
+    // Write local output
     let written = output::write_report(&out_config, &output_entries, &metadata)?;
 
     for path in &written {
         eprintln!("  → {}", path.display());
+    }
+
+    // Dual write: always persist to global store (~/.ai-contexters/contexts/)
+    if !output_entries.is_empty() {
+        let mut groups: std::collections::BTreeMap<(String, String), Vec<output::TimelineEntry>> =
+            std::collections::BTreeMap::new();
+        for entry in &output_entries {
+            let date = entry.timestamp.format("%Y-%m-%d").to_string();
+            groups
+                .entry((entry.agent.clone(), date))
+                .or_default()
+                .push(entry.clone());
+        }
+
+        let mut index = store::load_index();
+        for ((agent_name, date), group_entries) in &groups {
+            let path = store::write_context(&project_name, agent_name, date, group_entries)?;
+            store::update_index(&mut index, &project_name, agent_name, date, group_entries.len());
+            eprintln!("  store → {}", path.display());
+        }
+        store::save_index(&index)?;
     }
 
     // Rotation
@@ -545,7 +624,7 @@ fn run_extraction(
                 e.timestamp.timestamp(),
                 &e.message,
             );
-            state.mark_seen(hash);
+            state.mark_seen(&project_name, hash);
         }
 
         if incremental {
@@ -725,6 +804,100 @@ fn run_store(
         }
     }
 
+    Ok(())
+}
+
+/// List context files from the global store, filtered by recency.
+fn run_refs(hours: u64, project: Option<String>) -> Result<()> {
+    let ctx_dir = store::contexts_dir()?;
+    if !ctx_dir.exists() {
+        eprintln!("No contexts directory found at: {}", ctx_dir.display());
+        return Ok(());
+    }
+
+    let cutoff = std::time::SystemTime::now()
+        - std::time::Duration::from_secs(hours * 3600);
+
+    let mut files: Vec<PathBuf> = Vec::new();
+
+    // Walk contexts/<project>/<agent>/<date>.md
+    let project_dirs: Vec<_> = if let Some(ref p) = project {
+        let d = ctx_dir.join(p);
+        if d.is_dir() { vec![d] } else { vec![] }
+    } else {
+        std::fs::read_dir(&ctx_dir)?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect()
+    };
+
+    for proj_dir in project_dirs {
+        for agent_entry in std::fs::read_dir(&proj_dir)?.filter_map(|e| e.ok()) {
+            let agent_path = agent_entry.path();
+            if !agent_path.is_dir() {
+                continue;
+            }
+            for file_entry in std::fs::read_dir(&agent_path)?.filter_map(|e| e.ok()) {
+                let fpath = file_entry.path();
+                if fpath.extension().is_some_and(|ext| ext == "md")
+                    && let Ok(meta) = fpath.metadata()
+                    && let Ok(mtime) = meta.modified()
+                    && mtime >= cutoff
+                {
+                    files.push(fpath);
+                }
+            }
+        }
+    }
+
+    files.sort();
+
+    if files.is_empty() {
+        eprintln!("No context files found within last {} hours.", hours);
+    } else {
+        for f in &files {
+            println!("{}", f.display());
+        }
+        eprintln!("({} files)", files.len());
+    }
+
+    Ok(())
+}
+
+/// Manage dedup state.
+fn run_state(reset: bool, project: Option<String>, info: bool) -> Result<()> {
+    let mut state = StateManager::load();
+
+    if info {
+        eprintln!("=== State Info ===");
+        eprintln!("  Total hashes: {}", state.total_hashes());
+        eprintln!("  Projects: {}", state.seen_hashes.len());
+        for (proj, set) in &state.seen_hashes {
+            eprintln!("    {}: {} hashes", proj, set.len());
+        }
+        eprintln!("  Watermarks: {}", state.last_processed.len());
+        for (src, ts) in &state.last_processed {
+            eprintln!("    {}: {}", src, ts);
+        }
+        eprintln!("  Runs: {}", state.runs.len());
+        return Ok(());
+    }
+
+    if reset {
+        if let Some(ref p) = project {
+            state.reset_project(p);
+            state.save()?;
+            eprintln!("Reset hashes for project: {}", p);
+        } else {
+            state.reset_all();
+            state.save()?;
+            eprintln!("Reset all dedup hashes.");
+        }
+        return Ok(());
+    }
+
+    eprintln!("Use --info to show state or --reset to clear. See --help.");
     Ok(())
 }
 

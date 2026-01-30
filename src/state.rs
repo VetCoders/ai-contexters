@@ -33,8 +33,12 @@ pub struct RunRecord {
 pub struct StateManager {
     /// Per-source watermark: only process entries newer than this timestamp.
     pub last_processed: HashMap<String, DateTime<Utc>>,
-    /// Content hashes of already-processed entries (dedup set).
-    pub seen_hashes: HashSet<u64>,
+    /// Per-project content hashes of already-processed entries (dedup set).
+    ///
+    /// Key is project name, value is the set of hashes seen for that project.
+    /// This prevents cross-project dedup pollution: entries extracted for
+    /// project A won't be skipped when extracting project B.
+    pub seen_hashes: HashMap<String, HashSet<u64>>,
     /// History of extraction runs.
     pub runs: Vec<RunRecord>,
 }
@@ -48,6 +52,11 @@ impl StateManager {
 
     /// Load state from disk. Creates a fresh default state if the file
     /// does not exist or cannot be parsed.
+    ///
+    /// **Migration:** If the file contains the old flat `HashSet<u64>` format
+    /// for `seen_hashes`, deserialization will fail and we fall back to
+    /// `Default` (empty state). Old hashes are discarded — they have no
+    /// project context and would cause cross-project dedup pollution.
     pub fn load() -> Self {
         let path = match Self::state_path() {
             Ok(p) => p,
@@ -63,6 +72,7 @@ impl StateManager {
             Err(_) => return Self::default(),
         };
 
+        // Try new format first; fall back to default (migration: old flat hashes discarded)
         serde_json::from_str(&contents).unwrap_or_default()
     }
 
@@ -101,14 +111,19 @@ impl StateManager {
         hasher.finish()
     }
 
-    /// Returns `true` if this hash has NOT been seen before (i.e., the entry is new).
-    pub fn is_new(&self, hash: u64) -> bool {
-        !self.seen_hashes.contains(&hash)
+    /// Returns `true` if this hash has NOT been seen before for the given project.
+    pub fn is_new(&self, project: &str, hash: u64) -> bool {
+        self.seen_hashes
+            .get(project)
+            .is_none_or(|set| !set.contains(&hash))
     }
 
-    /// Mark a hash as seen (entry has been processed).
-    pub fn mark_seen(&mut self, hash: u64) {
-        self.seen_hashes.insert(hash);
+    /// Mark a hash as seen for the given project.
+    pub fn mark_seen(&mut self, project: &str, hash: u64) {
+        self.seen_hashes
+            .entry(project.to_string())
+            .or_default()
+            .insert(hash);
     }
 
     // ========================================================================
@@ -148,30 +163,42 @@ impl StateManager {
     // Cleanup API
     // ========================================================================
 
-    /// Prune the hash set to prevent unbounded growth.
+    /// Prune hash sets per-project to prevent unbounded growth.
     ///
-    /// Keeps only the last `max_hashes` entries. Since `HashSet` has no
-    /// insertion order, this drains arbitrary entries — which is acceptable
-    /// because old hashes correspond to entries that would be filtered by
-    /// watermarks anyway.
-    ///
+    /// Each project's set is capped at `max_per_project` entries.
     /// Pass `0` to use the default maximum (`50_000`).
-    pub fn prune_old_hashes(&mut self, max_hashes: usize) {
-        let limit = if max_hashes == 0 {
+    pub fn prune_old_hashes(&mut self, max_per_project: usize) {
+        let limit = if max_per_project == 0 {
             DEFAULT_MAX_HASHES
         } else {
-            max_hashes
+            max_per_project
         };
 
-        if self.seen_hashes.len() <= limit {
-            return;
+        for set in self.seen_hashes.values_mut() {
+            if set.len() <= limit {
+                continue;
+            }
+            let excess = set.len() - limit;
+            let to_remove: Vec<u64> = set.iter().take(excess).copied().collect();
+            for hash in to_remove {
+                set.remove(&hash);
+            }
         }
+    }
 
-        let excess = self.seen_hashes.len() - limit;
-        let to_remove: Vec<u64> = self.seen_hashes.iter().take(excess).copied().collect();
-        for hash in to_remove {
-            self.seen_hashes.remove(&hash);
-        }
+    /// Reset hashes for a specific project.
+    pub fn reset_project(&mut self, project: &str) {
+        self.seen_hashes.remove(project);
+    }
+
+    /// Reset all dedup state.
+    pub fn reset_all(&mut self) {
+        self.seen_hashes.clear();
+    }
+
+    /// Total number of hashes across all projects.
+    pub fn total_hashes(&self) -> usize {
+        self.seen_hashes.values().map(|s| s.len()).sum()
     }
 }
 
@@ -216,13 +243,22 @@ mod tests {
     }
 
     #[test]
-    fn test_is_new_and_mark_seen() {
+    fn test_is_new_and_mark_seen_per_project() {
         let mut state = StateManager::default();
         let hash = StateManager::content_hash("claude", "s1", 100, "msg");
 
-        assert!(state.is_new(hash));
-        state.mark_seen(hash);
-        assert!(!state.is_new(hash));
+        // New for both projects
+        assert!(state.is_new("projA", hash));
+        assert!(state.is_new("projB", hash));
+
+        // Mark seen only in projA
+        state.mark_seen("projA", hash);
+        assert!(!state.is_new("projA", hash));
+        assert!(state.is_new("projB", hash)); // still new for projB
+
+        // Mark seen in projB
+        state.mark_seen("projB", hash);
+        assert!(!state.is_new("projB", hash));
     }
 
     #[test]
@@ -270,31 +306,53 @@ mod tests {
     fn test_prune_old_hashes_below_limit() {
         let mut state = StateManager::default();
         for i in 0..10u64 {
-            state.mark_seen(i);
+            state.mark_seen("proj", i);
         }
 
-        // No pruning needed — set is below limit
         state.prune_old_hashes(100);
-        assert_eq!(state.seen_hashes.len(), 10);
+        assert_eq!(state.seen_hashes["proj"].len(), 10);
     }
 
     #[test]
     fn test_prune_old_hashes_above_limit() {
         let mut state = StateManager::default();
         for i in 0..100u64 {
-            state.mark_seen(i);
+            state.mark_seen("proj", i);
         }
 
         state.prune_old_hashes(30);
-        assert_eq!(state.seen_hashes.len(), 30);
+        assert_eq!(state.seen_hashes["proj"].len(), 30);
     }
 
     #[test]
     fn test_prune_old_hashes_default_limit() {
         let mut state = StateManager::default();
-        // Just verify passing 0 uses the default and doesn't panic
         state.prune_old_hashes(0);
-        assert!(state.seen_hashes.len() <= DEFAULT_MAX_HASHES);
+        assert_eq!(state.total_hashes(), 0);
+    }
+
+    #[test]
+    fn test_reset_project() {
+        let mut state = StateManager::default();
+        state.mark_seen("projA", 1);
+        state.mark_seen("projA", 2);
+        state.mark_seen("projB", 3);
+
+        state.reset_project("projA");
+        assert!(state.is_new("projA", 1));
+        assert!(!state.is_new("projB", 3));
+    }
+
+    #[test]
+    fn test_reset_all() {
+        let mut state = StateManager::default();
+        state.mark_seen("projA", 1);
+        state.mark_seen("projB", 2);
+
+        state.reset_all();
+        assert!(state.is_new("projA", 1));
+        assert!(state.is_new("projB", 2));
+        assert_eq!(state.total_hashes(), 0);
     }
 
     #[test]
@@ -303,25 +361,24 @@ mod tests {
         let t = Utc.with_ymd_and_hms(2026, 1, 20, 15, 30, 0).unwrap();
 
         state.update_watermark("claude:TestProject", t);
-        state.mark_seen(123456789);
-        state.mark_seen(987654321);
+        state.mark_seen("myproj", 123456789);
+        state.mark_seen("myproj", 987654321);
         state.record_run(5, vec!["claude:TestProject".to_string()]);
 
         let json = serde_json::to_string_pretty(&state).unwrap();
         let restored: StateManager = serde_json::from_str(&json).unwrap();
 
         assert_eq!(restored.get_watermark("claude:TestProject"), Some(t));
-        assert!(!restored.is_new(123456789));
-        assert!(!restored.is_new(987654321));
-        assert!(restored.is_new(111111111));
+        assert!(!restored.is_new("myproj", 123456789));
+        assert!(!restored.is_new("myproj", 987654321));
+        assert!(restored.is_new("myproj", 111111111));
+        assert!(restored.is_new("other", 123456789)); // different project
         assert_eq!(restored.runs.len(), 1);
         assert_eq!(restored.runs[0].entries_added, 5);
     }
 
     #[test]
     fn test_state_path_is_under_store() {
-        // Verify the path structure (won't fail on CI with no home dir
-        // because state_path returns Result)
         if let Ok(path) = StateManager::state_path() {
             assert!(path.to_string_lossy().contains(".ai-contexters"));
             assert!(path.to_string_lossy().ends_with("state.json"));

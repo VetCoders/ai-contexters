@@ -15,6 +15,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::output::TimelineEntry;
+use crate::sanitize;
 
 // ============================================================================
 // Path helpers
@@ -179,11 +180,15 @@ pub fn write_context(
 
     if path.exists() {
         // Append mode
-        let mut existing = fs::read_to_string(&path)?;
+        let validated = sanitize::validate_read_path(&path)?;
+        // SECURITY: path sanitized via validate_read_path (traversal + canonicalize + allowlist)
+        let mut existing = fs::read_to_string(&validated)?; // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
         existing.push_str(&content);
-        fs::write(&path, existing)?;
+        let write_path = sanitize::validate_write_path(&path)?;
+        fs::write(&write_path, existing)?;
     } else {
-        fs::write(&path, &content)?;
+        let write_path = sanitize::validate_write_path(&path)?;
+        fs::write(&write_path, &content)?;
     }
 
     Ok(path)

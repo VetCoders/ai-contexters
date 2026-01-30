@@ -18,6 +18,8 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 
+use crate::sanitize;
+
 // ============================================================================
 // Public types
 // ============================================================================
@@ -180,7 +182,9 @@ fn parse_claude_jsonl(
     session_id: &str,
     config: &ExtractionConfig,
 ) -> Result<Vec<TimelineEntry>> {
-    let file = File::open(path)?;
+    let validated = sanitize::validate_read_path(path)?;
+    // SECURITY: path sanitized via validate_read_path (traversal + canonicalize + allowlist)
+    let file = File::open(&validated)?; // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
     let reader = BufReader::new(file);
     let mut entries = Vec::new();
 
@@ -640,7 +644,9 @@ pub fn list_available_sources() -> Result<Vec<SourceInfo>> {
 
 /// Count unique sessions in the Codex history file.
 fn count_codex_sessions(path: &std::path::Path) -> Result<usize> {
-    let file = File::open(path)?;
+    let validated = sanitize::validate_read_path(path)?;
+    // SECURITY: path sanitized via validate_read_path (traversal + canonicalize + allowlist)
+    let file = File::open(&validated)?; // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
     let reader = BufReader::new(file);
     let mut sessions: HashSet<String> = HashSet::new();
 
