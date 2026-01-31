@@ -3,7 +3,7 @@
 //! Creates `.ai-context/` structure, builds context/prompt,
 //! runs the selected agent, and updates share artifacts.
 //!
-//! Created by M&K (c)2026 VetCoders
+//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
 use anyhow::{Context, Result};
 use chrono::{Local, Utc};
@@ -76,11 +76,9 @@ impl Logger {
 
 pub fn run_init(options: InitOptions) -> Result<()> {
     let root = repo_root()?;
-    let project = options.project.unwrap_or_else(|| {
-        root.file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "project".to_string())
-    });
+    let project = options
+        .project
+        .unwrap_or_else(sources::detect_project_name);
 
     let run_id = Local::now().format("%Y%m%d_%H%M%S").to_string();
     let ts_local = Local::now().format("%Y-%m-%d %H:%M").to_string();

@@ -8,7 +8,7 @@
 //! - Gemini Code Assist support
 //! - Proper deduplication
 //!
-//! Created by M&K (c)2026 VetCoders
+//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, TimeZone, Utc};
@@ -640,6 +640,33 @@ pub fn list_available_sources() -> Result<Vec<SourceInfo>> {
     }
 
     Ok(sources)
+}
+
+/// Detect project name from current working directory.
+///
+/// Strategy: git repo root dirname → cwd dirname → "unknown".
+pub fn detect_project_name() -> String {
+    // Try git repo root
+    if let Ok(output) = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+    {
+        if output.status.success() {
+            let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if let Some(name) = std::path::Path::new(&s).file_name() {
+                return name.to_string_lossy().to_string();
+            }
+        }
+    }
+
+    // Fallback: cwd dirname
+    if let Ok(cwd) = std::env::current_dir() {
+        if let Some(name) = cwd.file_name() {
+            return name.to_string_lossy().to_string();
+        }
+    }
+
+    "unknown".to_string()
 }
 
 /// Count unique sessions in the Codex history file.
