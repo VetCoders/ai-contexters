@@ -6,7 +6,7 @@
 //! Prevents path traversal and command injection from user-supplied inputs
 //! (CLI arguments, project names, agent names).
 //!
-//! Created by M&K (c)2026 VetCoders
+//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
 use anyhow::{anyhow, Result};
 use std::path::{Path, PathBuf};
@@ -22,7 +22,6 @@ const ALLOWED_AGENTS: &[&str] = &["claude", "codex"];
 fn contains_traversal(path: &str) -> bool {
     let path_lower = path.to_lowercase();
     path_lower.contains("..")
-        || path_lower.contains("./")
         || path.contains('\0')
         || path.contains('\n')
         || path.contains('\r')
@@ -208,11 +207,11 @@ mod tests {
     fn test_contains_traversal() {
         assert!(contains_traversal("../etc/passwd"));
         assert!(contains_traversal("foo/../bar"));
-        assert!(contains_traversal("./hidden"));
         assert!(contains_traversal("path\0with\0nulls"));
         assert!(contains_traversal("line\nbreak"));
         assert!(!contains_traversal("/normal/path"));
         assert!(!contains_traversal("simple_name"));
+        assert!(!contains_traversal("./relative/path"));
     }
 
     #[test]
