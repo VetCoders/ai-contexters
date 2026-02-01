@@ -55,9 +55,9 @@ enum Commands {
         #[arg(short = 'H', long, default_value = "48")]
         hours: u64,
 
-        /// Output directory
-        #[arg(short, long, default_value = ".")]
-        output: PathBuf,
+        /// Output directory (omit to only write to store)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
 
         /// Output format: md, json, both
         #[arg(short, long, default_value = "both")]
@@ -106,9 +106,9 @@ enum Commands {
         #[arg(short = 'H', long, default_value = "48")]
         hours: u64,
 
-        /// Output directory
-        #[arg(short, long, default_value = ".")]
-        output: PathBuf,
+        /// Output directory (omit to only write to store)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
 
         /// Output format: md, json, both
         #[arg(short, long, default_value = "both")]
@@ -153,9 +153,9 @@ enum Commands {
         #[arg(short = 'H', long, default_value = "48")]
         hours: u64,
 
-        /// Output directory
-        #[arg(short, long, default_value = ".")]
-        output: PathBuf,
+        /// Output directory (omit to only write to store)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
 
         /// Append to a single timeline file
         #[arg(long)]
@@ -327,7 +327,7 @@ fn main() -> Result<()> {
                 &["claude"],
                 project,
                 hours,
-                &output,
+                output.as_deref(),
                 &format,
                 append_to,
                 rotate,
@@ -357,7 +357,7 @@ fn main() -> Result<()> {
                 &["codex"],
                 project,
                 hours,
-                &output,
+                output.as_deref(),
                 &format,
                 append_to,
                 rotate,
@@ -387,7 +387,7 @@ fn main() -> Result<()> {
                 &["claude", "codex", "gemini"],
                 project,
                 hours,
-                &output,
+                output.as_deref(),
                 "both",
                 append_to,
                 rotate,
@@ -486,7 +486,7 @@ fn run_extraction(
     agents: &[&str],
     project: Vec<String>,
     hours: u64,
-    output_dir: &Path,
+    output_dir: Option<&Path>,
     format: &str,
     append_to: Option<PathBuf>,
     rotate: usize,
@@ -563,7 +563,6 @@ fn run_extraction(
         for e in entries {
             let exact = StateManager::content_hash(
                 &e.agent,
-                &e.session_id,
                 e.timestamp.timestamp(),
                 &e.message,
             );
@@ -572,8 +571,6 @@ fn run_extraction(
             }
 
             let overlap = StateManager::overlap_hash(
-                &e.agent,
-                &e.session_id,
                 e.timestamp.timestamp(),
                 &e.message,
             );
@@ -635,44 +632,18 @@ fn run_extraction(
         sessions: sessions.clone(),
     };
 
-    // Build output config
-    let out_format = match format {
-        "md" => OutputFormat::Markdown,
-        "json" => OutputFormat::Json,
-        _ => OutputFormat::Both,
-    };
-
-    let mode = if let Some(ref path) = append_to {
-        OutputMode::AppendTimeline(path.clone())
-    } else {
-        OutputMode::NewFile
-    };
-
-    let out_config = OutputConfig {
-        dir: output_dir.to_path_buf(),
-        format: out_format,
-        mode,
-        max_files: rotate,
-        max_message_chars: 0, // no truncation
-        include_loctree,
-        project_root,
-    };
-
-    // Write local output
-    let written = output::write_report(&out_config, &output_entries, &metadata)?;
-
-    for path in &written {
-        eprintln!("  → {}", path.display());
-    }
-
-    // Dual write: always persist to global store (~/.ai-contexters/contexts/)
+    // ── Store-first: group entries by repo (from cwd) × agent × date ──
     if !output_entries.is_empty() {
-        let mut groups: std::collections::BTreeMap<(String, String), Vec<output::TimelineEntry>> =
-            std::collections::BTreeMap::new();
+        let mut repo_groups: std::collections::BTreeMap<
+            (String, String, String),
+            Vec<output::TimelineEntry>,
+        > = std::collections::BTreeMap::new();
+
         for entry in &output_entries {
+            let repo = sources::repo_name_from_cwd(entry.cwd.as_deref());
             let date = entry.timestamp.format("%Y-%m-%d").to_string();
-            groups
-                .entry((entry.agent.clone(), date))
+            repo_groups
+                .entry((repo, entry.agent.clone(), date))
                 .or_default()
                 .push(entry.clone());
         }
@@ -680,29 +651,79 @@ fn run_extraction(
         let mut index = store::load_index();
         let now = Utc::now();
         let time_str = now.format("%H%M%S").to_string();
-        for ((agent_name, date), group_entries) in &groups {
+
+        // Per-repo summary counters
+        let mut repo_summary: std::collections::BTreeMap<String, std::collections::BTreeMap<String, usize>> =
+            std::collections::BTreeMap::new();
+
+        for ((repo, agent_name, date), group_entries) in &repo_groups {
             let paths =
-                store::write_context(&project_name, agent_name, date, &time_str, group_entries)?;
-            store::update_index(
-                &mut index,
-                &project_name,
-                agent_name,
-                date,
-                group_entries.len(),
-            );
+                store::write_context(repo, agent_name, date, &time_str, group_entries)?;
+            store::update_index(&mut index, repo, agent_name, date, group_entries.len());
+            *repo_summary
+                .entry(repo.clone())
+                .or_default()
+                .entry(agent_name.clone())
+                .or_insert(0) += group_entries.len();
             for path in &paths {
                 eprintln!("  store → {}", path.display());
             }
         }
         store::save_index(&index)?;
+
+        // Print per-repo summary to stderr
+        let store_base = store::store_base_dir().unwrap_or_default();
+        eprintln!(
+            "✓ {} entries → {}",
+            output_entries.len(),
+            store_base.display()
+        );
+        for (repo, agents_map) in &repo_summary {
+            let total: usize = agents_map.values().sum();
+            let detail: Vec<String> = agents_map
+                .iter()
+                .map(|(a, c)| format!("{}: {}", a, c))
+                .collect();
+            eprintln!("  {}: {} entries ({})", repo, total, detail.join(", "));
+        }
     }
 
-    // Rotation
-    if rotate > 0 {
-        let prefix = agents.join("_");
-        let deleted = output::rotate_outputs(output_dir, &prefix, rotate)?;
-        if deleted > 0 {
-            eprintln!("  Rotated: deleted {} old files", deleted);
+    // ── Optional local output (only when -o explicitly passed) ──
+    if let Some(local_dir) = output_dir {
+        let out_format = match format {
+            "md" => OutputFormat::Markdown,
+            "json" => OutputFormat::Json,
+            _ => OutputFormat::Both,
+        };
+
+        let mode = if let Some(ref path) = append_to {
+            OutputMode::AppendTimeline(path.clone())
+        } else {
+            OutputMode::NewFile
+        };
+
+        let out_config = OutputConfig {
+            dir: local_dir.to_path_buf(),
+            format: out_format,
+            mode,
+            max_files: rotate,
+            max_message_chars: 0,
+            include_loctree,
+            project_root,
+        };
+
+        let written = output::write_report(&out_config, &output_entries, &metadata)?;
+        for path in &written {
+            eprintln!("  → {}", path.display());
+        }
+
+        // Rotation
+        if rotate > 0 {
+            let prefix = agents.join("_");
+            let deleted = output::rotate_outputs(local_dir, &prefix, rotate)?;
+            if deleted > 0 {
+                eprintln!("  Rotated: deleted {} old files", deleted);
+            }
         }
     }
 
@@ -713,13 +734,10 @@ fn run_extraction(
             for e in &entries {
                 let exact = StateManager::content_hash(
                     &e.agent,
-                    &e.session_id,
                     e.timestamp.timestamp(),
                     &e.message,
                 );
                 let overlap = StateManager::overlap_hash(
-                    &e.agent,
-                    &e.session_id,
                     e.timestamp.timestamp(),
                     &e.message,
                 );
@@ -751,12 +769,13 @@ fn run_extraction(
         state.save()?;
     }
 
-    eprintln!(
-        "✓ {} entries from {} sessions ({})",
-        output_entries.len(),
-        sessions.len(),
-        agents.join("+"),
-    );
+    if output_entries.is_empty() {
+        eprintln!(
+            "✓ 0 entries from {} sessions ({})",
+            sessions.len(),
+            agents.join("+"),
+        );
+    }
 
     // Memex sync: chunk entries and push to vector store
     if sync_memex && !output_entries.is_empty() {
@@ -862,51 +881,68 @@ fn run_store(
         })
         .collect();
 
-    // Group by agent+date and write to central store
-    let proj_name = if project.is_empty() {
-        "unknown"
-    } else {
-        &project[0]
-    };
+    // Group by repo (from cwd) × agent × date and write to central store
     let mut index = store::load_index();
     let mut stored_count = 0usize;
 
-    // Group entries by (agent, date)
-    let mut groups: std::collections::BTreeMap<(String, String), Vec<output::TimelineEntry>> =
-        std::collections::BTreeMap::new();
+    let mut repo_groups: std::collections::BTreeMap<
+        (String, String, String),
+        Vec<output::TimelineEntry>,
+    > = std::collections::BTreeMap::new();
 
     for entry in &output_entries {
+        let repo = sources::repo_name_from_cwd(entry.cwd.as_deref());
         let date = entry.timestamp.format("%Y-%m-%d").to_string();
-        groups
-            .entry((entry.agent.clone(), date))
+        repo_groups
+            .entry((repo, entry.agent.clone(), date))
             .or_default()
             .push(entry.clone());
     }
 
     let now = Utc::now();
     let time_str = now.format("%H%M%S").to_string();
-    for ((agent_name, date), group_entries) in &groups {
-        let paths = store::write_context(proj_name, agent_name, date, &time_str, group_entries)?;
-        store::update_index(&mut index, proj_name, agent_name, date, group_entries.len());
+
+    let mut repo_summary: std::collections::BTreeMap<String, std::collections::BTreeMap<String, usize>> =
+        std::collections::BTreeMap::new();
+
+    for ((repo, agent_name, date), group_entries) in &repo_groups {
+        let paths = store::write_context(repo, agent_name, date, &time_str, group_entries)?;
+        store::update_index(&mut index, repo, agent_name, date, group_entries.len());
         stored_count += group_entries.len();
+        *repo_summary
+            .entry(repo.clone())
+            .or_default()
+            .entry(agent_name.clone())
+            .or_insert(0) += group_entries.len();
         for path in &paths {
-            eprintln!("  → {} ({} entries)", path.display(), group_entries.len());
+            eprintln!("  store → {}", path.display());
         }
     }
 
     store::save_index(&index)?;
-    eprintln!(
-        "✓ Stored {} entries in {} groups",
-        stored_count,
-        groups.len()
-    );
+
+    let store_base = store::store_base_dir().unwrap_or_default();
+    eprintln!("✓ {} entries → {}", stored_count, store_base.display());
+    for (repo, agents_map) in &repo_summary {
+        let total: usize = agents_map.values().sum();
+        let detail: Vec<String> = agents_map
+            .iter()
+            .map(|(a, c)| format!("{}: {}", a, c))
+            .collect();
+        eprintln!("  {}: {} entries ({})", repo, total, detail.join(", "));
+    }
 
     // Chunk and sync to memex if requested
     if sync_memex && !output_entries.is_empty() {
         let agent_label = agents.join("+");
+        let store_proj = if project.is_empty() {
+            "unknown"
+        } else {
+            &project[0]
+        };
         let chunker_config = ChunkerConfig::default();
         let chunks =
-            chunker::chunk_entries(&output_entries, proj_name, &agent_label, &chunker_config);
+            chunker::chunk_entries(&output_entries, store_proj, &agent_label, &chunker_config);
 
         if !chunks.is_empty() {
             let chunks_dir = store::chunks_dir()?;

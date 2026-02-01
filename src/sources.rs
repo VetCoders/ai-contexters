@@ -658,6 +658,15 @@ pub fn list_available_sources() -> Result<Vec<SourceInfo>> {
     Ok(sources)
 }
 
+/// Extract repo name from a `cwd` path (last path component).
+///
+/// Example: `"/Users/polyversai/Libraxis/lbrx-services"` → `"lbrx-services"`
+pub fn repo_name_from_cwd(cwd: Option<&str>) -> String {
+    cwd.and_then(|c| std::path::Path::new(c).file_name())
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 /// Detect project name from current working directory.
 ///
 /// Strategy: git repo root dirname → cwd dirname → "unknown".
@@ -781,6 +790,21 @@ fn extract_message_text(message: &Option<serde_json::Value>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_repo_name_from_cwd() {
+        assert_eq!(
+            repo_name_from_cwd(Some("/Users/polyversai/Libraxis/lbrx-services")),
+            "lbrx-services"
+        );
+        assert_eq!(
+            repo_name_from_cwd(Some("/Users/polyversai/Libraxis/mlx-batch-runner")),
+            "mlx-batch-runner"
+        );
+        assert_eq!(repo_name_from_cwd(None), "unknown");
+        assert_eq!(repo_name_from_cwd(Some("/")), "unknown");
+        assert_eq!(repo_name_from_cwd(Some("")), "unknown");
+    }
 
     #[test]
     fn test_decode_claude_project_path_with_leading_dash() {

@@ -667,7 +667,8 @@ fn run_claude(
     report_path: &Path,
     config_dir: &Path,
 ) -> Result<String> {
-    let prompt = fs::read_to_string(prompt_path)?;
+    let validated_prompt = sanitize::validate_read_path(prompt_path)?;
+    let prompt = fs::read_to_string(validated_prompt)?;
     let mcp_config = ensure_mcp_config(config_dir)?;
 
     let mut cmd = Command::new("claude");
@@ -760,18 +761,19 @@ fn split_summary_block(report: &str) -> (String, Option<String>) {
 }
 
 fn append_summary(path: &Path, block: &str) -> Result<()> {
-    if !path.exists() {
-        fs::write(path, "# AI Context Summary\n\n")?;
+    let validated = sanitize::validate_write_path(path)?;
+    if !validated.exists() {
+        fs::write(&validated, "# AI Context Summary\n\n")?;
     }
 
-    let mut content = fs::read_to_string(path)?;
+    let mut content = fs::read_to_string(&validated)?;
     if !content.ends_with('\n') {
         content.push('\n');
     }
     content.push_str(block.trim());
     content.push('\n');
     content.push('\n');
-    fs::write(path, content)?;
+    fs::write(&validated, content)?;
     Ok(())
 }
 
