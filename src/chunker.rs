@@ -3,7 +3,7 @@
 //! Splits timeline entries into overlapping windows of ~1.5k tokens,
 //! suitable for vector embedding and semantic search via memex.
 //!
-//! Created by M&K (c)2026 VetCoders
+//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
 use anyhow::Result;
 use std::collections::BTreeMap;
@@ -157,7 +157,8 @@ fn chunk_day_entries(
         let global_end = entries[end - 1].0 + 1;
 
         chunks.push(Chunk {
-            id: format!("{}_{}_{}_{{:03}}", project, agent, date).replace("{:03}", &format!("{:03}", seq)),
+            id: format!("{}_{}_{}_{{:03}}", project, agent, date)
+                .replace("{:03}", &format!("{:03}", seq)),
             project: project.to_string(),
             agent: agent.to_string(),
             date: date.to_string(),
@@ -186,14 +187,22 @@ fn chunk_day_entries(
 }
 
 /// Format entries into chunk text with metadata header.
-pub fn format_chunk_text(entries: &[&TimelineEntry], project: &str, agent: &str, date: &str) -> String {
-    let mut text = format!("[project: {} | agent: {} | date: {}]\n\n", project, agent, date);
+pub fn format_chunk_text(
+    entries: &[&TimelineEntry],
+    project: &str,
+    agent: &str,
+    date: &str,
+) -> String {
+    let mut text = format!(
+        "[project: {} | agent: {} | date: {}]\n\n",
+        project, agent, date
+    );
 
     for entry in entries {
         let time = entry.timestamp.format("%H:%M:%S");
-        // Truncate very long messages to avoid monster chunks
+        // Truncate very long messages to avoid monster chunks (UTF-8 safe).
         let msg = if entry.message.len() > 4000 {
-            format!("{}...[truncated]", &entry.message[..4000])
+            truncate_message_bytes(&entry.message, 4000)
         } else {
             entry.message.clone()
         };
@@ -201,6 +210,17 @@ pub fn format_chunk_text(entries: &[&TimelineEntry], project: &str, agent: &str,
     }
 
     text
+}
+
+fn truncate_message_bytes(message: &str, max_bytes: usize) -> String {
+    let mut cutoff = max_bytes.min(message.len());
+    while cutoff > 0 && !message.is_char_boundary(cutoff) {
+        cutoff -= 1;
+    }
+    let mut out = String::with_capacity(cutoff + 15);
+    out.push_str(&message[..cutoff]);
+    out.push_str("...[truncated]");
+    out
 }
 
 // ============================================================================
@@ -233,7 +253,12 @@ pub fn chunk_summary(chunks: &[Chunk]) -> String {
 
     let total_tokens: usize = chunks.iter().map(|c| c.token_estimate).sum();
     let avg_tokens = total_tokens / chunks.len();
-    let dates: Vec<&str> = chunks.iter().map(|c| c.date.as_str()).collect::<std::collections::HashSet<_>>().into_iter().collect();
+    let dates: Vec<&str> = chunks
+        .iter()
+        .map(|c| c.date.as_str())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
 
     format!(
         "{} chunks, {} total tokens (avg {}), {} days",
@@ -310,7 +335,11 @@ mod tests {
         };
 
         let chunks = chunk_entries(&entries, "proj", "claude", &config);
-        assert!(chunks.len() > 1, "Expected multiple chunks, got {}", chunks.len());
+        assert!(
+            chunks.len() > 1,
+            "Expected multiple chunks, got {}",
+            chunks.len()
+        );
 
         // Verify sequential IDs
         for (i, chunk) in chunks.iter().enumerate() {
@@ -331,7 +360,7 @@ mod tests {
 
         let chunks = chunk_entries(&entries, "proj", "claude", &config);
         // Single long message can't be split within chunker (it's per-message)
-        // but format_chunk_text truncates at 4000 chars
+        // but format_chunk_text truncates at 4000 bytes
         assert_eq!(chunks.len(), 1);
         assert!(chunks[0].text.contains("[truncated]"));
     }
@@ -380,6 +409,19 @@ mod tests {
         assert!(text.starts_with("[project: TestProj | agent: claude | date: 2026-01-22]"));
         assert!(text.contains("[14:30:00] user: hello"));
         assert!(text.contains("[14:31:00] assistant: hi there"));
+    }
+
+    #[test]
+    fn test_format_chunk_text_truncates_utf8_safely() {
+        let mut msg = "a".repeat(3999);
+        msg.push('é'); // 2-byte char forces non-boundary at 4000
+        let entries = [make_entry(14, 30, "user", &msg)];
+        let refs: Vec<&TimelineEntry> = entries.iter().collect();
+
+        let text = format_chunk_text(&refs, "TestProj", "claude", "2026-01-22");
+
+        assert!(text.contains("[truncated]"));
+        assert!(!text.contains('é'));
     }
 
     #[test]

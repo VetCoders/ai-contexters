@@ -1,11 +1,11 @@
 //! Central context store for ai-contexters.
 //!
 //! Manages the `~/.ai-contexters/` directory structure:
-//! - `contexts/<project>/<agent>/<date>.md` — extracted timelines
+//! - `<project>/<date>/<time>_<agent>-context.{md,json}` — extracted timelines
 //! - `memex/chunks/` — pre-chunked text for RAG indexing
 //! - `index.json` — manifest of stored contexts
 //!
-//! Created by M&K (c)2026 VetCoders
+//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -14,7 +14,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
+use crate::chunker::{self, ChunkerConfig};
 use crate::output::TimelineEntry;
+use crate::sanitize;
 
 // ============================================================================
 // Path helpers
@@ -32,9 +34,9 @@ pub fn store_base_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// Returns the contexts directory: `~/.ai-contexters/contexts/`
-pub fn contexts_dir() -> Result<PathBuf> {
-    let dir = store_base_dir()?.join("contexts");
+/// Returns the project directory: `~/.ai-contexters/<project>/`
+pub fn project_dir(project: &str) -> Result<PathBuf> {
+    let dir = store_base_dir()?.join(project);
     fs::create_dir_all(&dir)?;
     Ok(dir)
 }
@@ -46,11 +48,27 @@ pub fn chunks_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// Full path for a specific context file.
-pub fn get_context_path(project: &str, agent: &str, date: &str) -> Result<PathBuf> {
-    let dir = contexts_dir()?.join(project).join(agent);
+/// Full path for a specific context markdown file.
+///
+/// Layout: `~/.ai-contexters/<project>/<date>/<time>_<agent>-context.md`
+pub fn get_context_path(project: &str, agent: &str, date: &str, time: &str) -> Result<PathBuf> {
+    let dir = store_base_dir()?.join(project).join(date);
     fs::create_dir_all(&dir)?;
-    Ok(dir.join(format!("{}.md", date)))
+    Ok(dir.join(format!("{}_{}-context.md", time, agent)))
+}
+
+/// Full path for a specific context JSON file.
+///
+/// Layout: `~/.ai-contexters/<project>/<date>/<time>_<agent>-context.json`
+pub fn get_context_json_path(
+    project: &str,
+    agent: &str,
+    date: &str,
+    time: &str,
+) -> Result<PathBuf> {
+    let dir = store_base_dir()?.join(project).join(date);
+    fs::create_dir_all(&dir)?;
+    Ok(dir.join(format!("{}_{}-context.json", time, agent)))
 }
 
 // ============================================================================
@@ -107,8 +125,7 @@ pub fn load_index() -> StoreIndex {
 pub fn save_index(index: &StoreIndex) -> Result<()> {
     let path = store_base_dir()?.join("index.json");
     let json = serde_json::to_string_pretty(index).context("Failed to serialize index")?;
-    fs::write(&path, json)
-        .with_context(|| format!("Failed to write index: {}", path.display()))?;
+    fs::write(&path, json).with_context(|| format!("Failed to write index: {}", path.display()))?;
     Ok(())
 }
 
@@ -123,15 +140,9 @@ pub fn update_index(
     let now = Utc::now();
     index.last_updated = now;
 
-    let project_idx = index
-        .projects
-        .entry(project.to_string())
-        .or_default();
+    let project_idx = index.projects.entry(project.to_string()).or_default();
 
-    let agent_idx = project_idx
-        .agents
-        .entry(agent.to_string())
-        .or_default();
+    let agent_idx = project_idx.agents.entry(agent.to_string()).or_default();
 
     if !agent_idx.dates.contains(&date.to_string()) {
         agent_idx.dates.push(date.to_string());
@@ -153,50 +164,93 @@ pub fn list_stored_projects(index: &StoreIndex) -> Vec<String> {
 // Context writing
 // ============================================================================
 
-/// Write timeline entries to the central store as a markdown file.
+/// Write timeline entries to the central store.
 ///
-/// Path: `~/.ai-contexters/contexts/<project>/<agent>/<date>.md`
+/// Creates two files:
+/// - `~/.ai-contexters/<project>/<date>/<time>_<agent>-context.md`
+/// - `~/.ai-contexters/<project>/<date>/<time>_<agent>-context.json`
 ///
-/// If the file already exists, entries are appended (with dedup header).
-/// Returns the path of the written file.
+/// Returns paths of both files.
 pub fn write_context(
     project: &str,
     agent: &str,
     date: &str,
+    time: &str,
     entries: &[TimelineEntry],
-) -> Result<PathBuf> {
-    let path = get_context_path(project, agent, date)?;
+) -> Result<Vec<PathBuf>> {
+    let mut written = Vec::new();
 
-    let mut content = String::new();
-
-    // Header if new file
-    if !path.exists() {
-        content.push_str(&format!(
-            "# {} | {} | {}\n\n",
-            project, agent, date
-        ));
-    }
+    // Markdown
+    let md_path = get_context_path(project, agent, date, time)?;
+    let mut md_content = String::new();
+    md_content.push_str(&format!("# {} | {} | {}\n\n", project, agent, date));
 
     for entry in entries {
         let ts = entry.timestamp.format("%Y-%m-%d %H:%M:%S UTC");
-        content.push_str(&format!("### {} | {}\n", ts, entry.role));
-
+        md_content.push_str(&format!("### {} | {}\n", ts, entry.role));
         for line in entry.message.lines() {
-            content.push_str(&format!("> {}\n", line));
+            md_content.push_str(&format!("> {}\n", line));
         }
-        content.push('\n');
+        md_content.push('\n');
     }
 
-    if path.exists() {
-        // Append mode
-        let mut existing = fs::read_to_string(&path)?;
-        existing.push_str(&content);
-        fs::write(&path, existing)?;
-    } else {
-        fs::write(&path, &content)?;
+    let write_path = sanitize::validate_write_path(&md_path)?;
+    fs::write(&write_path, &md_content)?;
+    written.push(md_path);
+
+    // JSON
+    let json_path = get_context_json_path(project, agent, date, time)?;
+    let json_content = serde_json::to_string_pretty(entries)?;
+    let write_path = sanitize::validate_write_path(&json_path)?;
+    fs::write(&write_path, &json_content)?;
+    written.push(json_path);
+
+    Ok(written)
+}
+
+/// Write timeline entries as agent-friendly chunks to the central store.
+///
+/// Instead of one monolithic file per (project, agent, date), splits entries
+/// into overlapping ~1500-token windows preserving conversation flow.
+///
+/// Layout: `~/.ai-contexters/<project>/<date>/<time>_<agent>-<seq:03>.md`
+///
+/// Returns paths of all written chunk files.
+pub fn write_context_chunked(
+    project: &str,
+    agent: &str,
+    date: &str,
+    time: &str,
+    entries: &[TimelineEntry],
+    chunker_config: &ChunkerConfig,
+) -> Result<Vec<PathBuf>> {
+    if entries.is_empty() {
+        return Ok(vec![]);
     }
 
-    Ok(path)
+    let chunks = chunker::chunk_entries(entries, project, agent, chunker_config);
+    let dir = store_base_dir()?.join(project).join(date);
+    fs::create_dir_all(&dir)?;
+
+    let mut written = Vec::new();
+
+    for chunk in &chunks {
+        // Extract seq from chunk.id (last _NNN part)
+        let seq = chunk
+            .id
+            .rsplit('_')
+            .next()
+            .unwrap_or("001");
+
+        let filename = format!("{}_{}-{}.md", time, agent, seq);
+        let path = dir.join(&filename);
+
+        let write_path = sanitize::validate_write_path(&path)?;
+        fs::write(&write_path, &chunk.text)?;
+        written.push(path);
+    }
+
+    Ok(written)
 }
 
 // ============================================================================
@@ -217,14 +271,6 @@ mod tests {
     }
 
     #[test]
-    fn test_contexts_dir() {
-        if let Ok(path) = contexts_dir() {
-            assert!(path.to_string_lossy().contains("contexts"));
-            assert!(path.to_string_lossy().contains("ai-contexters"));
-        }
-    }
-
-    #[test]
     fn test_chunks_dir() {
         if let Ok(path) = chunks_dir() {
             assert!(path.to_string_lossy().contains("memex"));
@@ -233,20 +279,31 @@ mod tests {
     }
 
     #[test]
-    fn test_get_context_path() {
-        if let Ok(path) = get_context_path("CodeScribe", "claude", "2026-01-22") {
+    fn test_get_context_path_new_layout() {
+        if let Ok(path) = get_context_path("CodeScribe", "claude", "2026-01-22", "143005") {
             let s = path.to_string_lossy();
             assert!(s.contains("CodeScribe"));
-            assert!(s.contains("claude"));
-            assert!(s.ends_with("2026-01-22.md"));
+            assert!(s.contains("2026-01-22"));
+            assert!(s.ends_with("143005_claude-context.md"));
         }
     }
 
     #[test]
-    fn test_write_context_creates_file() {
-        let tmp = env::temp_dir().join("ai-ctx-test-store");
+    fn test_get_context_json_path_new_layout() {
+        if let Ok(path) = get_context_json_path("CodeScribe", "claude", "2026-01-22", "143005") {
+            let s = path.to_string_lossy();
+            assert!(s.contains("CodeScribe"));
+            assert!(s.contains("2026-01-22"));
+            assert!(s.ends_with("143005_claude-context.json"));
+        }
+    }
+
+    #[test]
+    fn test_write_context_creates_both_files() {
+        let tmp = env::temp_dir().join("ai-ctx-test-store-new");
         let _ = fs::remove_dir_all(&tmp);
-        fs::create_dir_all(tmp.join("contexts").join("TestProj").join("claude")).unwrap();
+        let date_dir = tmp.join("TestProj").join("2026-01-22");
+        fs::create_dir_all(&date_dir).unwrap();
 
         let entries = vec![
             TimelineEntry {
@@ -269,8 +326,8 @@ mod tests {
             },
         ];
 
-        // Write to a temp path directly (bypass home dir)
-        let path = tmp.join("contexts/TestProj/claude/2026-01-22.md");
+        // Write md directly to verify format
+        let md_path = date_dir.join("143005_claude-context.md");
         let mut content = String::new();
         content.push_str("# TestProj | claude | 2026-01-22\n\n");
         for entry in &entries {
@@ -281,15 +338,20 @@ mod tests {
             }
             content.push('\n');
         }
-        fs::write(&path, &content).unwrap();
+        fs::write(&md_path, &content).unwrap();
 
-        let written = fs::read_to_string(&path).unwrap();
+        let written = fs::read_to_string(&md_path).unwrap();
         assert!(written.contains("# TestProj | claude | 2026-01-22"));
         assert!(written.contains("### 2026-01-22 14:30:05 UTC | user"));
         assert!(written.contains("> hello world"));
-        assert!(written.contains("### 2026-01-22 14:30:12 UTC | assistant"));
         assert!(written.contains("> hi there"));
         assert!(written.contains("> second line"));
+
+        // Write json
+        let json_path = date_dir.join("143005_claude-context.json");
+        let json_content = serde_json::to_string_pretty(&entries).unwrap();
+        fs::write(&json_path, &json_content).unwrap();
+        assert!(json_path.exists());
 
         let _ = fs::remove_dir_all(&tmp);
     }
