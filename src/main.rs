@@ -283,6 +283,10 @@ enum Commands {
         #[arg(long)]
         include_assistant: bool,
 
+        /// Action focus appended to the prompt
+        #[arg(long)]
+        action: Option<String>,
+
         /// Build context/prompt only, do not run an agent
         #[arg(long)]
         no_run: bool,
@@ -448,6 +452,7 @@ fn main() -> Result<()> {
             hours,
             max_lines,
             include_assistant,
+            action,
             no_run,
             no_confirm,
             no_gitignore,
@@ -460,6 +465,7 @@ fn main() -> Result<()> {
                 max_lines,
                 include_assistant,
                 redact_secrets,
+                action,
                 no_run,
                 no_confirm,
                 no_gitignore,
@@ -793,16 +799,11 @@ fn run_extraction(
 
     // Memex sync: chunk entries and push to vector store
     if sync_memex && !output_entries.is_empty() {
-        let proj_name = if project.is_empty() {
-            "unknown"
-        } else {
-            &project[0]
-        };
         let agent_name = agents.join("+");
 
         let chunker_config = ChunkerConfig::default();
         let chunks =
-            chunker::chunk_entries(&output_entries, proj_name, &agent_name, &chunker_config);
+            chunker::chunk_entries(&output_entries, &project_name, &agent_name, &chunker_config);
 
         if !chunks.is_empty() {
             let chunks_dir = store::chunks_dir()?;
@@ -965,13 +966,13 @@ fn run_store(
     if sync_memex && !output_entries.is_empty() {
         let agent_label = agents.join("+");
         let store_proj = if project.is_empty() {
-            "unknown"
+            "_global".to_string()
         } else {
-            &project[0]
+            project.join("+")
         };
         let chunker_config = ChunkerConfig::default();
         let chunks =
-            chunker::chunk_entries(&output_entries, store_proj, &agent_label, &chunker_config);
+            chunker::chunk_entries(&output_entries, &store_proj, &agent_label, &chunker_config);
 
         if !chunks.is_empty() {
             let chunks_dir = store::chunks_dir()?;
