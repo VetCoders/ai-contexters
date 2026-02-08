@@ -34,7 +34,7 @@ Common options:
 - `--append-to <FILE>` append local output to a single file
 - `--rotate <N>` keep only last N local output files (default: `0` = unlimited)
 - `--incremental` incremental mode using a per-source watermark
-- `--include-assistant` include assistant messages (larger contexts)
+- `--user-only` exclude assistant + reasoning messages (default: assistant included)
 - `--loctree` include loctree snapshot in local output
 - `--project-root <DIR>` project root for loctree snapshot (defaults to cwd)
 - `--memex` also chunk + sync to memex after extraction
@@ -76,7 +76,7 @@ Extract timeline from Codex history.
 ai-contexters codex [OPTIONS]
 ```
 
-Same as `claude` except it does not have `--include-assistant` (Codex entries are always user-side).
+Same as `claude`, including assistant messages by default. Use `--user-only` if you want a user-only view.
 
 Example:
 
@@ -101,8 +101,8 @@ Examples:
 # Everything, last 7 days, incremental
 ai-contexters all -H 168 --incremental
 
-# Include assistant messages (Claude-heavy, can be large)
-ai-contexters all -H 48 --include-assistant
+# User-only mode (exclude assistant + reasoning)
+ai-contexters all -H 48 --user-only
 ```
 
 ## `ai-contexters store`
@@ -117,13 +117,13 @@ Options:
 - `-p, --project <PROJECT>...` project name(s)
 - `-a, --agent <AGENT>` `claude`, `codex`, `gemini` (default: all)
 - `-H, --hours <HOURS>` lookback window (default: `48`)
-- `--include-assistant` include assistant messages
+- `--user-only` exclude assistant + reasoning messages (default: assistant included)
 - `--memex` also chunk + sync to memex
 
 Example:
 
 ```bash
-ai-contexters store -p CodeScribe --agent claude -H 720 --include-assistant
+ai-contexters store -p CodeScribe --agent claude -H 720
 ```
 
 ## `ai-contexters memex-sync`
@@ -196,8 +196,10 @@ Options:
 - `--model <MODEL>` model override
 - `-H, --hours <HOURS>` context horizon (default: `4800`)
 - `--max-lines <MAX_LINES>` max lines per section (default: `1200`)
-- `--include-assistant` include assistant messages in context
+- `--user-only` exclude assistant + reasoning messages from context (default: assistant included)
 - `--action <ACTION>` append a focus/action to the prompt
+- `--agent-prompt <PROMPT>` append additional prompt text after core rules (verbatim)
+- `--agent-prompt-file <PATH>` append prompt text loaded from a file (verbatim)
 - `--no-run` build context/prompt only
 - `--no-confirm` skip interactive confirmation
 - `--no-gitignore` do not auto-modify `.gitignore`

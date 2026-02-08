@@ -35,6 +35,8 @@ pub struct InitOptions {
     pub include_assistant: bool,
     pub redact_secrets: bool,
     pub action: Option<String>,
+    pub agent_prompt: Option<String>,
+    pub agent_prompt_file: Option<PathBuf>,
     pub no_run: bool,
     pub no_confirm: bool,
     pub no_gitignore: bool,
@@ -81,7 +83,7 @@ impl Logger {
     }
 }
 
-pub fn run_init(options: InitOptions) -> Result<()> {
+pub fn run_init(mut options: InitOptions) -> Result<()> {
     let root = repo_root()?;
     let project = options.project.unwrap_or_else(sources::detect_project_name);
 
@@ -102,6 +104,12 @@ pub fn run_init(options: InitOptions) -> Result<()> {
     log.line(&format!("project: {}", project));
     if let Some(action) = options.action.as_deref() {
         log.line(&format!("action:  {}", action));
+    }
+    if options.agent_prompt.is_some() {
+        log.line("agent_prompt: (provided)");
+    }
+    if let Some(path) = options.agent_prompt_file.as_deref() {
+        log.line(&format!("agent_prompt_file: {}", path.display()));
     }
     log.line(&format!("run_id:  {}", run_id));
     log.line(&format!("log:     {}", log_path.display()));
@@ -137,11 +145,16 @@ pub fn run_init(options: InitOptions) -> Result<()> {
         "== Step 4/4: build prompt -> {} ==",
         prompt_path.display()
     ));
+    let agent_prompt = resolve_agent_prompt(
+        options.agent_prompt.take(),
+        options.agent_prompt_file.take(),
+    )?;
     let prompt_bytes = build_prompt(
         &prompt_path,
         &paths.context,
         &ts_local,
         options.action.as_deref(),
+        agent_prompt.as_deref(),
     )?;
     if prompt_bytes > PROMPT_SIZE_WARN_BYTES {
         log.warn(&format!(
@@ -511,11 +524,36 @@ fn extract_context(
     Ok(output_entries)
 }
 
+fn resolve_agent_prompt(inline: Option<String>, file: Option<PathBuf>) -> Result<Option<String>> {
+    let mut merged = inline.filter(|s| !s.trim().is_empty());
+
+    if let Some(path) = file {
+        let validated = sanitize::validate_read_path(&path)?;
+        // SECURITY: path sanitized via validate_read_path (traversal + canonicalize + allowlist)
+        let content = fs::read_to_string(&validated).with_context(|| {
+            format!("Failed to read agent prompt file: {}", validated.display())
+        })?;
+        if !content.trim().is_empty() {
+            merged = Some(match merged {
+                Some(mut existing) => {
+                    existing.push_str("\n\n");
+                    existing.push_str(&content);
+                    existing
+                }
+                None => content,
+            });
+        }
+    }
+
+    Ok(merged.filter(|s| !s.trim().is_empty()))
+}
+
 fn build_prompt(
     prompt_path: &Path,
     context_dir: &Path,
     ts_local: &str,
     action: Option<&str>,
+    agent_prompt: Option<&str>,
 ) -> Result<usize> {
     let validated_prompt = sanitize::validate_write_path(prompt_path)?;
     // SECURITY: path sanitized via validate_write_path (traversal + allowlist)
@@ -539,6 +577,15 @@ fn build_prompt(
     if let Some(action) = action {
         writeln!(file, "Action focus (must address):")?;
         writeln!(file, "- {}", action)?;
+        writeln!(file)?;
+    }
+    if let Some(agent_prompt) = agent_prompt {
+        writeln!(file, "Additional agent prompt:")?;
+        writeln!(file)?;
+        file.write_all(agent_prompt.as_bytes())?;
+        if !agent_prompt.ends_with('\n') {
+            writeln!(file)?;
+        }
         writeln!(file)?;
     }
     writeln!(file, "Rules:")?;
@@ -1202,15 +1249,23 @@ mod tests {
         prompt_path: &Path,
         context_dir: &Path,
         action: Option<&str>,
+        agent_prompt: Option<&str>,
     ) -> String {
-        build_prompt(prompt_path, context_dir, "2026-02-03 12:00", action).unwrap();
+        build_prompt(
+            prompt_path,
+            context_dir,
+            "2026-02-03 12:00",
+            action,
+            agent_prompt,
+        )
+        .unwrap();
         fs::read_to_string(prompt_path).unwrap()
     }
 
     #[test]
     fn test_build_prompt_includes_core_rules() {
         let (_root, context_dir, _share_dir, prompt_path) = setup_dirs();
-        let prompt = build_and_read_prompt(&prompt_path, &context_dir, None);
+        let prompt = build_and_read_prompt(&prompt_path, &context_dir, None, None);
 
         assert!(prompt.contains("Exploration schedule (required):"));
         assert!(prompt.contains("Quality gate:"));
@@ -1229,10 +1284,26 @@ mod tests {
             &prompt_path,
             &context_dir,
             Some("Zaimplementuj tę flagę ziom teraz"),
+            None,
         );
 
         assert!(prompt.contains("Action focus (must address):"));
         assert!(prompt.contains("Zaimplementuj tę flagę ziom teraz"));
+    }
+
+    #[test]
+    fn test_build_prompt_includes_agent_prompt() {
+        let (_root, context_dir, _share_dir, prompt_path) = setup_dirs();
+        let prompt = build_and_read_prompt(
+            &prompt_path,
+            &context_dir,
+            None,
+            Some("Extra rule 1\nExtra rule 2"),
+        );
+
+        assert!(prompt.contains("Additional agent prompt:"));
+        assert!(prompt.contains("Extra rule 1"));
+        assert!(prompt.contains("Extra rule 2"));
     }
 
     #[test]
@@ -1251,7 +1322,7 @@ mod tests {
         set_file_mtime(&mid, FileTime::from_unix_time(1_600_000_100, 0)).unwrap();
         set_file_mtime(&new, FileTime::from_unix_time(1_600_000_200, 0)).unwrap();
 
-        let prompt = build_and_read_prompt(&prompt_path, &context_dir, None);
+        let prompt = build_and_read_prompt(&prompt_path, &context_dir, None, None);
 
         let mut in_section = false;
         let mut listed = Vec::new();
@@ -1285,7 +1356,7 @@ mod tests {
         fs::write(&loct, "should not appear").unwrap();
         set_file_mtime(&loct, FileTime::from_unix_time(1_700_000_000, 0)).unwrap();
 
-        let prompt = build_and_read_prompt(&prompt_path, &context_dir, None);
+        let prompt = build_and_read_prompt(&prompt_path, &context_dir, None, None);
         assert!(!prompt.contains("x_loct_for_ai.md"));
     }
 
@@ -1296,7 +1367,7 @@ mod tests {
         fs::write(&shared, "shared").unwrap();
         set_file_mtime(&shared, FileTime::from_unix_time(1_700_000_000, 0)).unwrap();
 
-        let prompt = build_and_read_prompt(&prompt_path, &context_dir, None);
+        let prompt = build_and_read_prompt(&prompt_path, &context_dir, None, None);
         assert!(prompt.contains("shared.md"));
     }
 
@@ -1306,14 +1377,14 @@ mod tests {
         let artifact = context_dir.join("artifact.md");
         fs::write(&artifact, "SENSITIVE_TEST_TOKEN").unwrap();
 
-        let prompt = build_and_read_prompt(&prompt_path, &context_dir, None);
+        let prompt = build_and_read_prompt(&prompt_path, &context_dir, None, None);
         assert!(!prompt.contains("SENSITIVE_TEST_TOKEN"));
     }
 
     #[test]
     fn test_build_prompt_empty_artifacts() {
         let (_root, context_dir, _share_dir, prompt_path) = setup_dirs();
-        let prompt = build_and_read_prompt(&prompt_path, &context_dir, None);
+        let prompt = build_and_read_prompt(&prompt_path, &context_dir, None, None);
         assert!(prompt.contains("(no artifacts found)"));
     }
 }

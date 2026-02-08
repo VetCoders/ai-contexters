@@ -86,8 +86,12 @@ enum Commands {
         #[arg(long)]
         incremental: bool,
 
-        /// Include assistant messages (can be large)
+        /// Only include user messages (exclude assistant + reasoning)
         #[arg(long)]
+        user_only: bool,
+
+        /// Include assistant messages (legacy flag; now default)
+        #[arg(long, hide = true, conflicts_with = "user_only")]
         include_assistant: bool,
 
         /// Include loctree snapshot in output
@@ -141,6 +145,14 @@ enum Commands {
         #[arg(long)]
         incremental: bool,
 
+        /// Only include user messages (exclude assistant + reasoning)
+        #[arg(long)]
+        user_only: bool,
+
+        /// Include assistant messages (legacy flag; now default)
+        #[arg(long, hide = true, conflicts_with = "user_only")]
+        include_assistant: bool,
+
         /// Include loctree snapshot
         #[arg(long)]
         loctree: bool,
@@ -188,8 +200,12 @@ enum Commands {
         #[arg(long)]
         incremental: bool,
 
-        /// Include assistant messages
+        /// Only include user messages (exclude assistant + reasoning)
         #[arg(long)]
+        user_only: bool,
+
+        /// Include assistant messages (legacy flag; now default)
+        #[arg(long, hide = true, conflicts_with = "user_only")]
         include_assistant: bool,
 
         /// Include loctree snapshot
@@ -227,8 +243,12 @@ enum Commands {
         #[arg(short = 'H', long, default_value = "48")]
         hours: u64,
 
-        /// Include assistant messages
+        /// Only include user messages (exclude assistant + reasoning)
         #[arg(long)]
+        user_only: bool,
+
+        /// Include assistant messages (legacy flag; now default)
+        #[arg(long, hide = true, conflicts_with = "user_only")]
         include_assistant: bool,
 
         /// Also chunk and sync to memex
@@ -302,13 +322,25 @@ enum Commands {
         #[arg(long, default_value = "1200")]
         max_lines: usize,
 
-        /// Include assistant messages in context (can be large)
+        /// Only include user messages in context (exclude assistant + reasoning)
         #[arg(long)]
+        user_only: bool,
+
+        /// Include assistant messages (legacy flag; now default)
+        #[arg(long, hide = true, conflicts_with = "user_only")]
         include_assistant: bool,
 
         /// Action focus appended to the prompt
         #[arg(long)]
         action: Option<String>,
+
+        /// Additional agent prompt appended after core rules (verbatim)
+        #[arg(long)]
+        agent_prompt: Option<String>,
+
+        /// Read additional agent prompt from a file (verbatim)
+        #[arg(long)]
+        agent_prompt_file: Option<PathBuf>,
 
         /// Build context/prompt only, do not run an agent
         #[arg(long)]
@@ -344,13 +376,15 @@ fn main() -> Result<()> {
             append_to,
             rotate,
             incremental,
-            include_assistant,
+            user_only,
+            include_assistant: include_assistant_flag,
             loctree,
             project_root,
             memex,
             force,
             emit,
         } => {
+            let include_assistant = include_assistant_flag || !user_only;
             run_extraction(
                 &["claude"],
                 project,
@@ -377,12 +411,15 @@ fn main() -> Result<()> {
             append_to,
             rotate,
             incremental,
+            user_only,
+            include_assistant: include_assistant_flag,
             loctree,
             project_root,
             memex,
             force,
             emit,
         } => {
+            let include_assistant = include_assistant_flag || !user_only;
             run_extraction(
                 &["codex"],
                 project,
@@ -392,7 +429,7 @@ fn main() -> Result<()> {
                 append_to,
                 rotate,
                 incremental,
-                false,
+                include_assistant,
                 loctree,
                 project_root,
                 memex,
@@ -408,13 +445,15 @@ fn main() -> Result<()> {
             append_to,
             rotate,
             incremental,
-            include_assistant,
+            user_only,
+            include_assistant: include_assistant_flag,
             loctree,
             project_root,
             memex,
             force,
             emit,
         } => {
+            let include_assistant = include_assistant_flag || !user_only;
             run_extraction(
                 &["claude", "codex", "gemini"],
                 project,
@@ -437,9 +476,11 @@ fn main() -> Result<()> {
             project,
             agent,
             hours,
-            include_assistant,
+            user_only,
+            include_assistant: include_assistant_flag,
             memex,
         } => {
+            let include_assistant = include_assistant_flag || !user_only;
             run_store(
                 project,
                 agent,
@@ -480,12 +521,16 @@ fn main() -> Result<()> {
             model,
             hours,
             max_lines,
-            include_assistant,
             action,
+            agent_prompt,
+            agent_prompt_file,
+            user_only,
+            include_assistant: include_assistant_flag,
             no_run,
             no_confirm,
             no_gitignore,
         } => {
+            let include_assistant = include_assistant_flag || !user_only;
             let opts = InitOptions {
                 project,
                 agent,
@@ -495,6 +540,8 @@ fn main() -> Result<()> {
                 include_assistant,
                 redact_secrets,
                 action,
+                agent_prompt,
+                agent_prompt_file,
                 no_run,
                 no_confirm,
                 no_gitignore,

@@ -66,10 +66,10 @@ Incremental mode (watermark per source, avoids re-processing):
 ai-contexters all -H 168 --incremental
 ```
 
-Include assistant messages (bigger, but useful for full-context forensic runs):
+User-only mode (smaller output; excludes assistant + reasoning):
 
 ```bash
-ai-contexters claude -p CodeScribe -H 48 --include-assistant
+ai-contexters claude -p CodeScribe -H 48 --user-only
 ```
 
 Memex sync (vector memory):
