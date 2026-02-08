@@ -840,7 +840,7 @@ fn run_claude(model: Option<&str>, prompt_path: &Path, report_path: &Path) -> Re
         let validated_report = sanitize::validate_write_path(report_path)?;
 
         let mut cmd = String::from(
-            "claude --dangerously-skip-permissions -p --output-format stream-json --include-partial-messages",
+            "claude --dangerously-skip-permissions -p --output-format stream-json --include-partial-messages --verbose",
         );
         if let Some(model) = model {
             cmd.push_str(" --model ");
