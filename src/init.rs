@@ -35,6 +35,8 @@ pub struct InitOptions {
     pub include_assistant: bool,
     pub redact_secrets: bool,
     pub action: Option<String>,
+    pub agent_prompt: Option<String>,
+    pub agent_prompt_file: Option<PathBuf>,
     pub no_run: bool,
     pub no_confirm: bool,
     pub no_gitignore: bool,
@@ -81,7 +83,7 @@ impl Logger {
     }
 }
 
-pub fn run_init(options: InitOptions) -> Result<()> {
+pub fn run_init(mut options: InitOptions) -> Result<()> {
     let root = repo_root()?;
     let project = options.project.unwrap_or_else(sources::detect_project_name);
 
@@ -102,6 +104,12 @@ pub fn run_init(options: InitOptions) -> Result<()> {
     log.line(&format!("project: {}", project));
     if let Some(action) = options.action.as_deref() {
         log.line(&format!("action:  {}", action));
+    }
+    if options.agent_prompt.is_some() {
+        log.line("agent_prompt: (provided)");
+    }
+    if let Some(path) = options.agent_prompt_file.as_deref() {
+        log.line(&format!("agent_prompt_file: {}", path.display()));
     }
     log.line(&format!("run_id:  {}", run_id));
     log.line(&format!("log:     {}", log_path.display()));
@@ -137,11 +145,16 @@ pub fn run_init(options: InitOptions) -> Result<()> {
         "== Step 4/4: build prompt -> {} ==",
         prompt_path.display()
     ));
+    let agent_prompt = resolve_agent_prompt(
+        options.agent_prompt.take(),
+        options.agent_prompt_file.take(),
+    )?;
     let prompt_bytes = build_prompt(
         &prompt_path,
         &paths.context,
         &ts_local,
         options.action.as_deref(),
+        agent_prompt.as_deref(),
     )?;
     if prompt_bytes > PROMPT_SIZE_WARN_BYTES {
         log.warn(&format!(
@@ -228,12 +241,21 @@ pub fn run_init(options: InitOptions) -> Result<()> {
     if summary_written {
         log.line(&format!("Summary: {} (updated)", paths.summary.display()));
     } else {
-        log.line(&format!("Summary: {} (not updated)", paths.summary.display()));
+        log.line(&format!(
+            "Summary: {} (not updated)",
+            paths.summary.display()
+        ));
     }
     log.line("Next steps:");
     log.line(&format!("1) Review the report: {}", report_path.display()));
-    log.line(&format!("2) Scan the timeline: {}", paths.timeline.display()));
-    log.line(&format!("3) Check the summary: {}", paths.summary.display()));
+    log.line(&format!(
+        "2) Scan the timeline: {}",
+        paths.timeline.display()
+    ));
+    log.line(&format!(
+        "3) Check the summary: {}",
+        paths.summary.display()
+    ));
 
     Ok(())
 }
@@ -432,8 +454,7 @@ fn resolve_loct_bin() -> Result<PathBuf> {
         }
     }
 
-    let path_var = std::env::var_os("PATH")
-        .ok_or_else(|| anyhow::anyhow!("PATH is not set"))?;
+    let path_var = std::env::var_os("PATH").ok_or_else(|| anyhow::anyhow!("PATH is not set"))?;
     for dir in std::env::split_paths(&path_var) {
         let candidate = dir.join("loct");
         if candidate.is_file() {
@@ -503,11 +524,36 @@ fn extract_context(
     Ok(output_entries)
 }
 
+fn resolve_agent_prompt(inline: Option<String>, file: Option<PathBuf>) -> Result<Option<String>> {
+    let mut merged = inline.filter(|s| !s.trim().is_empty());
+
+    if let Some(path) = file {
+        let validated = sanitize::validate_read_path(&path)?;
+        // SECURITY: path sanitized via validate_read_path (traversal + canonicalize + allowlist)
+        let content = fs::read_to_string(&validated).with_context(|| {
+            format!("Failed to read agent prompt file: {}", validated.display())
+        })?;
+        if !content.trim().is_empty() {
+            merged = Some(match merged {
+                Some(mut existing) => {
+                    existing.push_str("\n\n");
+                    existing.push_str(&content);
+                    existing
+                }
+                None => content,
+            });
+        }
+    }
+
+    Ok(merged.filter(|s| !s.trim().is_empty()))
+}
+
 fn build_prompt(
     prompt_path: &Path,
     context_dir: &Path,
     ts_local: &str,
     action: Option<&str>,
+    agent_prompt: Option<&str>,
 ) -> Result<usize> {
     let validated_prompt = sanitize::validate_write_path(prompt_path)?;
     // SECURITY: path sanitized via validate_write_path (traversal + allowlist)
@@ -531,6 +577,15 @@ fn build_prompt(
     if let Some(action) = action {
         writeln!(file, "Action focus (must address):")?;
         writeln!(file, "- {}", action)?;
+        writeln!(file)?;
+    }
+    if let Some(agent_prompt) = agent_prompt {
+        writeln!(file, "Additional agent prompt:")?;
+        writeln!(file)?;
+        file.write_all(agent_prompt.as_bytes())?;
+        if !agent_prompt.ends_with('\n') {
+            writeln!(file)?;
+        }
         writeln!(file)?;
     }
     writeln!(file, "Rules:")?;
@@ -558,9 +613,15 @@ fn build_prompt(
     writeln!(file, "- Language: English. Tone: direct and concise.")?;
     writeln!(file)?;
     writeln!(file, "Exploration schedule (required):")?;
-    writeln!(file, "1) ai-contexters artifacts (newest-first) + update TIMELINE.md.")?;
+    writeln!(
+        file,
+        "1) ai-contexters artifacts (newest-first) + update TIMELINE.md."
+    )?;
     writeln!(file, "2) Identify red flags / hot spots.")?;
-    writeln!(file, "3) Selective verification in repo code (confirm only).")?;
+    writeln!(
+        file,
+        "3) Selective verification in repo code (confirm only)."
+    )?;
     writeln!(file, "4) TRIAGE.md (unfinished implementations, P0-P2).")?;
     writeln!(file, "5) Generate task prompts (\"Emil Kurier\" format).")?;
     writeln!(file)?;
@@ -598,10 +659,16 @@ fn build_prompt(
     writeln!(file, "- Before finalizing, run:")?;
     writeln!(file, "  - `cargo clippy -- -D warnings`")?;
     writeln!(file, "  - `semgrep scan --config auto`")?;
-    writeln!(file, "  - project tests (if missing, state what should be run).")?;
+    writeln!(
+        file,
+        "  - project tests (if missing, state what should be run)."
+    )?;
     writeln!(file)?;
     writeln!(file, "Task prompt requirements (\"Emil Kurier\" format):")?;
-    writeln!(file, "- Each file is a ready-to-paste prompt for another agent (no pre/post commentary).")?;
+    writeln!(
+        file,
+        "- Each file is a ready-to-paste prompt for another agent (no pre/post commentary)."
+    )?;
     writeln!(file, "- Preserve intent 1:1; do not ask for more details.")?;
     writeln!(file, "- Always includes:")?;
     writeln!(file, "  1) Task description from the current transcript")?;
@@ -613,13 +680,28 @@ fn build_prompt(
     writeln!(file, "     - tests (if missing, you MUST write them)")?;
     writeln!(file, "  4) Expected deliverables")?;
     writeln!(file, "  5) Report expectation")?;
-    writeln!(file, "  6) Appendix: tooling (loctree: `loct auto`, `loct --for-ai`, `loct find <...>`, clippy, etc.) + anti-technical-debt rules (e.g. \"remove all legacy leftovers after refactor\").")?;
-    writeln!(file, "  7) Call to action and a cheesy joke + kaomoji (no emoji). Both must be in English, unique, and the kaomoji must be creative (not a common/recycled one).")?;
-    writeln!(file, "- Tone: tolerant, motivating, empathetic. Kaomoji ALWAYS. No emoji anywhere.")?;
+    writeln!(
+        file,
+        "  6) Appendix: tooling (loctree: `loct auto`, `loct --for-ai`, `loct find <...>`, clippy, etc.) + anti-technical-debt rules (e.g. \"remove all legacy leftovers after refactor\")."
+    )?;
+    writeln!(
+        file,
+        "  7) Call to action and a cheesy joke + kaomoji (no emoji). Both must be in English, unique, and the kaomoji must be creative (not a common/recycled one)."
+    )?;
+    writeln!(
+        file,
+        "- Tone: tolerant, motivating, empathetic. Kaomoji ALWAYS. No emoji anywhere."
+    )?;
     writeln!(file)?;
     writeln!(file, "TRIAGE.md requirements:")?;
-    writeln!(file, "- Each item MUST include a source pointer: artifact path + section/line if available (e.g. `path#L12` or `path:SectionName`).")?;
-    writeln!(file, "- Group items by domain (e.g. Auth Context, Loctree Refactor, Vista UI), then assign P0/P1/P2 within each group.")?;
+    writeln!(
+        file,
+        "- Each item MUST include a source pointer: artifact path + section/line if available (e.g. `path#L12` or `path:SectionName`)."
+    )?;
+    writeln!(
+        file,
+        "- Group items by domain (e.g. Auth Context, Loctree Refactor, Vista UI), then assign P0/P1/P2 within each group."
+    )?;
     writeln!(file)?;
     writeln!(
         file,
@@ -680,8 +762,7 @@ fn build_prompt(
         writeln!(file, "(no artifacts found)")?;
     } else {
         for (path, mtime) in &artifacts {
-            let ts = chrono::DateTime::<Local>::from(*mtime)
-                .format("%Y-%m-%d %H:%M:%S");
+            let ts = chrono::DateTime::<Local>::from(*mtime).format("%Y-%m-%d %H:%M:%S");
             writeln!(file, "- {} (mtime: {})", path.display(), ts)?;
         }
     }
@@ -799,18 +880,14 @@ fn run_agent(
     }
 }
 
-fn run_claude(
-    model: Option<&str>,
-    prompt_path: &Path,
-    report_path: &Path,
-) -> Result<String> {
+fn run_claude(model: Option<&str>, prompt_path: &Path, report_path: &Path) -> Result<String> {
     let validated_prompt = sanitize::validate_read_path(prompt_path)?;
     let bootstrap = bootstrap_prompt(&validated_prompt);
     if should_dispatch_terminal() {
         let validated_report = sanitize::validate_write_path(report_path)?;
 
         let mut cmd = String::from(
-            "claude --dangerously-skip-permissions -p --output-format stream-json --include-partial-messages",
+            "claude --dangerously-skip-permissions -p --output-format stream-json --include-partial-messages --verbose",
         );
         if let Some(model) = model {
             cmd.push_str(" --model ");
@@ -936,10 +1013,7 @@ fn dispatch_terminal(command: &str) -> Result<()> {
             "-e",
             "tell application \"Terminal\" to activate",
             "-e",
-            &format!(
-                "tell application \"Terminal\" to do script \"{}\"",
-                escaped
-            ),
+            &format!("tell application \"Terminal\" to do script \"{}\"", escaped),
         ])
         .status()
         .context("Failed to dispatch command via osascript")?;
@@ -1119,7 +1193,7 @@ fn append_timeline(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use filetime::{set_file_mtime, FileTime};
+    use filetime::{FileTime, set_file_mtime};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1175,15 +1249,23 @@ mod tests {
         prompt_path: &Path,
         context_dir: &Path,
         action: Option<&str>,
+        agent_prompt: Option<&str>,
     ) -> String {
-        build_prompt(prompt_path, context_dir, "2026-02-03 12:00", action).unwrap();
+        build_prompt(
+            prompt_path,
+            context_dir,
+            "2026-02-03 12:00",
+            action,
+            agent_prompt,
+        )
+        .unwrap();
         fs::read_to_string(prompt_path).unwrap()
     }
 
     #[test]
     fn test_build_prompt_includes_core_rules() {
         let (_root, context_dir, _share_dir, prompt_path) = setup_dirs();
-        let prompt = build_and_read_prompt(&prompt_path, &context_dir, None);
+        let prompt = build_and_read_prompt(&prompt_path, &context_dir, None, None);
 
         assert!(prompt.contains("Exploration schedule (required):"));
         assert!(prompt.contains("Quality gate:"));
@@ -1202,10 +1284,26 @@ mod tests {
             &prompt_path,
             &context_dir,
             Some("Zaimplementuj tę flagę ziom teraz"),
+            None,
         );
 
         assert!(prompt.contains("Action focus (must address):"));
         assert!(prompt.contains("Zaimplementuj tę flagę ziom teraz"));
+    }
+
+    #[test]
+    fn test_build_prompt_includes_agent_prompt() {
+        let (_root, context_dir, _share_dir, prompt_path) = setup_dirs();
+        let prompt = build_and_read_prompt(
+            &prompt_path,
+            &context_dir,
+            None,
+            Some("Extra rule 1\nExtra rule 2"),
+        );
+
+        assert!(prompt.contains("Additional agent prompt:"));
+        assert!(prompt.contains("Extra rule 1"));
+        assert!(prompt.contains("Extra rule 2"));
     }
 
     #[test]
@@ -1224,7 +1322,7 @@ mod tests {
         set_file_mtime(&mid, FileTime::from_unix_time(1_600_000_100, 0)).unwrap();
         set_file_mtime(&new, FileTime::from_unix_time(1_600_000_200, 0)).unwrap();
 
-        let prompt = build_and_read_prompt(&prompt_path, &context_dir, None);
+        let prompt = build_and_read_prompt(&prompt_path, &context_dir, None, None);
 
         let mut in_section = false;
         let mut listed = Vec::new();
@@ -1258,7 +1356,7 @@ mod tests {
         fs::write(&loct, "should not appear").unwrap();
         set_file_mtime(&loct, FileTime::from_unix_time(1_700_000_000, 0)).unwrap();
 
-        let prompt = build_and_read_prompt(&prompt_path, &context_dir, None);
+        let prompt = build_and_read_prompt(&prompt_path, &context_dir, None, None);
         assert!(!prompt.contains("x_loct_for_ai.md"));
     }
 
@@ -1269,7 +1367,7 @@ mod tests {
         fs::write(&shared, "shared").unwrap();
         set_file_mtime(&shared, FileTime::from_unix_time(1_700_000_000, 0)).unwrap();
 
-        let prompt = build_and_read_prompt(&prompt_path, &context_dir, None);
+        let prompt = build_and_read_prompt(&prompt_path, &context_dir, None, None);
         assert!(prompt.contains("shared.md"));
     }
 
@@ -1279,14 +1377,14 @@ mod tests {
         let artifact = context_dir.join("artifact.md");
         fs::write(&artifact, "SENSITIVE_TEST_TOKEN").unwrap();
 
-        let prompt = build_and_read_prompt(&prompt_path, &context_dir, None);
+        let prompt = build_and_read_prompt(&prompt_path, &context_dir, None, None);
         assert!(!prompt.contains("SENSITIVE_TEST_TOKEN"));
     }
 
     #[test]
     fn test_build_prompt_empty_artifacts() {
         let (_root, context_dir, _share_dir, prompt_path) = setup_dirs();
-        let prompt = build_and_read_prompt(&prompt_path, &context_dir, None);
+        let prompt = build_and_read_prompt(&prompt_path, &context_dir, None, None);
         assert!(prompt.contains("(no artifacts found)"));
     }
 }
