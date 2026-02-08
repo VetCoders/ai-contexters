@@ -21,10 +21,17 @@ The output text format is stable and line-oriented:
 ```text
 [project: <project> | agent: <agent> | date: <YYYY-MM-DD>]
 
+[signals]
+...
+[/signals]
+
 [HH:MM:SS] <role>: <message>
 [HH:MM:SS] <role>: <message>
 ...
 ```
+
+The `[signals]` block is optional and only appears when the chunk contains at least one
+high-signal marker (checklist items, intent lines, results, or keyword-based highlights).
 
 ## Tuning Knobs
 
@@ -39,19 +46,23 @@ Practical guidance:
 - Decrease `overlap_messages` if your store grows too fast.
 - Keep `max_tokens` bounded to avoid “monster chunks” that get expensive to embed and hard to retrieve.
 
-## Highlight Extraction
+## Signals + Highlight Extraction
 
-Chunks also compute lightweight “highlights” (see `extract_highlights` in `src/chunker.rs`).
+Chunks compute lightweight “signals” and “highlights” (see `extract_signals` and
+`extract_highlights` in `src/chunker.rs`).
 
-Today, highlights:
+Signals (persisted in the chunk text as `[signals]...[/signals]`):
+- TODO checklist extraction (`- [ ]`, `- [x]`) with a prominent "RED LIGHT" marker when open items exist
+- intent-line extraction (example: "mam taki pomysl, zeby ...")
+- result-line extraction (example: "SMOKE TEST PASSED", "0 failed")
+- optional inclusion of keyword-based highlights as "Notes"
+
+Highlights (programmatic only):
 - extract up to 3 first lines that match keyword heuristics (e.g. `Decision:`, `TODO:`, `Plan:`)
 - are stored on the in-memory `Chunk` struct as `highlights: Vec<String>`
 
-Current status:
-- highlights are not written into chunk files yet
-- highlights are not yet used as memex metadata
-
-This is a deliberate staging step so we can refine the heuristic before persisting it.
+Note: "highlights" are currently included in the `[signals]` block as "Notes" for
+agent visibility, but they are also kept separately on the `Chunk` struct for tooling.
 
 ## Efficiency Notes (Where To Improve)
 
@@ -63,4 +74,3 @@ The current chunker is correct and tested, but there are clear performance wins 
 4. Reduce per-chunk string work in hot paths (chunk IDs and text builders).
 
 If you implement these, keep tests in `src/chunker.rs` as the behavioral contract.
-

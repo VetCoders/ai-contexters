@@ -6,7 +6,7 @@
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
 use anyhow::Result;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -148,7 +148,8 @@ fn chunk_day_entries(
         // Build chunk from entries[start..end]
         let window: Vec<&TimelineEntry> = entries[start..end].iter().map(|(_, e)| *e).collect();
         let highlights = extract_highlights(&window);
-        let text = format_chunk_text(&window, project, agent, date);
+        let signals = extract_signals(&window);
+        let text = format_chunk_text_inner(&window, project, agent, date, &signals, &highlights);
         let token_estimate = estimate_tokens(&text);
 
         let session_id = window
@@ -197,10 +198,28 @@ pub fn format_chunk_text(
     agent: &str,
     date: &str,
 ) -> String {
+    let highlights = extract_highlights(entries);
+    let signals = extract_signals(entries);
+    format_chunk_text_inner(entries, project, agent, date, &signals, &highlights)
+}
+
+fn format_chunk_text_inner(
+    entries: &[&TimelineEntry],
+    project: &str,
+    agent: &str,
+    date: &str,
+    signals: &ChunkSignals,
+    highlights: &[String],
+) -> String {
     let mut text = format!(
         "[project: {} | agent: {} | date: {}]\n\n",
         project, agent, date
     );
+
+    if let Some(block) = format_signals_block(signals, highlights) {
+        text.push_str(&block);
+        text.push('\n');
+    }
 
     for entry in entries {
         let time = entry.timestamp.format("%H:%M:%S");
@@ -252,6 +271,304 @@ fn is_highlight_message(message: &str) -> bool {
         || HIGHLIGHT_KEYWORDS_CASE_SENSITIVE
             .iter()
             .any(|kw| message.contains(kw))
+}
+
+// ============================================================================
+// Signals (intent + checklists)
+// ============================================================================
+
+#[derive(Debug, Clone, Default)]
+struct ChunkSignals {
+    todo_open: Vec<String>,
+    todo_done: Vec<String>,
+    intents: Vec<String>,
+    results: Vec<String>,
+}
+
+const MAX_TODO_ITEMS: usize = 8;
+const MAX_INTENT_LINES: usize = 6;
+const MAX_RESULT_LINES: usize = 6;
+
+const INTENT_KEYWORDS: &[&str] = &[
+    // Polish
+    "mam pomysl",
+    "mam pomysł",
+    "mam taki pomysl",
+    "mam taki pomysł",
+    "pomysl",
+    "pomysł",
+    "proponuje",
+    "proponuję",
+    "zrobmy",
+    "zróbmy",
+    "ustalmy",
+    "ustalmy",
+    "chce",
+    "chcę",
+    "chcialbym",
+    "chciałbym",
+    "potrzebuje",
+    "potrzebuję",
+    "następny krok",
+    "nastepny krok",
+    "kolejny krok",
+    // English
+    "i want",
+    "i'd like",
+    "let's",
+    "next step",
+];
+
+const RESULT_KEYWORDS: &[&str] = &[
+    "smoke test",
+    "passed",
+    "all checks passed",
+    "0 failed",
+    "completed",
+    "done",
+    "zrobione",
+    "dowiezione",
+    "gotowe",
+    "dziala",
+    "działa",
+];
+
+fn extract_signals(entries: &[&TimelineEntry]) -> ChunkSignals {
+    let (todo_open, todo_done) = extract_checklist_items(entries);
+    let intents = extract_intent_lines(entries);
+    let results = extract_result_lines(entries);
+
+    ChunkSignals {
+        todo_open,
+        todo_done,
+        intents,
+        results,
+    }
+}
+
+fn extract_checklist_items(entries: &[&TimelineEntry]) -> (Vec<String>, Vec<String>) {
+    #[derive(Debug, Clone, Copy)]
+    enum TaskState {
+        Open,
+        Done,
+    }
+
+    let mut state_by_key: HashMap<String, TaskState> = HashMap::new();
+    let mut display_by_key: HashMap<String, String> = HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+
+    for entry in entries {
+        for line in entry.message.lines() {
+            if let Some((is_done, task)) = parse_checklist_task(line) {
+                let key = normalize_key(&task);
+                if !state_by_key.contains_key(&key) {
+                    order.push(key.clone());
+                    display_by_key.insert(key.clone(), task);
+                    state_by_key.insert(key.clone(), TaskState::Open);
+                }
+
+                // Once a task is marked done anywhere, keep it done.
+                if is_done {
+                    state_by_key.insert(key, TaskState::Done);
+                }
+            }
+        }
+    }
+
+    let mut open = Vec::new();
+    let mut done = Vec::new();
+    for key in order {
+        let Some(task) = display_by_key.get(&key) else {
+            continue;
+        };
+        match state_by_key.get(&key) {
+            Some(TaskState::Done) => done.push(task.clone()),
+            Some(TaskState::Open) => open.push(task.clone()),
+            None => {}
+        }
+    }
+
+    (open, done)
+}
+
+fn parse_checklist_task(line: &str) -> Option<(bool, String)> {
+    let l = line.trim_start();
+    let mut chars = l.chars();
+    let bullet = chars.next()?;
+    if !matches!(bullet, '-' | '*' | '+') {
+        return None;
+    }
+    let rest = chars.as_str().trim_start();
+    let rest = rest.strip_prefix('[')?;
+    let mut chars = rest.chars();
+    let state = chars.next()?;
+    let rest = chars.as_str();
+    let rest = rest.strip_prefix(']')?;
+    let task = rest.trim_start();
+    if task.is_empty() {
+        return None;
+    }
+
+    match state {
+        'x' | 'X' => Some((true, task.trim().to_string())),
+        ' ' => Some((false, task.trim().to_string())),
+        _ => None,
+    }
+}
+
+fn extract_intent_lines(entries: &[&TimelineEntry]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+
+    for entry in entries {
+        if entry.role.to_lowercase() != "user" {
+            continue;
+        }
+        for line in entry.message.lines().map(str::trim) {
+            if line.is_empty() {
+                continue;
+            }
+            if !is_intent_line(line) {
+                continue;
+            }
+
+            let key = normalize_key(line);
+            if !seen.insert(key) {
+                continue;
+            }
+
+            out.push(truncate_signal_line(line));
+            if out.len() >= MAX_INTENT_LINES {
+                return out;
+            }
+        }
+    }
+
+    out
+}
+
+fn is_intent_line(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    INTENT_KEYWORDS.iter().any(|kw| lower.contains(kw))
+}
+
+fn extract_result_lines(entries: &[&TimelineEntry]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+
+    for entry in entries {
+        for line in entry.message.lines().map(str::trim) {
+            if line.is_empty() {
+                continue;
+            }
+            if !is_result_line(line) {
+                continue;
+            }
+            let key = normalize_key(line);
+            if !seen.insert(key) {
+                continue;
+            }
+            out.push(truncate_signal_line(line));
+            if out.len() >= MAX_RESULT_LINES {
+                return out;
+            }
+        }
+    }
+
+    out
+}
+
+fn is_result_line(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    RESULT_KEYWORDS.iter().any(|kw| lower.contains(kw))
+}
+
+fn normalize_key(s: &str) -> String {
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn truncate_signal_line(line: &str) -> String {
+    const MAX_BYTES: usize = 240;
+    if line.len() <= MAX_BYTES {
+        return line.to_string();
+    }
+    truncate_message_bytes(line, MAX_BYTES)
+}
+
+fn format_signals_block(signals: &ChunkSignals, highlights: &[String]) -> Option<String> {
+    let has_any = !signals.todo_open.is_empty()
+        || !signals.todo_done.is_empty()
+        || !signals.intents.is_empty()
+        || !signals.results.is_empty()
+        || !highlights.is_empty();
+    if !has_any {
+        return None;
+    }
+
+    let mut out = String::new();
+    out.push_str("[signals]\n");
+
+    if !signals.todo_open.is_empty() || !signals.todo_done.is_empty() {
+        if !signals.todo_open.is_empty() {
+            out.push_str(&format!(
+                "RED LIGHT: checklist detected (open: {}, done: {})\n",
+                signals.todo_open.len(),
+                signals.todo_done.len()
+            ));
+        } else {
+            out.push_str(&format!(
+                "Checklist detected (open: 0, done: {})\n",
+                signals.todo_done.len()
+            ));
+        }
+
+        for task in signals.todo_open.iter().take(MAX_TODO_ITEMS) {
+            out.push_str(&format!("- [ ] {}\n", task));
+        }
+        if signals.todo_open.len() > MAX_TODO_ITEMS {
+            out.push_str(&format!(
+                "... (+{} more open)\n",
+                signals.todo_open.len() - MAX_TODO_ITEMS
+            ));
+        }
+
+        for task in signals.todo_done.iter().take(MAX_TODO_ITEMS) {
+            out.push_str(&format!("- [x] {}\n", task));
+        }
+        if signals.todo_done.len() > MAX_TODO_ITEMS {
+            out.push_str(&format!(
+                "... (+{} more done)\n",
+                signals.todo_done.len() - MAX_TODO_ITEMS
+            ));
+        }
+    }
+
+    if !signals.intents.is_empty() {
+        out.push_str("Intent:\n");
+        for line in &signals.intents {
+            out.push_str(&format!("- {}\n", line));
+        }
+    }
+
+    if !signals.results.is_empty() {
+        out.push_str("Results:\n");
+        for line in &signals.results {
+            out.push_str(&format!("- {}\n", line));
+        }
+    }
+
+    if !highlights.is_empty() {
+        out.push_str("Notes:\n");
+        for line in highlights {
+            out.push_str(&format!("- {}\n", truncate_signal_line(line)));
+        }
+    }
+
+    out.push_str("[/signals]\n");
+    Some(out)
 }
 
 fn truncate_message_bytes(message: &str, max_bytes: usize) -> String {
@@ -599,5 +916,26 @@ mod tests {
                 "KEY architectural choice"
             ]
         );
+    }
+
+    #[test]
+    fn test_format_chunk_text_includes_signals_for_checklist_and_intent() {
+        let entries = [make_entry(
+            14,
+            30,
+            "user",
+            "No i tutaj mam taki pomysł, żeby to zrobić\n- [ ] pierwsza rzecz\n- [x] druga rzecz",
+        )];
+        let refs: Vec<&TimelineEntry> = entries.iter().collect();
+
+        let text = format_chunk_text(&refs, "TestProj", "claude", "2026-01-22");
+
+        assert!(text.contains("[signals]"));
+        assert!(text.contains("RED LIGHT: checklist detected (open: 1, done: 1)"));
+        assert!(text.contains("- [ ] pierwsza rzecz"));
+        assert!(text.contains("- [x] druga rzecz"));
+        assert!(text.contains("Intent:"));
+        assert!(text.contains("No i tutaj mam taki pomysł, żeby to zrobić"));
+        assert!(text.contains("[/signals]"));
     }
 }
