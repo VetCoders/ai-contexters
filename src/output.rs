@@ -208,6 +208,44 @@ pub fn write_report(
     Ok(written_paths)
 }
 
+/// Write a Markdown report to an explicit file path (overwrites).
+///
+/// This is a lightweight helper used by the CLI `extract` subcommand where
+/// the user wants a single output file like `/tmp/report.md` instead of
+/// the timestamped output directory layout.
+pub fn write_markdown_report_to_path(
+    path: &Path,
+    entries: &[TimelineEntry],
+    metadata: &ReportMetadata,
+    max_chars: usize,
+    loctree_snapshot: Option<&str>,
+) -> Result<PathBuf> {
+    let validated = sanitize::validate_write_path(path)?;
+    if let Some(parent) = validated.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create parent dir: {}", parent.display()))?;
+    }
+
+    write_markdown_full(&validated, entries, metadata, max_chars, loctree_snapshot)?;
+    Ok(validated)
+}
+
+/// Write a JSON report to an explicit file path (overwrites).
+pub fn write_json_report_to_path(
+    path: &Path,
+    entries: &[TimelineEntry],
+    metadata: &ReportMetadata,
+) -> Result<PathBuf> {
+    let validated = sanitize::validate_write_path(path)?;
+    if let Some(parent) = validated.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create parent dir: {}", parent.display()))?;
+    }
+
+    write_json_report(&validated, entries, metadata)?;
+    Ok(validated)
+}
+
 /// Delete oldest files matching `{prefix}_memory_*.{json,md}`, keeping only `max_files`.
 /// Returns number of files deleted.
 pub fn rotate_outputs(dir: &Path, prefix: &str, max_files: usize) -> Result<usize> {

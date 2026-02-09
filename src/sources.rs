@@ -272,6 +272,92 @@ fn parse_claude_jsonl(
     Ok(entries)
 }
 
+/// Extract timeline entries from a single Claude JSONL-like file by path.
+///
+/// This is intentionally a "direct file" extractor used by:
+/// `ai-contexters extract --format claude <path> -o <out.md>`
+///
+/// Unlike `extract_claude()`, this does not require the file to live under
+/// `~/.claude/projects/**` nor to have a `.jsonl` extension (Claude task outputs
+/// often end with `.output` but are still JSONL).
+pub fn extract_claude_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
+    let validated = sanitize::validate_read_path(path)?;
+    // SECURITY: path sanitized via validate_read_path (traversal + canonicalize + allowlist)
+    let file = File::open(&validated)?; // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+    let reader = BufReader::new(file);
+    let mut entries = Vec::new();
+
+    let default_session_id = validated
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let entry: ClaudeEntry = match serde_json::from_str(&line) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        // Only process user/assistant messages
+        if entry.entry_type != "user" && entry.entry_type != "assistant" {
+            continue;
+        }
+
+        // Skip assistant messages if not requested
+        if !config.include_assistant && entry.entry_type == "assistant" {
+            continue;
+        }
+
+        // Parse timestamp
+        let timestamp = match &entry.timestamp {
+            Some(ts) => match DateTime::parse_from_rfc3339(ts) {
+                Ok(dt) => dt.with_timezone(&Utc),
+                Err(_) => continue,
+            },
+            None => continue,
+        };
+
+        // Respect cutoff
+        if timestamp < config.cutoff {
+            continue;
+        }
+
+        // Respect watermark (skip already-processed entries)
+        if config.watermark.is_some_and(|wm| timestamp <= wm) {
+            continue;
+        }
+
+        // Extract message text
+        let message = extract_message_text(&entry.message);
+        if message.is_empty() {
+            continue;
+        }
+
+        // Prefer embedded sessionId when present (task outputs are often renamed).
+        let session_id = entry
+            .session_id
+            .unwrap_or_else(|| default_session_id.clone());
+
+        entries.push(TimelineEntry {
+            timestamp,
+            agent: "claude".to_string(),
+            session_id,
+            role: entry.entry_type,
+            message,
+            branch: entry.git_branch,
+            cwd: entry.cwd,
+        });
+    }
+
+    entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    Ok(entries)
+}
+
 // ============================================================================
 // Claude history.jsonl extractor
 // ============================================================================
@@ -1219,6 +1305,7 @@ fn extract_message_text(message: &Option<serde_json::Value>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn test_repo_name_from_cwd() {
@@ -1267,6 +1354,35 @@ mod tests {
         let encoded = "-a-b-c-d-e-f";
         let decoded = decode_claude_project_path(encoded);
         assert_eq!(decoded, "a/b/c/d/e/f");
+    }
+
+    #[test]
+    fn test_extract_claude_file_parses_text_only_blocks() {
+        let tmp = std::env::temp_dir().join("ai-ctx-claude-direct.jsonl");
+        let _ = fs::remove_file(&tmp);
+
+        let content = r#"{"type":"user","message":{"role":"user","content":"Hello"},"timestamp":"2026-02-09T22:03:06.765Z","sessionId":"sess123","gitBranch":"main","cwd":"/tmp"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Hi"}]},"timestamp":"2026-02-09T22:03:07.765Z","sessionId":"sess123"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"echo hi"}}]},"timestamp":"2026-02-09T22:03:08.765Z","sessionId":"sess123"}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]},"timestamp":"2026-02-09T22:03:09.765Z","sessionId":"sess123"}"#;
+        fs::write(&tmp, content).unwrap();
+
+        let cutoff = Utc.timestamp_opt(0, 0).single().unwrap();
+        let config = ExtractionConfig {
+            project_filter: vec![],
+            cutoff,
+            include_assistant: true,
+            watermark: None,
+        };
+
+        let entries = extract_claude_file(&tmp, &config).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].role, "user");
+        assert_eq!(entries[0].message, "Hello");
+        assert_eq!(entries[1].role, "assistant");
+        assert_eq!(entries[1].message, "Hi");
+
+        let _ = fs::remove_file(&tmp);
     }
 
     #[test]

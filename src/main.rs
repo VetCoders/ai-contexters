@@ -54,6 +54,13 @@ enum StdoutEmit {
     None,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ExtractInputFormat {
+    Claude,
+    Codex,
+    Gemini,
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Extract timeline from Claude Code sessions
@@ -227,6 +234,35 @@ enum Commands {
         /// What to print to stdout: paths, json, none (default: paths)
         #[arg(long, value_enum, default_value_t = StdoutEmit::Paths)]
         emit: StdoutEmit,
+    },
+
+    /// Extract timeline from a single agent session file (direct path).
+    ///
+    /// Example:
+    ///   ai-contexters extract --format claude /path/to/session.jsonl -o /tmp/report.md
+    Extract {
+        /// Input format (agent): claude | codex | gemini
+        #[arg(long, value_enum, alias = "input-format")]
+        format: ExtractInputFormat,
+
+        /// Input file path (JSONL / JSON depending on agent)
+        input: PathBuf,
+
+        /// Output file path (e.g. /tmp/report.md)
+        #[arg(short, long)]
+        output: PathBuf,
+
+        /// Only include user messages (exclude assistant + reasoning)
+        #[arg(long)]
+        user_only: bool,
+
+        /// Include assistant messages (legacy flag; now default)
+        #[arg(long, hide = true, conflicts_with = "user_only")]
+        include_assistant: bool,
+
+        /// Maximum message characters in markdown (0 = no truncation)
+        #[arg(long, default_value = "0")]
+        max_message_chars: usize,
     },
 
     /// Store contexts in central store (~/.ai-contexters/) and optionally sync to memex
@@ -472,6 +508,24 @@ fn main() -> Result<()> {
                 emit,
             )?;
         }
+        Commands::Extract {
+            format,
+            input,
+            output,
+            user_only,
+            include_assistant: include_assistant_flag,
+            max_message_chars,
+        } => {
+            let include_assistant = include_assistant_flag || !user_only;
+            run_extract_file(
+                format,
+                input,
+                output,
+                include_assistant,
+                max_message_chars,
+                redact_secrets,
+            )?;
+        }
         Commands::Store {
             project,
             agent,
@@ -558,6 +612,103 @@ fn main() -> Result<()> {
         } => {
             run_state(reset, project, info)?;
         }
+    }
+
+    Ok(())
+}
+
+fn run_extract_file(
+    format: ExtractInputFormat,
+    input: PathBuf,
+    output_path: PathBuf,
+    include_assistant: bool,
+    max_message_chars: usize,
+    redact_secrets: bool,
+) -> Result<()> {
+    // For direct file extraction we intentionally don't apply a time cutoff;
+    // set cutoff far in the past.
+    let cutoff = Utc::now() - chrono::Duration::days(365 * 200);
+    let config = ExtractionConfig {
+        project_filter: vec![],
+        cutoff,
+        include_assistant,
+        watermark: None,
+    };
+
+    let mut entries = match format {
+        ExtractInputFormat::Claude => sources::extract_claude_file(&input, &config)?,
+        ExtractInputFormat::Codex => {
+            anyhow::bail!(
+                "extract --format codex not implemented yet (use `ai-contexters codex ...` for now)"
+            )
+        }
+        ExtractInputFormat::Gemini => {
+            anyhow::bail!(
+                "extract --format gemini not implemented yet (use `ai-contexters all ...` for now)"
+            )
+        }
+    };
+
+    // Sort by timestamp (extractors should already do this).
+    entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+
+    // Convert sources::TimelineEntry → output::TimelineEntry
+    let output_entries: Vec<output::TimelineEntry> = entries
+        .iter()
+        .map(|e| output::TimelineEntry {
+            timestamp: e.timestamp,
+            agent: e.agent.clone(),
+            session_id: e.session_id.clone(),
+            role: e.role.clone(),
+            message: if redact_secrets {
+                ai_contexters::redact::redact_secrets(&e.message)
+            } else {
+                e.message.clone()
+            },
+            branch: e.branch.clone(),
+            cwd: e.cwd.clone(),
+        })
+        .collect();
+
+    // Collect unique sessions
+    let mut sessions: Vec<String> = entries.iter().map(|e| e.session_id.clone()).collect();
+    sessions.sort();
+    sessions.dedup();
+
+    let file_label = input
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "(unknown)".to_string());
+
+    let hours_back = entries
+        .first()
+        .map(|e| (Utc::now() - e.timestamp).num_hours().max(0) as u64)
+        .unwrap_or(0);
+
+    let metadata = ReportMetadata {
+        generated_at: Utc::now(),
+        project_filter: Some(format!("file: {file_label}")),
+        hours_back,
+        total_entries: output_entries.len(),
+        sessions,
+    };
+
+    let ext = output_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("md")
+        .to_lowercase();
+
+    if ext == "json" {
+        output::write_json_report_to_path(&output_path, &output_entries, &metadata)?;
+    } else {
+        output::write_markdown_report_to_path(
+            &output_path,
+            &output_entries,
+            &metadata,
+            max_message_chars,
+            None,
+        )?;
     }
 
     Ok(())
