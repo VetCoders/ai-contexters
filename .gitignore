@@ -17,3 +17,4 @@ agents/state/
 !.ai-context/share/artifacts/prompts/*.md
 *.log
 /.ai-context
+*.zip

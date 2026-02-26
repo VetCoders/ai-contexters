@@ -13,6 +13,7 @@ use anyhow::Result;
 use chrono::Utc;
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use ai_contexters::chunker::{self, ChunkerConfig};
@@ -1286,10 +1287,25 @@ fn run_refs(hours: u64, project: Option<String>) -> Result<()> {
     if files.is_empty() {
         eprintln!("No context files found within last {} hours.", hours);
     } else {
+        let stdout = io::stdout();
+        let mut out = io::BufWriter::new(stdout.lock());
         for f in &files {
-            println!("{}", f.display());
+            if let Err(err) = writeln!(out, "{}", f.display()) {
+                if err.kind() == io::ErrorKind::BrokenPipe {
+                    return Ok(());
+                }
+                return Err(err.into());
+            }
         }
-        eprintln!("({} files)", files.len());
+        if let Err(err) = out.flush() {
+            if err.kind() == io::ErrorKind::BrokenPipe {
+                return Ok(());
+            }
+            return Err(err.into());
+        }
+        if io::stderr().is_terminal() {
+            eprintln!("({} files)", files.len());
+        }
     }
 
     Ok(())
