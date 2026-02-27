@@ -15,12 +15,12 @@ import urllib.parse
 import urllib.error
 from typing import Optional
 
-API_KEY = os.environ.get("BRAVE_API_KEY", "")
 API_URL = "https://api.search.brave.com/res/v1/web/search"
 
 
 def search(query: str, count: int = 8, lang: Optional[str] = None) -> dict:
-    if not API_KEY:
+    api_key = os.environ.get("BRAVE_API_KEY", "")
+    if not api_key:
         return {"error": "BRAVE_API_KEY environment variable is not set"}
     params = {"q": query, "count": str(count)}
     if lang:
@@ -30,7 +30,7 @@ def search(query: str, count: int = 8, lang: Optional[str] = None) -> dict:
     req = urllib.request.Request(url, headers={
         "Accept": "application/json",
         "Accept-Encoding": "identity",
-        "X-Subscription-Token": API_KEY,
+        "X-Subscription-Token": api_key,
     })
 
     try:

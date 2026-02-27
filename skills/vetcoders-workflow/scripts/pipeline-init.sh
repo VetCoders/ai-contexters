@@ -54,16 +54,12 @@ Pipeline: .ai-agents/pipeline/SLUG_PLACEHOLDER/
 - [ ] Skip to Implement
 CONTEXT_EOF
 
-# Replace placeholders (portable: works on both macOS BSD sed and GNU sed)
-if sed --version >/dev/null 2>&1; then
-    # GNU sed
-    sed -i "s/SLUG_PLACEHOLDER/$SLUG/g" "$PIPELINE_DIR/CONTEXT.md"
-    sed -i "s/DATE_PLACEHOLDER/$(date +%Y-%m-%d)/g" "$PIPELINE_DIR/CONTEXT.md"
-else
-    # BSD sed (macOS)
-    sed -i '' "s/SLUG_PLACEHOLDER/$SLUG/g" "$PIPELINE_DIR/CONTEXT.md"
-    sed -i '' "s/DATE_PLACEHOLDER/$(date +%Y-%m-%d)/g" "$PIPELINE_DIR/CONTEXT.md"
-fi
+# Replace placeholders (portable: sed -i.bak works on both GNU and BSD sed)
+sed -i.bak \
+    -e "s/SLUG_PLACEHOLDER/$SLUG/g" \
+    -e "s/DATE_PLACEHOLDER/$(date +%Y-%m-%d)/g" \
+    "$PIPELINE_DIR/CONTEXT.md"
+rm "$PIPELINE_DIR/CONTEXT.md.bak"
 
 echo "Pipeline initialized: $PIPELINE_DIR"
 echo ""
