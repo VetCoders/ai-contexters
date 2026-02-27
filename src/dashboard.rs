@@ -1477,6 +1477,58 @@ mod tests {
         assert!(joined.contains("notes"));
     }
 
+    #[test]
+    fn collect_json_strings_respects_depth_limit() {
+        // Build a JSON value nested deeper than MAX_JSON_RECURSE_DEPTH (64)
+        let mut value = serde_json::json!("deep_leaf");
+        for _ in 0..80 {
+            value = serde_json::json!({ "nest": value });
+        }
+
+        let mut out = Vec::new();
+        let mut chars = 0usize;
+        collect_json_strings(&value, &mut out, &mut chars, 50, 1000);
+        // The leaf is at depth 80 — beyond the 64-level guard, so it must NOT be collected
+        assert!(
+            !out.iter().any(|s| s.contains("deep_leaf")),
+            "depth guard should prevent collecting strings beyond MAX_JSON_RECURSE_DEPTH"
+        );
+    }
+
+    #[test]
+    fn static_html_strips_absolute_paths() {
+        let root = mk_tmp_dir("ai_ctx_dashboard_paths");
+        let proj = root.join("demo").join("2026-02-24");
+        fs::create_dir_all(&proj).expect("proj");
+        fs::write(
+            proj.join("120000_claude-context.md"),
+            "# demo\n\n### 2026-02-24 12:00:00 UTC | user\n> hi\n",
+        )
+        .expect("md");
+
+        let cfg = DashboardConfig {
+            store_root: root.clone(),
+            title: "test".to_string(),
+            preview_chars: 100,
+            include_absolute_paths: false,
+        };
+
+        let artifact = build_dashboard(&cfg).expect("dashboard");
+        // The store root path must not appear in the HTML
+        let root_str = root.display().to_string();
+        assert!(
+            !artifact.html.contains(&root_str),
+            "static HTML should not contain the store_root absolute path"
+        );
+        // absolute_path fields should be empty in the embedded JSON
+        assert!(
+            !artifact.html.contains("absolute_path\":\"/" ),
+            "static HTML should not contain any non-empty absolute_path"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[cfg(unix)]
     #[test]
     fn scan_skips_symlinked_files() {
