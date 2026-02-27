@@ -1334,12 +1334,11 @@ mod tests {
             if in_section && line.starts_with("Notes:") {
                 break;
             }
-            if in_section {
-                if let Some(rest) = line.strip_prefix("- ") {
-                    if let Some((path, _)) = rest.split_once(" (mtime:") {
-                        listed.push(path.to_string());
-                    }
-                }
+            if in_section
+                && let Some(rest) = line.strip_prefix("- ")
+                && let Some((path, _)) = rest.split_once(" (mtime:")
+            {
+                listed.push(path.to_string());
             }
         }
 

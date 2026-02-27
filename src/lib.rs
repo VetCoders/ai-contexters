@@ -3,6 +3,8 @@
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
 pub mod chunker;
+pub mod dashboard;
+pub mod dashboard_server;
 pub mod init;
 pub mod memex;
 pub mod output;

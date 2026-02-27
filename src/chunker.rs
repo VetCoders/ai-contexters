@@ -1008,7 +1008,7 @@ mod tests {
 
     #[test]
     fn test_extract_highlights_filters_keywords() {
-        let entries = vec![
+        let entries = [
             make_entry(10, 0, "user", "Decision: lock chunking heuristics"),
             make_entry(10, 1, "assistant", "Just chatting"),
             make_entry(10, 2, "user", "TODO: add summarization notes"),

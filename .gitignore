@@ -18,3 +18,4 @@ agents/state/
 *.log
 /.ai-context
 *.zip
+/.ai-agents

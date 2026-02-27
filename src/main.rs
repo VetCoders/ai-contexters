@@ -9,14 +9,17 @@
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
+use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use ai_contexters::chunker::{self, ChunkerConfig};
+use ai_contexters::dashboard::{self, DashboardConfig};
+use ai_contexters::dashboard_server::{self, DashboardServerConfig};
 use ai_contexters::init::{self, InitOptions};
 use ai_contexters::memex::{self, MemexConfig};
 use ai_contexters::output::{self, OutputConfig, OutputFormat, OutputMode, ReportMetadata};
@@ -337,6 +340,52 @@ enum Commands {
         info: bool,
     },
 
+    /// Generate a searchable HTML dashboard from the ai-contexters store.
+    Dashboard {
+        /// Store root directory (default: ~/.ai-contexters)
+        #[arg(long)]
+        store_root: Option<PathBuf>,
+
+        /// Output HTML path
+        #[arg(short, long, default_value = "ai-contexters-dashboard.html")]
+        output: PathBuf,
+
+        /// Document title
+        #[arg(long, default_value = "AI Contexters Dashboard")]
+        title: String,
+
+        /// Max preview characters per record (0 = no truncation)
+        #[arg(long, default_value = "320")]
+        preview_chars: usize,
+    },
+
+    /// Run dashboard HTTP server with on-demand regeneration endpoints.
+    DashboardServe {
+        /// Store root directory (default: ~/.ai-contexters)
+        #[arg(long)]
+        store_root: Option<PathBuf>,
+
+        /// Bind host IP address (example: 127.0.0.1)
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+
+        /// Bind TCP port
+        #[arg(long, default_value = "8033")]
+        port: u16,
+
+        /// Artifact path written on startup and each regeneration
+        #[arg(long, default_value = "ai-contexters-dashboard.html")]
+        artifact: PathBuf,
+
+        /// Document title
+        #[arg(long, default_value = "AI Contexters Dashboard")]
+        title: String,
+
+        /// Max preview characters per record (0 = no truncation)
+        #[arg(long, default_value = "320")]
+        preview_chars: usize,
+    },
+
     /// Initialize repo context and run an agent
     Init {
         /// Project name override
@@ -612,6 +661,36 @@ fn main() -> Result<()> {
             info,
         } => {
             run_state(reset, project, info)?;
+        }
+        Commands::Dashboard {
+            store_root,
+            output,
+            title,
+            preview_chars,
+        } => {
+            run_dashboard(DashboardRunArgs {
+                store_root,
+                output,
+                title,
+                preview_chars,
+            })?;
+        }
+        Commands::DashboardServe {
+            store_root,
+            host,
+            port,
+            artifact,
+            title,
+            preview_chars,
+        } => {
+            run_dashboard_server(DashboardServerRunArgs {
+                store_root,
+                host,
+                port,
+                artifact,
+                title,
+                preview_chars,
+            })?;
         }
     }
 
@@ -1390,5 +1469,112 @@ fn run_memex_sync(namespace: &str, per_chunk: bool, db_path: Option<PathBuf>) ->
         eprintln!("  Error: {}", err);
     }
 
+    Ok(())
+}
+
+/// Build and write an AI context dashboard HTML file.
+struct DashboardServerRunArgs {
+    store_root: Option<PathBuf>,
+    host: String,
+    port: u16,
+    artifact: PathBuf,
+    title: String,
+    preview_chars: usize,
+}
+
+/// Run dashboard server mode with artifact regeneration endpoints.
+fn run_dashboard_server(args: DashboardServerRunArgs) -> Result<()> {
+    let root = if let Some(path) = args.store_root {
+        path
+    } else {
+        store::store_base_dir()?
+    };
+    let host: std::net::IpAddr = args.host.parse().with_context(|| {
+        format!(
+            "Invalid --host IP address '{}'. Example valid value: 127.0.0.1",
+            args.host
+        )
+    })?;
+    if !host.is_loopback() {
+        return Err(anyhow::anyhow!(
+            "Refusing non-loopback --host '{}'. Dashboard server is local-only for safety.",
+            host
+        ));
+    }
+    let artifact_path = ai_contexters::sanitize::validate_write_path(&args.artifact)?;
+
+    let config = DashboardServerConfig {
+        store_root: root,
+        title: args.title,
+        preview_chars: args.preview_chars,
+        artifact_path,
+        host,
+        port: args.port,
+    };
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("Failed to create tokio runtime for dashboard server")?;
+
+    runtime.block_on(dashboard_server::run_dashboard_server(config))
+}
+
+/// Build and write an AI context dashboard HTML file.
+struct DashboardRunArgs {
+    store_root: Option<PathBuf>,
+    output: PathBuf,
+    title: String,
+    preview_chars: usize,
+}
+
+/// Build and write an AI context dashboard HTML file.
+fn run_dashboard(args: DashboardRunArgs) -> Result<()> {
+    let root = if let Some(path) = args.store_root {
+        path
+    } else {
+        store::store_base_dir()?
+    };
+
+    let config = DashboardConfig {
+        store_root: root.clone(),
+        title: args.title,
+        preview_chars: args.preview_chars,
+    };
+
+    let artifact = dashboard::build_dashboard(&config)?;
+
+    let mut output_path = ai_contexters::sanitize::validate_write_path(&args.output)?;
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create output directory: {}", parent.display()))?;
+    }
+    output_path = ai_contexters::sanitize::validate_write_path(&output_path)?;
+    fs::write(&output_path, artifact.html)
+        .with_context(|| format!("Failed to write dashboard: {}", output_path.display()))?;
+
+    eprintln!("✓ Dashboard generated");
+    eprintln!("  Output: {}", output_path.display());
+    eprintln!("  Store: {}", root.display());
+    eprintln!(
+        "  Stats: {} projects, {} days, {} files, {} agents",
+        artifact.stats.total_projects,
+        artifact.stats.total_days,
+        artifact.stats.total_files,
+        artifact.stats.agents_detected
+    );
+    eprintln!("  Backend: {}", artifact.stats.search_backend);
+    eprintln!(
+        "  Estimated timeline entries: {}",
+        artifact.stats.total_entries_estimate
+    );
+    if !artifact.assumptions.is_empty() {
+        eprintln!("  Assumptions:");
+        for assumption in artifact.assumptions.iter().take(8) {
+            eprintln!("    - {}", assumption);
+        }
+    }
+
+    println!("{}", output_path.display());
     Ok(())
 }

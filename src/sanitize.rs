@@ -120,27 +120,37 @@ pub fn validate_write_path(path: &Path) -> Result<PathBuf> {
         return Ok(canonical);
     }
 
-    // New path — validate parent or grandparent
-    if let Some(parent) = path.parent() {
-        if parent.exists() {
-            let canonical_parent = canonicalize_existing(parent)?;
-            if !is_under_allowed_base(&canonical_parent)? {
-                return Err(anyhow!(
-                    "Parent directory '{}' is not under an allowed directory",
-                    canonical_parent.display()
-                ));
-            }
-        } else if let Some(grandparent) = parent.parent()
-            && grandparent.exists()
-        {
-            let canonical_gp = canonicalize_existing(grandparent)?;
-            if !is_under_allowed_base(&canonical_gp)? {
-                return Err(anyhow!(
-                    "Path '{}' would be created outside allowed directories",
-                    path.display()
-                ));
-            }
+    // New path — walk ancestors until we find an existing base directory and validate it.
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| anyhow!("Cannot determine current directory: {}", e))?
+            .join(path)
+    };
+
+    let mut ancestor = Some(candidate.as_path());
+    let mut existing_ancestor = None;
+    while let Some(current) = ancestor {
+        if current.exists() {
+            existing_ancestor = Some(canonicalize_existing(current)?);
+            break;
         }
+        ancestor = current.parent();
+    }
+
+    let canonical_base = existing_ancestor.ok_or_else(|| {
+        anyhow!(
+            "Cannot validate write path '{}': no existing ancestor found",
+            path.display()
+        )
+    })?;
+
+    if !is_under_allowed_base(&canonical_base)? {
+        return Err(anyhow!(
+            "Path '{}' would be created outside allowed directories",
+            path.display()
+        ));
     }
 
     Ok(path.to_path_buf())
@@ -251,6 +261,18 @@ mod tests {
     fn test_validate_write_path_traversal() {
         let bad = Path::new("/tmp/../../../etc/evil.txt");
         assert!(validate_write_path(bad).is_err());
+    }
+
+    #[test]
+    fn test_validate_write_path_rejects_non_allowed_ancestor() {
+        let bad = Path::new("/etc/ai-contexters-test/nope/file.txt");
+        assert!(validate_write_path(bad).is_err());
+    }
+
+    #[test]
+    fn test_validate_write_path_relative_with_missing_parents() {
+        let nested = Path::new("target/ai-ctx-sanitize-new/subdir/new.txt");
+        assert!(validate_write_path(nested).is_ok());
     }
 
     #[test]
