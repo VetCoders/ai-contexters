@@ -31,29 +31,29 @@ Trigger when the user asks to delegate work with full isolation, especially:
 - Agents are the **copies of yourself** - same smart, same capable, but light and agile due to lack of overwhelming context you carry - you can trust them as you **trust yourself**
 --- 
 ## Goal
-Create a small fleet of subagents that each get a precise task into `/.ai-agents/plans/`. 
+Create a small fleet of subagents that each get a precise task into `.ai-agents/plans/`. 
 #### Delegate:
 - **exploration** - on user request or /init command
 - **research** - on the codebase or any requested topic
 - **implementation** - from little fixes to huge refactors, the agents can handle this!
 
-then collect their results in `/.ai-agents/reports/` in the current repo.
+then collect their results in `.ai-agents/reports/` in the current repo.
 
 ## Standard workflow
 1) **Clarify scope** (if needed)
    - If tasks are not explicit, propose a split (2–5 items) and ask for confirmation.
 
 2) **Prepare repo folders**
-   - Ensure `/.ai-agents/plans/` and `/.ai-agents/reports/` exist in the repo root.
+   - Ensure `.ai-agents/plans/` and `.ai-agents/reports/` exist in the repo root.
 
-3) **Write one plan per subagent** in `/.ai-agents/plans/`
+3) **Write one plan per subagent** in `.ai-agents/plans/`
    - Keep it high level, decisive, and test‑gated.
    - Provide the initial **reason** and **context** for the plan
    - Give the clear `[ ]` todolist with hard `[x]` refinement requirement at the end 
    - Include acceptance criteria and required checks.
    - Include 'Call to action' motivational sentence with Koamoji for decoration and brand stamp
 
-4) **Spawn subagents** (Codex or Claude) and write output to `/.ai-agents/reports/`
+4) **Spawn subagents** (Codex or Claude) and write output to `.ai-agents/reports/`
 
 5) **Keep the standard VetCoders Tools and Quality Gate**
    - loctree-mcp as **first-choice** exploration and search tool with `fail-fast` if inaccessible
@@ -182,8 +182,8 @@ nohup bash -c 'unset CLAUDECODE && cd "'"$ROOT"'" && claude -p \
 </details>
 
 ## Output convention
-- Plans: `/.ai-agents/plans/<timestamp>_<slug>_<agent>.md`
-- Reports: `/.ai-agents/reports/<timestamp>_<slug>_<agent>.md`
+- Plans: `.ai-agents/plans/<timestamp>_<slug>_<agent>.md`
+- Reports: `.ai-agents/reports/<timestamp>_<slug>_<agent>.md`
 - Implementations: standard git flow
 
 ## Safety rules - to b   in the :

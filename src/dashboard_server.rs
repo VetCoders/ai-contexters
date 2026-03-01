@@ -178,7 +178,9 @@ async fn get_dashboard_html(State(state): State<Arc<DashboardServerState>>) -> i
     (headers, Html(snapshot.html.clone()))
 }
 
-async fn get_status(State(state): State<Arc<DashboardServerState>>) -> Json<DashboardStatusResponse> {
+async fn get_status(
+    State(state): State<Arc<DashboardServerState>>,
+) -> Json<DashboardStatusResponse> {
     let snapshot = state.snapshot.read().await;
     Json(DashboardStatusResponse {
         ok: true,
@@ -340,7 +342,10 @@ fn write_dashboard_artifact(path: &Path, html: &str) -> Result<()> {
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(err) => {
                 return Err(err).with_context(|| {
-                    format!("Failed to create temporary artifact: {}", tmp_path.display())
+                    format!(
+                        "Failed to create temporary artifact: {}",
+                        tmp_path.display()
+                    )
                 });
             }
         }
@@ -455,7 +460,8 @@ mod tests {
             .build()
             .expect("runtime");
 
-        let response = runtime.block_on(regenerate_dashboard(State(state.clone()), HeaderMap::new()));
+        let response =
+            runtime.block_on(regenerate_dashboard(State(state.clone()), HeaderMap::new()));
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert!(!state.rebuilding.load(Ordering::SeqCst));
 

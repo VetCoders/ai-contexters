@@ -13,6 +13,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -323,6 +324,10 @@ enum Commands {
         /// Project filter
         #[arg(short, long)]
         project: Option<String>,
+
+        /// Compact summary instead of raw file paths
+        #[arg(long)]
+        summary: bool,
     },
 
     /// Manage dedup state
@@ -652,8 +657,12 @@ fn main() -> Result<()> {
             };
             init::run_init(opts)?;
         }
-        Commands::Refs { hours, project } => {
-            run_refs(hours, project)?;
+        Commands::Refs {
+            hours,
+            project,
+            summary,
+        } => {
+            run_refs(hours, project, summary)?;
         }
         Commands::State {
             reset,
@@ -1322,7 +1331,7 @@ fn run_store(
 }
 
 /// List context files from the global store, filtered by recency.
-fn run_refs(hours: u64, project: Option<String>) -> Result<()> {
+fn run_refs(hours: u64, project: Option<String>, summary: bool) -> Result<()> {
     let base = store::store_base_dir()?;
 
     let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(hours * 3600);
@@ -1365,6 +1374,8 @@ fn run_refs(hours: u64, project: Option<String>) -> Result<()> {
 
     if files.is_empty() {
         eprintln!("No context files found within last {} hours.", hours);
+    } else if summary {
+        print_refs_summary(&files)?;
     } else {
         let stdout = io::stdout();
         let mut out = io::BufWriter::new(stdout.lock());
@@ -1385,6 +1396,172 @@ fn run_refs(hours: u64, project: Option<String>) -> Result<()> {
         if io::stderr().is_terminal() {
             eprintln!("({} files)", files.len());
         }
+    }
+
+    Ok(())
+}
+
+#[derive(Default)]
+struct RefsAgentSummary {
+    files: usize,
+    days: BTreeSet<String>,
+}
+
+#[derive(Default)]
+struct RefsProjectSummary {
+    total_files: usize,
+    min_date: Option<String>,
+    max_date: Option<String>,
+    latest: Option<String>,
+    agents: BTreeMap<String, RefsAgentSummary>,
+}
+
+fn extract_agent_from_filename(path: &Path) -> String {
+    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+        return "unknown".to_string();
+    };
+    let Some((_, tail)) = stem.split_once('_') else {
+        return "unknown".to_string();
+    };
+    let agent = tail
+        .split_once('-')
+        .map(|(a, _)| a)
+        .filter(|a| !a.is_empty())
+        .unwrap_or(tail);
+    if agent.is_empty() {
+        "unknown".to_string()
+    } else {
+        agent.to_ascii_lowercase()
+    }
+}
+
+fn print_refs_summary(files: &[PathBuf]) -> Result<()> {
+    let mut by_project: BTreeMap<String, RefsProjectSummary> = BTreeMap::new();
+
+    for path in files {
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown-file")
+            .to_string();
+        let date = path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown-date")
+            .to_string();
+        let project = path
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("_unknown")
+            .to_string();
+        let latest_rel = format!("{}/{}", date, file_name);
+        let agent = extract_agent_from_filename(path);
+
+        let project_summary = by_project.entry(project).or_default();
+        project_summary.total_files += 1;
+
+        if project_summary
+            .min_date
+            .as_ref()
+            .is_none_or(|min_date| &date < min_date)
+        {
+            project_summary.min_date = Some(date.clone());
+        }
+        if project_summary
+            .max_date
+            .as_ref()
+            .is_none_or(|max_date| &date > max_date)
+        {
+            project_summary.max_date = Some(date.clone());
+        }
+        if project_summary
+            .latest
+            .as_ref()
+            .is_none_or(|latest| &latest_rel > latest)
+        {
+            project_summary.latest = Some(latest_rel);
+        }
+
+        let agent_summary = project_summary.agents.entry(agent).or_default();
+        agent_summary.files += 1;
+        agent_summary.days.insert(date);
+    }
+
+    let stdout = io::stdout();
+    let mut out = io::BufWriter::new(stdout.lock());
+
+    for (idx, (project, summary)) in by_project.iter().enumerate() {
+        if idx > 0
+            && let Err(err) = writeln!(out)
+        {
+            if err.kind() == io::ErrorKind::BrokenPipe {
+                return Ok(());
+            }
+            return Err(err.into());
+        }
+
+        let date_range = match (&summary.min_date, &summary.max_date) {
+            (Some(min), Some(max)) => format!("{min} .. {max}"),
+            _ => "unknown".to_string(),
+        };
+
+        if let Err(err) = writeln!(
+            out,
+            "{}: {} files ({})",
+            project, summary.total_files, date_range
+        ) {
+            if err.kind() == io::ErrorKind::BrokenPipe {
+                return Ok(());
+            }
+            return Err(err.into());
+        }
+
+        let agent_width = summary
+            .agents
+            .keys()
+            .map(|agent| agent.len() + 1)
+            .max()
+            .unwrap_or(1);
+        let files_width = summary
+            .agents
+            .values()
+            .map(|agent| agent.files.to_string().len())
+            .max()
+            .unwrap_or(1);
+
+        for (agent, data) in &summary.agents {
+            let agent_label = format!("{agent}:");
+            if let Err(err) = writeln!(
+                out,
+                "  {agent_label:agent_width$} {files:>files_width$} files ({days} days)",
+                files = data.files,
+                days = data.days.len(),
+            ) {
+                if err.kind() == io::ErrorKind::BrokenPipe {
+                    return Ok(());
+                }
+                return Err(err.into());
+            }
+        }
+
+        if let Some(latest) = &summary.latest
+            && let Err(err) = writeln!(out, "  latest: {}", latest)
+        {
+            if err.kind() == io::ErrorKind::BrokenPipe {
+                return Ok(());
+            }
+            return Err(err.into());
+        }
+    }
+
+    if let Err(err) = out.flush() {
+        if err.kind() == io::ErrorKind::BrokenPipe {
+            return Ok(());
+        }
+        return Err(err.into());
     }
 
     Ok(())

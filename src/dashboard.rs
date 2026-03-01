@@ -1469,7 +1469,12 @@ mod tests {
 
         let scan = scan_store(&root, 120).expect("scan");
         assert_eq!(scan.payload.stats.total_files, 1);
-        assert!(scan.payload.records.iter().all(|r| r.file_name != "120000_codex-context.md"));
+        assert!(
+            scan.payload
+                .records
+                .iter()
+                .all(|r| r.file_name != "120000_codex-context.md")
+        );
 
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(outside);

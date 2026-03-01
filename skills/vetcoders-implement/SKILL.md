@@ -61,7 +61,7 @@ mkdir -p "$ROOT/.ai-agents/pipeline/$SLUG/reports"
 
 ### 2. Write Plans
 
-Write one plan per subagent to `/.ai-agents/pipeline/<slug>/plans/`.
+Write one plan per subagent to `.ai-agents/pipeline/<slug>/plans/`.
 Use the same plan template as `vetcoders-spawn`:
 
 ```markdown
@@ -312,8 +312,8 @@ The pipeline doesn't care HOW agents were spawned — only that plans exist in
 
 Same as `vetcoders-spawn` — full compatibility:
 
-- Plans: `/.ai-agents/pipeline/<slug>/plans/<N>_<task>_claude-task.md`
-- Reports: `/.ai-agents/pipeline/<slug>/reports/<N>_<task>_claude-task.md`
+- Plans: `.ai-agents/pipeline/<slug>/plans/<N>_<task>_claude-task.md`
+- Reports: `.ai-agents/pipeline/<slug>/reports/<N>_<task>_claude-task.md`
 - Agent suffix: `_claude-task` (vs `_codex` or `_claude` for spawn)
 
 ## Anti-Patterns

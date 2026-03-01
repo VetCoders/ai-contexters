@@ -116,7 +116,7 @@ Context:
 ### Spawn method
 
 Use canonical Terminal spawn (`osascript`) from `vetcoders-spawn`.
-Write plans to `/.ai-agents/.../plans/` and reports to `/.ai-agents/.../reports/`.
+Write plans to `.ai-agents/.../plans/` and reports to `.ai-agents/.../reports/`.
 
 ## Phase D - Follow-up Synthesis (Primary Agent)
 
