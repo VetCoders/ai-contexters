@@ -326,8 +326,23 @@ enum Commands {
         project: Option<String>,
 
         /// Compact summary instead of raw file paths
-        #[arg(long)]
+        #[arg(short, long)]
         summary: bool,
+
+        /// Filter out low-signal noise (<15 lines, task-notifications only)
+        #[arg(long)]
+        strict: bool,
+    },
+
+    /// Rank and filter artifacts (removes noise, bundles incident sequences)
+    Rank {
+        /// Hours to look back
+        #[arg(short = 'H', long, default_value = "48")]
+        hours: u64,
+
+        /// Project filter
+        #[arg(short, long)]
+        project: String,
     },
 
     /// Manage dedup state
@@ -661,8 +676,15 @@ fn main() -> Result<()> {
             hours,
             project,
             summary,
+            strict,
         } => {
-            run_refs(hours, project, summary)?;
+            run_refs(hours, project, summary, strict)?;
+        }
+        Commands::Rank {
+            hours,
+            project,
+        } => {
+            run_rank(hours, &project)?;
         }
         Commands::State {
             reset,
@@ -954,7 +976,7 @@ fn run_extraction(
         > = std::collections::BTreeMap::new();
 
         for entry in &output_entries {
-            let repo = sources::repo_name_from_cwd(entry.cwd.as_deref());
+            let repo = sources::repo_name_from_cwd(entry.cwd.as_deref(), &project);
             let date = entry.timestamp.format("%Y-%m-%d").to_string();
             repo_groups
                 .entry((repo, entry.agent.clone(), date))
@@ -1241,7 +1263,7 @@ fn run_store(
     > = std::collections::BTreeMap::new();
 
     for entry in &output_entries {
-        let repo = sources::repo_name_from_cwd(entry.cwd.as_deref());
+        let repo = sources::repo_name_from_cwd(entry.cwd.as_deref(), &project);
         let date = entry.timestamp.format("%Y-%m-%d").to_string();
         repo_groups
             .entry((repo, entry.agent.clone(), date))
@@ -1330,8 +1352,170 @@ fn run_store(
     Ok(())
 }
 
+fn run_rank(hours: u64, project: &str) -> Result<()> {
+    let base = store::store_base_dir()?;
+    let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(hours * 3600);
+
+    let mut files: Vec<PathBuf> = Vec::new();
+    let proj_dir = base.join(project);
+    
+    if proj_dir.is_dir() {
+        for date_entry in std::fs::read_dir(&proj_dir)?.filter_map(|e| e.ok()) {
+            let date_path = date_entry.path();
+            if !date_path.is_dir() {
+                continue;
+            }
+            for file_entry in std::fs::read_dir(&date_path)?.filter_map(|e| e.ok()) {
+                let fpath = file_entry.path();
+                if fpath.extension().is_some_and(|ext| ext == "md" || ext == "json")
+                    && let Ok(meta) = fpath.metadata()
+                    && let Ok(mtime) = meta.modified()
+                    && mtime >= cutoff
+                {
+                    files.push(fpath);
+                }
+            }
+        }
+    }
+
+    files.sort();
+
+    if files.is_empty() {
+        println!("No context files found within last {} hours for project {}.", hours, project);
+        return Ok(());
+    }
+
+    println!("Ranked Artifacts for {} (last {}h):", project, hours);
+    println!("------------------------------------------------------------");
+
+    // Group by prefix (e.g. 160800_codex)
+    let mut bundles: std::collections::BTreeMap<String, Vec<PathBuf>> = std::collections::BTreeMap::new();
+    
+    for f in files {
+        let name = f.file_name().unwrap_or_default().to_string_lossy().to_string();
+        // e.g., 160800_codex-021.md -> prefix = 160800_codex
+        let prefix = name.split('-').next().unwrap_or(&name).to_string();
+        bundles.entry(prefix).or_default().push(f);
+    }
+
+    // Sort bundles descending by name (time)
+    let mut bundle_keys: Vec<_> = bundles.keys().cloned().collect();
+    bundle_keys.sort_by(|a, b| b.cmp(a));
+
+    for key in bundle_keys {
+        let bundle_files = bundles.get(&key).unwrap();
+        let mut bundle_score = 0;
+        let mut bundle_lines = 0;
+        let mut is_noise = true;
+        let mut has_skill_markers = false;
+
+        for f in bundle_files {
+            if let Ok(content) = std::fs::read_to_string(f) {
+                let lines = content.lines().count();
+                bundle_lines += lines;
+                
+                let lower_content = content.to_lowercase();
+                if lower_content.contains("[skill_enter]") 
+                    || lower_content.contains("[decision]") 
+                    || lower_content.contains("[skill_outcome]")
+                    || lower_content.contains("vetcoders-partner")
+                    || lower_content.contains("vetcoders-spawn")
+                    || lower_content.contains("vetcoders-ownership") 
+                {
+                    has_skill_markers = true;
+                }
+
+                if !is_noise_artifact(f) {
+                    is_noise = false; // If any file in the bundle is signal, the bundle is signal
+                }
+            }
+        }
+
+        // Simple scoring heuristic
+        if bundle_lines >= 50 {
+            bundle_score += 4;
+        } else if bundle_lines >= 15 {
+            bundle_score += 2;
+        }
+        
+        if !is_noise {
+            bundle_score += 6;
+        } else {
+            bundle_score += 1; // Task notification only
+        }
+
+        if has_skill_markers {
+            bundle_score += 5; // Heavy boost for skill-based structured outputs
+            is_noise = false; // Never treat skill outputs as noise
+        }
+
+        // Cap score at 10 (or 15 for super high-signal)
+        let max_score = if has_skill_markers { 15 } else { 10 };
+        let bundle_score = bundle_score.min(max_score);
+
+        if is_noise && bundle_lines < 15 {
+            println!("- Bundle: {} ({} files) — Score: {}/{} (Noise/Short, recommend ignoring)", key, bundle_files.len(), bundle_score, max_score);
+        } else if bundle_files.len() > 1 {
+            println!("- Bundle: {} ({} files) — Score: {}/{} (Incident Sequence{})", key, bundle_files.len(), bundle_score, max_score, if has_skill_markers { ", Skill Output" } else { "" });
+        } else {
+            println!("- Bundle: {} ({} files) — Score: {}/{}{}", key, bundle_files.len(), bundle_score, max_score, if has_skill_markers { " (Skill Output)" } else { "" });
+        }
+
+        for f in bundle_files {
+            let name = f.file_name().unwrap_or_default().to_string_lossy();
+            let noise_tag = if is_noise_artifact(f) { "[NOISE]" } else { "[SIGNAL]" };
+            println!("    └ {} {}", name, noise_tag);
+        }
+    }
+
+    Ok(())
+}
+
+fn is_noise_artifact(path: &std::path::Path) -> bool {
+    if !path.is_file() || !path.extension().is_some_and(|ext| ext == "md") {
+        return false;
+    }
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.len() >= 15 {
+        return false; // Not short enough to be considered noise
+    }
+
+    // Check if it's task-notification only
+    let mut is_noise = true;
+    for line in &lines {
+        let l = line.trim().to_lowercase();
+        if l.is_empty() 
+            || l.starts_with("[project:") 
+            || l.starts_with("[signals") 
+            || l.starts_with("[/signals") 
+            || l.starts_with("-") // checklist/signals
+            || (l.starts_with("[") && l.contains("] ") && l.contains("tool:")) // e.g. [14:30:00] assistant: Tool: ...
+            || l.contains("task-notification")
+            || l.contains("background command")
+            || l.contains("task killed")
+            || l.contains("task update")
+            || l.contains("ran command")
+            || l.contains("ran find")
+            || l.contains("called loctree")
+            || l.contains("killed process")
+        {
+            continue;
+        } else {
+            // Found some actual signal line that is not a known noise pattern
+            is_noise = false;
+            break;
+        }
+    }
+    
+    is_noise
+}
+
 /// List context files from the global store, filtered by recency.
-fn run_refs(hours: u64, project: Option<String>, summary: bool) -> Result<()> {
+fn run_refs(hours: u64, project: Option<String>, summary: bool, strict: bool) -> Result<()> {
     let base = store::store_base_dir()?;
 
     let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(hours * 3600);
@@ -1364,6 +1548,9 @@ fn run_refs(hours: u64, project: Option<String>, summary: bool) -> Result<()> {
                     && let Ok(mtime) = meta.modified()
                     && mtime >= cutoff
                 {
+                    if strict && is_noise_artifact(&fpath) {
+                        continue;
+                    }
                     files.push(fpath);
                 }
             }

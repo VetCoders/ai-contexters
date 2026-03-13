@@ -286,6 +286,9 @@ struct ChunkSignals {
     plan_mode: Vec<String>,
     intents: Vec<String>,
     results: Vec<String>,
+    skills: Vec<String>,
+    decisions: Vec<String>,
+    outcomes: Vec<String>,
 }
 
 const MAX_TODO_ITEMS: usize = 8;
@@ -347,6 +350,9 @@ fn extract_signals(entries: &[&TimelineEntry]) -> ChunkSignals {
     let plan_mode = extract_tag_blocks(entries, is_plan_mode_tag, MAX_PLAN_MODE_EVENTS);
     let intents = extract_intent_lines(entries);
     let results = extract_result_lines(entries);
+    let skills = extract_tag_blocks(entries, is_skill_tag, 4);
+    let decisions = extract_tag_blocks(entries, is_decision_tag, 4);
+    let outcomes = extract_tag_blocks(entries, is_outcome_tag, 4);
 
     ChunkSignals {
         todo_open,
@@ -356,6 +362,9 @@ fn extract_signals(entries: &[&TimelineEntry]) -> ChunkSignals {
         plan_mode,
         intents,
         results,
+        skills,
+        decisions,
+        outcomes,
     }
 }
 
@@ -534,6 +543,25 @@ fn is_plan_mode_tag(line: &str) -> bool {
         || lower.contains("bypass permissions")
 }
 
+fn is_skill_tag(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    lower.contains("[skill_enter]")
+        || lower.contains("vetcoders-partner")
+        || lower.contains("vetcoders-spawn")
+        || lower.contains("vetcoders-ownership")
+        || lower.contains("vetcoders-workflow")
+}
+
+fn is_decision_tag(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    lower.contains("[decision]") || lower.starts_with("decision:")
+}
+
+fn is_outcome_tag(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    lower.contains("[skill_outcome]") || lower.starts_with("outcome:") || lower.starts_with("validation:")
+}
+
 fn extract_tag_blocks(
     entries: &[&TimelineEntry],
     is_tag: fn(&str) -> bool,
@@ -591,6 +619,9 @@ fn format_signals_block(signals: &ChunkSignals, highlights: &[String]) -> Option
         || !signals.plan_mode.is_empty()
         || !signals.intents.is_empty()
         || !signals.results.is_empty()
+        || !signals.skills.is_empty()
+        || !signals.decisions.is_empty()
+        || !signals.outcomes.is_empty()
         || !highlights.is_empty();
     if !has_any {
         return None;
@@ -598,6 +629,14 @@ fn format_signals_block(signals: &ChunkSignals, highlights: &[String]) -> Option
 
     let mut out = String::new();
     out.push_str("[signals]\n");
+
+    if !signals.skills.is_empty() {
+        out.push_str("=== SKILL ENTER ===\n");
+        for line in &signals.skills {
+            out.push_str(&format!("{}\n", line));
+        }
+        out.push_str("===================\n");
+    }
 
     if !signals.todo_open.is_empty() || !signals.todo_done.is_empty() {
         if !signals.todo_open.is_empty() {
@@ -662,9 +701,23 @@ fn format_signals_block(signals: &ChunkSignals, highlights: &[String]) -> Option
         }
     }
 
+    if !signals.decisions.is_empty() {
+        out.push_str("Decision:\n");
+        for line in &signals.decisions {
+            out.push_str(&format!("- {}\n", line));
+        }
+    }
+
     if !signals.results.is_empty() {
         out.push_str("Results:\n");
         for line in &signals.results {
+            out.push_str(&format!("- {}\n", line));
+        }
+    }
+
+    if !signals.outcomes.is_empty() {
+        out.push_str("Outcome:\n");
+        for line in &signals.outcomes {
             out.push_str(&format!("- {}\n", line));
         }
     }

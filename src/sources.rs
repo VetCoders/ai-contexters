@@ -155,24 +155,23 @@ pub fn extract_claude(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
         let dir_entry = dir_entry?;
         let dir_name = dir_entry.file_name().to_string_lossy().to_string();
 
-        // Filter by project if specified
-        if !config.project_filter.is_empty() {
-            let decoded = decode_claude_project_path(&dir_name);
-            let decoded_lower = decoded.to_lowercase();
-            let dir_lower = dir_name.to_lowercase();
-            let matches = config.project_filter.iter().any(|f| {
-                let fl = f.to_lowercase();
-                decoded_lower.contains(&fl) || dir_lower.contains(&fl)
-            });
-            if !matches {
-                continue;
-            }
-        }
-
         let project_dir = dir_entry.path();
         if !project_dir.is_dir() {
             continue;
         }
+
+        // Determine if directory name inherently matches the filter
+        let dir_matches = if config.project_filter.is_empty() {
+            true
+        } else {
+            let decoded = decode_claude_project_path(&dir_name);
+            let decoded_lower = decoded.to_lowercase();
+            let dir_lower = dir_name.to_lowercase();
+            config.project_filter.iter().any(|f| {
+                let fl = f.to_lowercase();
+                decoded_lower.contains(&fl) || dir_lower.contains(&fl)
+            })
+        };
 
         for file_entry in fs::read_dir(&project_dir)? {
             let file_entry = file_entry?;
@@ -185,7 +184,31 @@ pub fn extract_claude(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
                     .unwrap_or_default();
 
                 let session_entries = parse_claude_jsonl(&path, &session_id, config)?;
-                entries.extend(session_entries);
+                
+                // If directory name matched, keep all entries.
+                // Otherwise, check if ANY entry in this session matches the project filter.
+                let keep_session = dir_matches || {
+                    if config.project_filter.is_empty() {
+                        true
+                    } else {
+                        let filters_lower: Vec<String> = config
+                            .project_filter
+                            .iter()
+                            .map(|f| f.to_lowercase())
+                            .collect();
+                        
+                        session_entries.iter().any(|entry| {
+                            filters_lower.iter().any(|fl| {
+                                entry.message.to_lowercase().contains(fl)
+                                    || entry.cwd.as_ref().is_some_and(|c| c.to_lowercase().contains(fl))
+                            })
+                        })
+                    }
+                };
+
+                if keep_session {
+                    entries.extend(session_entries);
+                }
             }
         }
     }
@@ -1324,11 +1347,41 @@ pub fn list_available_sources() -> Result<Vec<SourceInfo>> {
     Ok(sources)
 }
 
-/// Extract repo name from a `cwd` path (last path component).
+/// Determine the project/repo name for a given entry.
 ///
-/// Example: `"/Users/polyversai/Libraxis/lbrx-services"` → `"lbrx-services"`
-pub fn repo_name_from_cwd(cwd: Option<&str>) -> String {
-    cwd.and_then(|c| std::path::Path::new(c).file_name())
+/// 1. If a single project filter is active, it unconditionally becomes the project name.
+/// 2. If multiple filters are active, uses the first one matching the `cwd`.
+/// 3. Otherwise, tries to walk up the `cwd` path to find a `.git` root.
+/// 4. Fallback: last path component of `cwd`.
+pub fn repo_name_from_cwd(cwd: Option<&str>, project_filter: &[String]) -> String {
+    if !project_filter.is_empty() {
+        if project_filter.len() == 1 {
+            return project_filter[0].clone();
+        } else if let Some(c) = cwd {
+            for p in project_filter {
+                if c.contains(p) {
+                    return p.clone();
+                }
+            }
+        }
+    }
+
+    let cwd_str = match cwd {
+        Some(c) if !c.is_empty() => c,
+        _ => return "unknown".to_string(),
+    };
+
+    let path = std::path::Path::new(cwd_str);
+    let mut current = Some(path);
+
+    while let Some(p) = current {
+        if !p.as_os_str().is_empty() && p.join(".git").is_dir() && let Some(name) = p.file_name() {
+            return name.to_string_lossy().to_string();
+        }
+        current = p.parent();
+    }
+
+    path.file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "unknown".to_string())
 }
@@ -1460,17 +1513,31 @@ mod tests {
 
     #[test]
     fn test_repo_name_from_cwd() {
+        // Fallback behavior
         assert_eq!(
-            repo_name_from_cwd(Some("/Users/polyversai/Libraxis/lbrx-services")),
+            repo_name_from_cwd(Some("/Users/polyversai/Libraxis/lbrx-services"), &[]),
             "lbrx-services"
         );
         assert_eq!(
-            repo_name_from_cwd(Some("/Users/polyversai/Libraxis/mlx-batch-runner")),
+            repo_name_from_cwd(Some("/Users/polyversai/Libraxis/mlx-batch-runner"), &[]),
             "mlx-batch-runner"
         );
-        assert_eq!(repo_name_from_cwd(None), "unknown");
-        assert_eq!(repo_name_from_cwd(Some("/")), "unknown");
-        assert_eq!(repo_name_from_cwd(Some("")), "unknown");
+        assert_eq!(repo_name_from_cwd(None, &[]), "unknown");
+        assert_eq!(repo_name_from_cwd(Some("/"), &[]), "unknown");
+        assert_eq!(repo_name_from_cwd(Some(""), &[]), "unknown");
+        
+        // Single project filter
+        assert_eq!(
+            repo_name_from_cwd(Some("/Users/polyversai/Libraxis/lbrx-services/subfolder"), &["lbrx".to_string()]),
+            "lbrx"
+        );
+        
+        // Multiple project filters
+        let filters = vec!["lbrx-services".to_string(), "foo".to_string()];
+        assert_eq!(
+            repo_name_from_cwd(Some("/Users/polyversai/Libraxis/lbrx-services/subfolder"), &filters),
+            "lbrx-services"
+        );
     }
 
     #[test]

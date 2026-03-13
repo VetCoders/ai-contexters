@@ -6,6 +6,7 @@ description = "Extract timeline and memory from AI agent sessions (Claude Code, 
 authors = ["Maciej Gad <void@div0.space>", "Monika Szymanska <hello@vetcoders.io>"]
 license = "MIT"
 repository = "https://github.com/VetCoders/ai-contexters"
+autobins = false
 
 [dependencies]
 anyhow = "1.0"
