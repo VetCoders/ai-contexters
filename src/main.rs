@@ -491,23 +491,23 @@ fn main() -> Result<()> {
             emit,
         } => {
             let include_assistant = include_assistant_flag || !user_only;
-            run_extraction(
-                &["claude"],
+            run_extraction(ExtractionParams {
+                agents: &["claude"],
                 project,
                 hours,
-                output.as_deref(),
-                &format,
+                output_dir: output.as_deref(),
+                format: &format,
                 append_to,
                 rotate,
                 incremental,
                 include_assistant,
-                loctree,
+                include_loctree: loctree,
                 project_root,
-                memex,
+                sync_memex: memex,
                 force,
                 redact_secrets,
                 emit,
-            )?;
+            })?;
         }
         Commands::Codex {
             project,
@@ -526,23 +526,23 @@ fn main() -> Result<()> {
             emit,
         } => {
             let include_assistant = include_assistant_flag || !user_only;
-            run_extraction(
-                &["codex"],
+            run_extraction(ExtractionParams {
+                agents: &["codex"],
                 project,
                 hours,
-                output.as_deref(),
-                &format,
+                output_dir: output.as_deref(),
+                format: &format,
                 append_to,
                 rotate,
                 incremental,
                 include_assistant,
-                loctree,
+                include_loctree: loctree,
                 project_root,
-                memex,
+                sync_memex: memex,
                 force,
                 redact_secrets,
                 emit,
-            )?;
+            })?;
         }
         Commands::All {
             project,
@@ -560,23 +560,23 @@ fn main() -> Result<()> {
             emit,
         } => {
             let include_assistant = include_assistant_flag || !user_only;
-            run_extraction(
-                &["claude", "codex", "gemini"],
+            run_extraction(ExtractionParams {
+                agents: &["claude", "codex", "gemini"],
                 project,
                 hours,
-                output.as_deref(),
-                "both",
+                output_dir: output.as_deref(),
+                format: "both",
                 append_to,
                 rotate,
                 incremental,
                 include_assistant,
-                loctree,
+                include_loctree: loctree,
                 project_root,
-                memex,
+                sync_memex: memex,
                 force,
                 redact_secrets,
                 emit,
-            )?;
+            })?;
         }
         Commands::Extract {
             format,
@@ -817,13 +817,12 @@ fn run_extract_file(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_extraction(
-    agents: &[&str],
+struct ExtractionParams<'a> {
+    agents: &'a [&'a str],
     project: Vec<String>,
     hours: u64,
-    output_dir: Option<&Path>,
-    format: &str,
+    output_dir: Option<&'a Path>,
+    format: &'a str,
     append_to: Option<PathBuf>,
     rotate: usize,
     incremental: bool,
@@ -834,7 +833,27 @@ fn run_extraction(
     force: bool,
     redact_secrets: bool,
     emit: StdoutEmit,
-) -> Result<()> {
+}
+
+fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
+    let ExtractionParams {
+        agents,
+        project,
+        hours,
+        output_dir,
+        format,
+        append_to,
+        rotate,
+        incremental,
+        include_assistant,
+        include_loctree,
+        project_root,
+        sync_memex,
+        force,
+        redact_secrets,
+        emit,
+    } = params;
+    
     // Load state for incremental/dedup
     let mut state = StateManager::load();
     let project_name = if project.is_empty() {
