@@ -24,6 +24,7 @@ use ai_contexters::dashboard_server::{self, DashboardServerConfig};
 use ai_contexters::init::{self, InitOptions};
 use ai_contexters::memex::{self, MemexConfig};
 use ai_contexters::output::{self, OutputConfig, OutputFormat, OutputMode, ReportMetadata};
+use ai_contexters::rank;
 use ai_contexters::sources::{self, ExtractionConfig};
 use ai_contexters::state::StateManager;
 use ai_contexters::store;
@@ -342,7 +343,7 @@ enum Commands {
         strict: bool,
     },
 
-    /// Rank and filter artifacts (removes noise, bundles incident sequences)
+    /// Rank and filter artifacts by content quality (QUALITY > quantity)
     Rank {
         /// Hours to look back
         #[arg(short = 'H', long, default_value = "48")]
@@ -351,6 +352,14 @@ enum Commands {
         /// Project filter
         #[arg(short, long)]
         project: String,
+
+        /// Only show chunks scoring >= 5 (hide noise)
+        #[arg(long)]
+        strict: bool,
+
+        /// Show only top N bundles by score
+        #[arg(long)]
+        top: Option<usize>,
     },
 
     /// Manage dedup state
@@ -691,8 +700,10 @@ fn main() -> Result<()> {
         Some(Commands::Rank {
             hours,
             project,
+            strict,
+            top,
         }) => {
-            run_rank(hours, &project, redact_secrets)?;
+            run_rank(hours, &project, redact_secrets, strict, top)?;
         }
         Some(Commands::State {
             reset,
@@ -732,11 +743,11 @@ fn main() -> Result<()> {
             })?;
         }
         None => {
-            let project = cli.project.unwrap_or_else(|| sources::detect_project_name());
+            let project = cli.project.unwrap_or_else(sources::detect_project_name);
             let hours = cli.hours;
-            run_rank(hours, &project, redact_secrets)?;
+            run_rank(hours, &project, redact_secrets, false, None)?;
         }
-        }
+    }
 
     Ok(())
 }
@@ -866,7 +877,7 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
         redact_secrets,
         emit,
     } = params;
-    
+
     // Load state for incremental/dedup
     let mut state = StateManager::load();
     let project_name = if project.is_empty() {
@@ -1384,7 +1395,13 @@ fn run_store(
     Ok(())
 }
 
-fn run_rank(hours: u64, project: &str, redact_secrets: bool) -> Result<()> {
+fn run_rank(
+    hours: u64,
+    project: &str,
+    redact_secrets: bool,
+    strict: bool,
+    top: Option<usize>,
+) -> Result<()> {
     // Unconditionally sync store incrementally before ranking
     let _ = run_extraction(ExtractionParams {
         agents: &["claude", "codex", "gemini"],
@@ -1409,7 +1426,7 @@ fn run_rank(hours: u64, project: &str, redact_secrets: bool) -> Result<()> {
 
     let mut files: Vec<PathBuf> = Vec::new();
     let proj_dir = base.join(project);
-    
+
     if proj_dir.is_dir() {
         for date_entry in std::fs::read_dir(&proj_dir)?.filter_map(|e| e.ok()) {
             let date_path = date_entry.path();
@@ -1418,7 +1435,9 @@ fn run_rank(hours: u64, project: &str, redact_secrets: bool) -> Result<()> {
             }
             for file_entry in std::fs::read_dir(&date_path)?.filter_map(|e| e.ok()) {
                 let fpath = file_entry.path();
-                if fpath.extension().is_some_and(|ext| ext == "md" || ext == "json")
+                if fpath
+                    .extension()
+                    .is_some_and(|ext| ext == "md" || ext == "json")
                     && let Ok(meta) = fpath.metadata()
                     && let Ok(mtime) = meta.modified()
                     && mtime >= cutoff
@@ -1432,94 +1451,151 @@ fn run_rank(hours: u64, project: &str, redact_secrets: bool) -> Result<()> {
     files.sort();
 
     if files.is_empty() {
-        println!("No context files found within last {} hours for project {}.", hours, project);
+        println!(
+            "No context files found within last {} hours for project {}.",
+            hours, project
+        );
+        return Ok(());
+    }
+
+    // Group by prefix (e.g. 2026-03-12/160800_codex)
+    let mut bundles: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+
+    for f in files {
+        let parent_name = f
+            .parent()
+            .and_then(|p| p.file_name())
+            .unwrap_or_default()
+            .to_string_lossy();
+        let name = f.file_name().unwrap_or_default().to_string_lossy();
+        let file_prefix = name.split('-').next().unwrap_or(&name);
+        let prefix = format!("{}/{}", parent_name, file_prefix);
+        bundles.entry(prefix).or_default().push(f);
+    }
+
+    // Score each chunk and compute bundle averages
+    struct ScoredBundle {
+        key: String,
+        files: Vec<(PathBuf, rank::ChunkScore)>,
+        avg_score: f32,
+        max_score: u8,
+        total_signal: usize,
+        total_lines: usize,
+    }
+
+    let mut scored_bundles: Vec<ScoredBundle> = Vec::new();
+
+    for (key, bundle_files) in &bundles {
+        let scored_files: Vec<(PathBuf, rank::ChunkScore)> = bundle_files
+            .iter()
+            .map(|f| (f.clone(), rank::score_chunk_file(f)))
+            .collect();
+
+        let total_score: u32 = scored_files.iter().map(|(_, s)| s.score as u32).sum();
+        let avg_score = total_score as f32 / scored_files.len().max(1) as f32;
+        let max_score = scored_files.iter().map(|(_, s)| s.score).max().unwrap_or(0);
+        let total_signal: usize = scored_files.iter().map(|(_, s)| s.signal_lines).sum();
+        let total_lines: usize = scored_files.iter().map(|(_, s)| s.total_lines).sum();
+
+        scored_bundles.push(ScoredBundle {
+            key: key.clone(),
+            files: scored_files,
+            avg_score,
+            max_score,
+            total_signal,
+            total_lines,
+        });
+    }
+
+    // Sort by average score descending, then by key descending (recency)
+    scored_bundles.sort_by(|a, b| {
+        b.avg_score
+            .partial_cmp(&a.avg_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.key.cmp(&a.key))
+    });
+
+    // Apply --strict filter
+    if strict {
+        scored_bundles.retain(|b| b.avg_score >= 5.0);
+    }
+
+    // Apply --top limit
+    if let Some(n) = top {
+        scored_bundles.truncate(n);
+    }
+
+    if scored_bundles.is_empty() {
+        println!(
+            "No artifacts above quality threshold for {} (last {}h).",
+            project, hours
+        );
         return Ok(());
     }
 
     println!("Ranked Artifacts for {} (last {}h):", project, hours);
     println!("------------------------------------------------------------");
 
-    // Group by prefix (e.g. 2026-03-12/160800_codex)
-    let mut bundles: std::collections::BTreeMap<String, Vec<PathBuf>> = std::collections::BTreeMap::new();
-    
-    for f in files {
-        let parent_name = f.parent().and_then(|p| p.file_name()).unwrap_or_default().to_string_lossy();
-        let name = f.file_name().unwrap_or_default().to_string_lossy();
-        // e.g., 160800_codex-021.md -> file_prefix = 160800_codex
-        let file_prefix = name.split('-').next().unwrap_or(&name);
-        let prefix = format!("{}/{}", parent_name, file_prefix);
-        bundles.entry(prefix).or_default().push(f);
+    for bundle in &scored_bundles {
+        let label = match bundle.avg_score.round() as u8 {
+            0..=2 => "NOISE",
+            3..=4 => "LOW",
+            5..=7 => "MEDIUM",
+            _ => "HIGH",
+        };
+        let density = if bundle.total_lines > 0 {
+            bundle.total_signal as f32 / bundle.total_lines as f32
+        } else {
+            0.0
+        };
+
+        println!(
+            "- Bundle: {} ({} files) — Avg: {:.1}/10  Peak: {}/10  Density: {:.0}%  [{}]",
+            bundle.key,
+            bundle.files.len(),
+            bundle.avg_score,
+            bundle.max_score,
+            density * 100.0,
+            label,
+        );
+
+        for (path, score) in &bundle.files {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            println!(
+                "    {} {} {}/10 (sig:{} noise:{} total:{})",
+                match score.label {
+                    "HIGH" => "+",
+                    "MEDIUM" => "~",
+                    "LOW" => "-",
+                    _ => "x",
+                },
+                name,
+                score.score,
+                score.signal_lines,
+                score.noise_lines,
+                score.total_lines,
+            );
+        }
     }
 
-    // Sort bundles descending by name (time)
-    let mut bundle_keys: Vec<_> = bundles.keys().cloned().collect();
-    bundle_keys.sort_by(|a, b| b.cmp(a));
+    // Summary stats
+    let total_bundles = scored_bundles.len();
+    let high_count = scored_bundles.iter().filter(|b| b.avg_score >= 8.0).count();
+    let medium_count = scored_bundles
+        .iter()
+        .filter(|b| b.avg_score >= 5.0 && b.avg_score < 8.0)
+        .count();
+    let low_count = scored_bundles
+        .iter()
+        .filter(|b| b.avg_score >= 3.0 && b.avg_score < 5.0)
+        .count();
+    let noise_count = scored_bundles.iter().filter(|b| b.avg_score < 3.0).count();
 
-    for key in bundle_keys {
-        let bundle_files = bundles.get(&key).unwrap();
-        let mut bundle_score = 0;
-        let mut bundle_lines = 0;
-        let mut is_noise = true;
-        let mut has_skill_markers = false;
-
-        for f in bundle_files {
-            if let Ok(content) = std::fs::read_to_string(f) {
-                let lines = content.lines().count();
-                bundle_lines += lines;
-                
-                let lower_content = content.to_lowercase();
-                if lower_content.contains("[skill_enter]") 
-                    || lower_content.contains("[decision]") 
-                    || lower_content.contains("[skill_outcome]")
-                    || lower_content.contains("vetcoders-partner")
-                    || lower_content.contains("vetcoders-spawn")
-                    || lower_content.contains("vetcoders-ownership") 
-                {
-                    has_skill_markers = true;
-                }
-
-                if !is_noise_artifact(f) {
-                    is_noise = false; // If any file in the bundle is signal, the bundle is signal
-                }
-            }
-        }
-
-        // Simple scoring heuristic
-        if bundle_lines >= 50 {
-            bundle_score += 4;
-        } else if bundle_lines >= 15 {
-            bundle_score += 2;
-        }
-        
-        if !is_noise {
-            bundle_score += 6;
-        } else {
-            bundle_score += 1; // Task notification only
-        }
-
-        if has_skill_markers {
-            bundle_score += 5; // Heavy boost for skill-based structured outputs
-            is_noise = false; // Never treat skill outputs as noise
-        }
-
-        // Cap score at 10 (or 15 for super high-signal)
-        let max_score = if has_skill_markers { 15 } else { 10 };
-        let bundle_score = bundle_score.min(max_score);
-
-        if is_noise && bundle_lines < 15 {
-            println!("- Bundle: {} ({} files) — Score: {}/{} (Noise/Short, recommend ignoring)", key, bundle_files.len(), bundle_score, max_score);
-        } else if bundle_files.len() > 1 {
-            println!("- Bundle: {} ({} files) — Score: {}/{} (Incident Sequence{})", key, bundle_files.len(), bundle_score, max_score, if has_skill_markers { ", Skill Output" } else { "" });
-        } else {
-            println!("- Bundle: {} ({} files) — Score: {}/{}{}", key, bundle_files.len(), bundle_score, max_score, if has_skill_markers { " (Skill Output)" } else { "" });
-        }
-
-        for f in bundle_files {
-            let name = f.file_name().unwrap_or_default().to_string_lossy();
-            let noise_tag = if is_noise_artifact(f) { "[NOISE]" } else { "[SIGNAL]" };
-            println!("    └ {} {}", name, noise_tag);
-        }
-    }
+    println!("------------------------------------------------------------");
+    println!(
+        "Summary: {} bundles — HIGH: {} | MEDIUM: {} | LOW: {} | NOISE: {}",
+        total_bundles, high_count, medium_count, low_count, noise_count,
+    );
 
     Ok(())
 }
@@ -1531,7 +1607,7 @@ fn is_noise_artifact(path: &std::path::Path) -> bool {
     let Ok(content) = std::fs::read_to_string(path) else {
         return false;
     };
-    
+
     let lines: Vec<&str> = content.lines().collect();
     if lines.len() >= 15 {
         return false; // Not short enough to be considered noise
@@ -1541,10 +1617,10 @@ fn is_noise_artifact(path: &std::path::Path) -> bool {
     let mut is_noise = true;
     for line in &lines {
         let l = line.trim().to_lowercase();
-        if l.is_empty() 
-            || l.starts_with("[project:") 
-            || l.starts_with("[signals") 
-            || l.starts_with("[/signals") 
+        if l.is_empty()
+            || l.starts_with("[project:")
+            || l.starts_with("[signals")
+            || l.starts_with("[/signals")
             || l.starts_with("-") // checklist/signals
             || (l.starts_with("[") && l.contains("] ") && l.contains("tool:")) // e.g. [14:30:00] assistant: Tool: ...
             || l.contains("task-notification")
@@ -1563,7 +1639,7 @@ fn is_noise_artifact(path: &std::path::Path) -> bool {
             break;
         }
     }
-    
+
     is_noise
 }
 

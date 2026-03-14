@@ -5,18 +5,19 @@
 use anyhow::{Context, Result, anyhow};
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     fs,
     io::Write,
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
+    process::Command,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -25,6 +26,7 @@ use std::{
 use tokio::sync::RwLock;
 
 use crate::dashboard::{self, DashboardConfig, DashboardStats};
+use crate::rank;
 
 const REGENERATE_HEADER_NAME: &str = "x-ai-contexters-action";
 const REGENERATE_HEADER_VALUE: &str = "regenerate";
@@ -106,6 +108,76 @@ struct ErrorResponse {
     error: String,
 }
 
+// ============================================================================
+// Search types
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+struct FuzzySearchParams {
+    q: String,
+    #[serde(default = "default_search_limit")]
+    limit: usize,
+}
+
+fn default_search_limit() -> usize {
+    20
+}
+
+#[derive(Debug, Deserialize)]
+struct SemanticSearchParams {
+    q: String,
+    #[serde(default = "default_namespace")]
+    ns: String,
+    #[serde(default = "default_search_limit")]
+    limit: usize,
+    #[serde(default = "default_search_mode")]
+    mode: String,
+}
+
+fn default_namespace() -> String {
+    "ai-contexts".to_string()
+}
+
+fn default_search_mode() -> String {
+    "hybrid".to_string()
+}
+
+#[derive(Debug, Deserialize)]
+struct CrossSearchParams {
+    q: String,
+    #[serde(default = "default_search_limit")]
+    limit: usize,
+    #[serde(default = "default_search_mode")]
+    mode: String,
+}
+
+#[derive(Debug, Serialize)]
+struct FuzzySearchResult {
+    file: String,
+    project: String,
+    date: String,
+    score: u8,
+    label: String,
+    signal_density: f32,
+    matched_lines: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct FuzzySearchResponse {
+    ok: bool,
+    query: String,
+    results: Vec<FuzzySearchResult>,
+    total_scanned: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct MemexSearchResponse {
+    ok: bool,
+    query: String,
+    source: String,
+    results: serde_json::Value,
+}
+
 struct RebuildFlagGuard<'a> {
     flag: &'a AtomicBool,
 }
@@ -137,6 +209,9 @@ pub async fn run_dashboard_server(config: DashboardServerConfig) -> Result<()> {
         .route("/", get(get_dashboard_html))
         .route("/api/status", get(get_status))
         .route("/api/regenerate", post(regenerate_dashboard))
+        .route("/api/search/fuzzy", get(fuzzy_search))
+        .route("/api/search/semantic", get(semantic_search))
+        .route("/api/search/cross", get(cross_search))
         .with_state(state);
 
     let addr = SocketAddr::new(config.host, config.port);
@@ -146,8 +221,11 @@ pub async fn run_dashboard_server(config: DashboardServerConfig) -> Result<()> {
 
     eprintln!("✓ Dashboard server started");
     eprintln!("  URL: http://{addr}");
-    eprintln!("  Status endpoint: http://{addr}/api/status");
-    eprintln!("  Regenerate endpoint: POST http://{addr}/api/regenerate");
+    eprintln!("  Status:    GET  http://{addr}/api/status");
+    eprintln!("  Regenerate: POST http://{addr}/api/regenerate");
+    eprintln!("  Fuzzy:     GET  http://{addr}/api/search/fuzzy?q=<query>");
+    eprintln!("  Semantic:  GET  http://{addr}/api/search/semantic?q=<query>&ns=<namespace>");
+    eprintln!("  Cross:     GET  http://{addr}/api/search/cross?q=<query>");
     eprintln!(
         "  Required header: {}: {}",
         REGENERATE_HEADER_NAME, REGENERATE_HEADER_VALUE
@@ -284,6 +362,318 @@ async fn regenerate_dashboard(
                 .into_response()
         }
     }
+}
+
+// ============================================================================
+// Search handlers
+// ============================================================================
+
+/// Fuzzy text search across all stored chunks.
+///
+/// Reads chunk files from the store, matches lines against the query,
+/// and scores each match using the rank module.
+async fn fuzzy_search(
+    State(state): State<Arc<DashboardServerState>>,
+    Query(params): Query<FuzzySearchParams>,
+) -> Response {
+    let query = params.q.trim().to_string();
+    if query.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                ok: false,
+                error: "Query parameter 'q' is required".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    let store_root = state.config.store_root.clone();
+    let limit = params.limit;
+    let query_clone = query.clone();
+
+    let result =
+        tokio::task::spawn_blocking(move || run_fuzzy_search(&store_root, &query_clone, limit))
+            .await;
+
+    match result {
+        Ok(Ok((results, total_scanned))) => (
+            StatusCode::OK,
+            Json(FuzzySearchResponse {
+                ok: true,
+                query,
+                results,
+                total_scanned,
+            }),
+        )
+            .into_response(),
+        Ok(Err(err)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                ok: false,
+                error: format!("{err:#}"),
+            }),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                ok: false,
+                error: format!("Search task failed: {err}"),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+fn run_fuzzy_search(
+    store_root: &Path,
+    query: &str,
+    limit: usize,
+) -> Result<(Vec<FuzzySearchResult>, usize)> {
+    let query_lower = query.to_lowercase();
+    let query_terms: Vec<&str> = query_lower.split_whitespace().collect();
+    let mut results = Vec::new();
+    let mut total_scanned = 0usize;
+
+    // Walk project dirs in store
+    for proj_entry in fs::read_dir(store_root)?.filter_map(|e| e.ok()) {
+        let proj_path = proj_entry.path();
+        if !proj_path.is_dir() {
+            continue;
+        }
+        let project = proj_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+
+        if project == "memex" {
+            continue;
+        }
+
+        // Walk date dirs
+        for date_entry in fs::read_dir(&proj_path)?.filter_map(|e| e.ok()) {
+            let date_path = date_entry.path();
+            if !date_path.is_dir() {
+                continue;
+            }
+            let date = date_path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+
+            // Read chunk files
+            for file_entry in fs::read_dir(&date_path)?.filter_map(|e| e.ok()) {
+                let fpath = file_entry.path();
+                if fpath.extension().is_none_or(|ext| ext != "md") {
+                    continue;
+                }
+                total_scanned += 1;
+
+                let Ok(content) = fs::read_to_string(&fpath) else {
+                    continue;
+                };
+
+                let content_lower = content.to_lowercase();
+
+                // Check if ALL query terms appear in file (AND matching)
+                if !query_terms.iter().all(|t| content_lower.contains(t)) {
+                    continue;
+                }
+
+                // Collect matching lines
+                let matched_lines: Vec<String> = content
+                    .lines()
+                    .filter(|line| {
+                        let lower = line.to_lowercase();
+                        query_terms.iter().any(|t| lower.contains(t))
+                    })
+                    .take(5)
+                    .map(|l| l.trim().to_string())
+                    .collect();
+
+                // Score the chunk for quality
+                let chunk_score = rank::score_chunk_content(&content);
+
+                let file_name = fpath
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+
+                results.push(FuzzySearchResult {
+                    file: file_name,
+                    project: project.clone(),
+                    date: date.clone(),
+                    score: chunk_score.score,
+                    label: chunk_score.label.to_string(),
+                    signal_density: chunk_score.density,
+                    matched_lines,
+                });
+            }
+        }
+    }
+
+    // Sort by quality score desc, then by date desc
+    results.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| b.date.cmp(&a.date)));
+    results.truncate(limit);
+
+    Ok((results, total_scanned))
+}
+
+/// Semantic search via rmcp-memex vector DB.
+///
+/// Shells out to `rmcp-memex search --json` for vector similarity.
+async fn semantic_search(Query(params): Query<SemanticSearchParams>) -> Response {
+    let query = params.q.trim().to_string();
+    if query.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                ok: false,
+                error: "Query parameter 'q' is required".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    let ns = params.ns;
+    let limit = params.limit;
+    let mode = params.mode;
+
+    let result =
+        tokio::task::spawn_blocking(move || run_memex_search(&query, &ns, limit, &mode)).await;
+
+    match result {
+        Ok(Ok(response)) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(Err(err)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                ok: false,
+                error: format!("{err:#}"),
+            }),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                ok: false,
+                error: format!("Search task failed: {err}"),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+fn run_memex_search(
+    query: &str,
+    namespace: &str,
+    limit: usize,
+    mode: &str,
+) -> Result<MemexSearchResponse> {
+    let output = Command::new("rmcp-memex")
+        .arg("search")
+        .arg("-n")
+        .arg(namespace)
+        .arg("-q")
+        .arg(query)
+        .arg("-l")
+        .arg(limit.to_string())
+        .arg("-m")
+        .arg(mode)
+        .arg("--json")
+        .output()
+        .context("Failed to run rmcp-memex search. Is rmcp-memex installed?")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("rmcp-memex search failed: {}", stderr.trim());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let results: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or(serde_json::Value::String(stdout.to_string()));
+
+    Ok(MemexSearchResponse {
+        ok: true,
+        query: query.to_string(),
+        source: format!("rmcp-memex search -n {} --mode {}", namespace, mode),
+        results,
+    })
+}
+
+/// Cross-namespace semantic search via rmcp-memex.
+///
+/// Searches all namespaces at once, merging and ranking results.
+async fn cross_search(Query(params): Query<CrossSearchParams>) -> Response {
+    let query = params.q.trim().to_string();
+    if query.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                ok: false,
+                error: "Query parameter 'q' is required".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    let limit = params.limit;
+    let mode = params.mode;
+
+    let result =
+        tokio::task::spawn_blocking(move || run_memex_cross_search(&query, limit, &mode)).await;
+
+    match result {
+        Ok(Ok(response)) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(Err(err)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                ok: false,
+                error: format!("{err:#}"),
+            }),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                ok: false,
+                error: format!("Search task failed: {err}"),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+fn run_memex_cross_search(query: &str, limit: usize, mode: &str) -> Result<MemexSearchResponse> {
+    let output = Command::new("rmcp-memex")
+        .arg("cross-search")
+        .arg(query)
+        .arg("--limit")
+        .arg(limit.to_string())
+        .arg("--mode")
+        .arg(mode)
+        .arg("--json")
+        .output()
+        .context("Failed to run rmcp-memex cross-search. Is rmcp-memex installed?")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("rmcp-memex cross-search failed: {}", stderr.trim());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let results: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or(serde_json::Value::String(stdout.to_string()));
+
+    Ok(MemexSearchResponse {
+        ok: true,
+        query: query.to_string(),
+        source: format!("rmcp-memex cross-search --mode {}", mode),
+        results,
+    })
 }
 
 fn rebuild_dashboard(config: &DashboardServerConfig) -> Result<BuildOutput> {

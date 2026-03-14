@@ -184,7 +184,7 @@ pub fn extract_claude(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
                     .unwrap_or_default();
 
                 let session_entries = parse_claude_jsonl(&path, &session_id, config)?;
-                
+
                 // If directory name matched, keep all entries.
                 // Otherwise, check if ANY entry in this session matches the project filter.
                 let keep_session = dir_matches || {
@@ -196,11 +196,14 @@ pub fn extract_claude(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
                             .iter()
                             .map(|f| f.to_lowercase())
                             .collect();
-                        
+
                         session_entries.iter().any(|entry| {
                             filters_lower.iter().any(|fl| {
                                 entry.message.to_lowercase().contains(fl)
-                                    || entry.cwd.as_ref().is_some_and(|c| c.to_lowercase().contains(fl))
+                                    || entry
+                                        .cwd
+                                        .as_ref()
+                                        .is_some_and(|c| c.to_lowercase().contains(fl))
                             })
                         })
                     }
@@ -1375,7 +1378,10 @@ pub fn repo_name_from_cwd(cwd: Option<&str>, project_filter: &[String]) -> Strin
     let mut current = Some(path);
 
     while let Some(p) = current {
-        if !p.as_os_str().is_empty() && p.join(".git").is_dir() && let Some(name) = p.file_name() {
+        if !p.as_os_str().is_empty()
+            && p.join(".git").is_dir()
+            && let Some(name) = p.file_name()
+        {
             return name.to_string_lossy().to_string();
         }
         current = p.parent();
@@ -1525,17 +1531,23 @@ mod tests {
         assert_eq!(repo_name_from_cwd(None, &[]), "unknown");
         assert_eq!(repo_name_from_cwd(Some("/"), &[]), "unknown");
         assert_eq!(repo_name_from_cwd(Some(""), &[]), "unknown");
-        
+
         // Single project filter
         assert_eq!(
-            repo_name_from_cwd(Some("/Users/polyversai/Libraxis/lbrx-services/subfolder"), &["lbrx".to_string()]),
+            repo_name_from_cwd(
+                Some("/Users/polyversai/Libraxis/lbrx-services/subfolder"),
+                &["lbrx".to_string()]
+            ),
             "lbrx"
         );
-        
+
         // Multiple project filters
         let filters = vec!["lbrx-services".to_string(), "foo".to_string()];
         assert_eq!(
-            repo_name_from_cwd(Some("/Users/polyversai/Libraxis/lbrx-services/subfolder"), &filters),
+            repo_name_from_cwd(
+                Some("/Users/polyversai/Libraxis/lbrx-services/subfolder"),
+                &filters
+            ),
             "lbrx-services"
         );
     }

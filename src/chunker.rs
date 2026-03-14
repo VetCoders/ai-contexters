@@ -559,7 +559,9 @@ fn is_decision_tag(line: &str) -> bool {
 
 fn is_outcome_tag(line: &str) -> bool {
     let lower = line.to_lowercase();
-    lower.contains("[skill_outcome]") || lower.starts_with("outcome:") || lower.starts_with("validation:")
+    lower.contains("[skill_outcome]")
+        || lower.starts_with("outcome:")
+        || lower.starts_with("validation:")
 }
 
 fn extract_tag_blocks(

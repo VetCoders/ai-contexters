@@ -8,6 +8,7 @@ pub mod dashboard_server;
 pub mod init;
 pub mod memex;
 pub mod output;
+pub mod rank;
 pub mod redact;
 pub mod sanitize;
 pub mod sources;

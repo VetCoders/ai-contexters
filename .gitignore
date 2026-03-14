@@ -19,3 +19,6 @@ agents/state/
 /.ai-context
 *.zip
 /.ai-agents
+*.orig
+*.patch
+aicx-dashboard.html
