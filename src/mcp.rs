@@ -7,14 +7,11 @@
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
-use rmcp::{
-    ErrorData as McpError,
-    model::*,
-    tool, tool_router,
-    handler::server::tool::ToolRouter,
-    handler::server::wrapper::Parameters,
-};
 use rmcp::schemars::{self, JsonSchema};
+use rmcp::{
+    ErrorData as McpError, handler::server::tool::ToolRouter, handler::server::wrapper::Parameters,
+    model::*, tool, tool_router,
+};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -98,26 +95,7 @@ struct SearchResult {
     matched_lines: Vec<String>,
 }
 
-// ============================================================================
-// Query normalization (shared with dashboard_server)
-// ============================================================================
-
-fn normalize_query(text: &str) -> String {
-    text.chars()
-        .map(|c| match c {
-            'Ą' | 'ą' => 'a',
-            'Ć' | 'ć' => 'c',
-            'Ę' | 'ę' => 'e',
-            'Ł' | 'ł' => 'l',
-            'Ń' | 'ń' => 'n',
-            'Ó' | 'ó' => 'o',
-            'Ś' | 'ś' => 's',
-            'Ź' | 'ź' | 'Ż' | 'ż' => 'z',
-            _ => c,
-        })
-        .collect::<String>()
-        .to_lowercase()
-}
+use crate::sanitize::normalize_query;
 
 // ============================================================================
 // MCP Server
@@ -156,12 +134,12 @@ impl AicxMcpServer {
         let store_root = store::store_base_dir()
             .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
 
-        // Auto-rescan
+        // Non-blocking auto-rescan: spawn child and don't wait.
         let _ = std::process::Command::new("aicx")
             .args(["store", "-H", "24", "--incremental"])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .status();
+            .spawn();
 
         let normalized = normalize_query(&query);
         let terms: Vec<&str> = normalized.split_whitespace().collect();
@@ -178,7 +156,11 @@ impl AicxMcpServer {
             if !proj_path.is_dir() {
                 continue;
             }
-            let proj_name = proj_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+            let proj_name = proj_path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
             if proj_name == "memex" {
                 continue;
             }
@@ -188,15 +170,23 @@ impl AicxMcpServer {
                 continue;
             }
 
-            let Ok(dates) = std::fs::read_dir(&proj_path) else { continue };
+            let Ok(dates) = std::fs::read_dir(&proj_path) else {
+                continue;
+            };
             for date_entry in dates.filter_map(|e| e.ok()) {
                 let date_path = date_entry.path();
                 if !date_path.is_dir() {
                     continue;
                 }
-                let date = date_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                let date = date_path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
 
-                let Ok(files) = std::fs::read_dir(&date_path) else { continue };
+                let Ok(files) = std::fs::read_dir(&date_path) else {
+                    continue;
+                };
                 for file_entry in files.filter_map(|e| e.ok()) {
                     let fpath = file_entry.path();
                     if fpath.extension().is_none_or(|ext| ext != "md") {
@@ -204,7 +194,9 @@ impl AicxMcpServer {
                     }
                     scanned += 1;
 
-                    let Ok(content) = std::fs::read_to_string(&fpath) else { continue };
+                    let Ok(content) = std::fs::read_to_string(&fpath) else {
+                        continue;
+                    };
                     let content_norm = normalize_query(&content);
 
                     if !terms.iter().all(|t| content_norm.contains(t)) {
@@ -223,7 +215,11 @@ impl AicxMcpServer {
 
                     let cs = rank::score_chunk_content(&content);
                     results.push(SearchResult {
-                        file: fpath.file_name().unwrap_or_default().to_string_lossy().to_string(),
+                        file: fpath
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_string(),
                         project: proj_name.clone(),
                         date: date.clone(),
                         score: cs.score,
@@ -263,20 +259,21 @@ impl AicxMcpServer {
 
         let store_root = store::store_base_dir()
             .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
-        let cutoff = std::time::SystemTime::now()
-            - std::time::Duration::from_secs(hours * 3600);
+        let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(hours * 3600);
 
         let proj_dir = store_root.join(&project);
         if !proj_dir.is_dir() {
-            return Ok(CallToolResult::success(vec![Content::text(
-                format!("No data for project '{project}'"),
-            )]));
+            return Ok(CallToolResult::success(vec![Content::text(format!(
+                "No data for project '{project}'"
+            ))]));
         }
 
         let mut scored: Vec<serde_json::Value> = Vec::new();
 
         let Ok(dates) = std::fs::read_dir(&proj_dir) else {
-            return Ok(CallToolResult::success(vec![Content::text("Cannot read project dir")]));
+            return Ok(CallToolResult::success(vec![Content::text(
+                "Cannot read project dir",
+            )]));
         };
 
         for date_entry in dates.filter_map(|e| e.ok()) {
@@ -284,7 +281,9 @@ impl AicxMcpServer {
             if !date_path.is_dir() {
                 continue;
             }
-            let Ok(files) = std::fs::read_dir(&date_path) else { continue };
+            let Ok(files) = std::fs::read_dir(&date_path) else {
+                continue;
+            };
             for file_entry in files.filter_map(|e| e.ok()) {
                 let fpath = file_entry.path();
                 if fpath.extension().is_none_or(|ext| ext != "md") {
@@ -312,9 +311,7 @@ impl AicxMcpServer {
             }
         }
 
-        scored.sort_by(|a, b| {
-            b["score"].as_u64().cmp(&a["score"].as_u64())
-        });
+        scored.sort_by(|a, b| b["score"].as_u64().cmp(&a["score"].as_u64()));
 
         if let Some(n) = top {
             scored.truncate(n);
@@ -346,8 +343,7 @@ impl AicxMcpServer {
 
         let store_root = store::store_base_dir()
             .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
-        let cutoff = std::time::SystemTime::now()
-            - std::time::Duration::from_secs(hours * 3600);
+        let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(hours * 3600);
 
         let mut paths: Vec<PathBuf> = Vec::new();
 
@@ -364,16 +360,22 @@ impl AicxMcpServer {
         };
 
         for proj_dir in project_dirs {
-            let Ok(dates) = std::fs::read_dir(&proj_dir) else { continue };
+            let Ok(dates) = std::fs::read_dir(&proj_dir) else {
+                continue;
+            };
             for date_entry in dates.filter_map(|e| e.ok()) {
                 let date_path = date_entry.path();
                 if !date_path.is_dir() {
                     continue;
                 }
-                let Ok(files) = std::fs::read_dir(&date_path) else { continue };
+                let Ok(files) = std::fs::read_dir(&date_path) else {
+                    continue;
+                };
                 for file_entry in files.filter_map(|e| e.ok()) {
                     let fpath = file_entry.path();
-                    if fpath.extension().is_some_and(|ext| ext == "md" || ext == "json")
+                    if fpath
+                        .extension()
+                        .is_some_and(|ext| ext == "md" || ext == "json")
                         && let Ok(meta) = fpath.metadata()
                         && let Ok(mtime) = meta.modified()
                         && mtime >= cutoff
@@ -477,7 +479,9 @@ pub async fn run_stdio() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("MCP stdio serve failed: {e}"))?;
 
     eprintln!("aicx MCP server running (stdio)");
-    service.waiting().await
+    service
+        .waiting()
+        .await
         .map_err(|e| anyhow::anyhow!("MCP server error: {e}"))?;
     Ok(())
 }
@@ -490,10 +494,7 @@ pub async fn run_sse(port: u16) -> anyhow::Result<()> {
         .try_init()
         .ok();
 
-    let addr = std::net::SocketAddr::new(
-        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-        port,
-    );
+    let addr = std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port);
 
     let config = rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default();
     let service = rmcp::transport::streamable_http_server::StreamableHttpService::new(
@@ -504,19 +505,23 @@ pub async fn run_sse(port: u16) -> anyhow::Result<()> {
         config,
     );
 
-    let app = axum::Router::new()
-        .route("/mcp", axum::routing::any(move |req: axum::http::Request<axum::body::Body>| {
+    let app = axum::Router::new().route(
+        "/mcp",
+        axum::routing::any(move |req: axum::http::Request<axum::body::Body>| {
             let svc = service.clone();
             async move { svc.handle(req).await }
-        }));
+        }),
+    );
 
-    let listener = tokio::net::TcpListener::bind(addr).await
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to bind MCP server on {addr}: {e}"))?;
 
     eprintln!("aicx MCP server running (streamable HTTP)");
     eprintln!("  Endpoint: http://{addr}/mcp");
     eprintln!("  Transport: Streamable HTTP (POST + GET /mcp)");
 
-    axum::serve(listener, app).await
+    axum::serve(listener, app)
+        .await
         .map_err(|e| anyhow::anyhow!("MCP HTTP server error: {e}"))
 }

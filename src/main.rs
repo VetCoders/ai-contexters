@@ -22,12 +22,12 @@ use ai_contexters::chunker::{self, ChunkerConfig};
 use ai_contexters::dashboard::{self, DashboardConfig};
 use ai_contexters::dashboard_server::{self, DashboardServerConfig};
 use ai_contexters::init::{self, InitOptions};
+use ai_contexters::intents;
 use ai_contexters::memex::{self, MemexConfig};
 use ai_contexters::output::{self, OutputConfig, OutputFormat, OutputMode, ReportMetadata};
 use ai_contexters::rank;
 use ai_contexters::sources::{self, ExtractionConfig};
 use ai_contexters::state::StateManager;
-use ai_contexters::intents;
 use ai_contexters::store;
 
 /// AI Contexters - timeline and decisions from AI sessions
@@ -830,7 +830,10 @@ fn run_intents(
     let records = intents::extract_intents(&config)?;
 
     if records.is_empty() {
-        eprintln!("No intents found for project '{}' in last {} hours.", project, hours);
+        eprintln!(
+            "No intents found for project '{}' in last {} hours.",
+            project, hours
+        );
         return Ok(());
     }
 
@@ -875,23 +878,14 @@ fn run_extract_file(
     // Sort by timestamp (extractors should already do this).
     entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
 
-    // Convert sources::TimelineEntry → output::TimelineEntry
-    let output_entries: Vec<output::TimelineEntry> = entries
-        .iter()
-        .map(|e| output::TimelineEntry {
-            timestamp: e.timestamp,
-            agent: e.agent.clone(),
-            session_id: e.session_id.clone(),
-            role: e.role.clone(),
-            message: if redact_secrets {
-                ai_contexters::redact::redact_secrets(&e.message)
-            } else {
-                e.message.clone()
-            },
-            branch: e.branch.clone(),
-            cwd: e.cwd.clone(),
-        })
-        .collect();
+    // Apply secret redaction in-place (TimelineEntry is now single definition in sources)
+    if redact_secrets {
+        for e in &mut entries {
+            e.message = ai_contexters::redact::redact_secrets(&e.message);
+        }
+    }
+    #[allow(clippy::redundant_clone)]
+    let output_entries = entries.clone();
 
     // Collect unique sessions
     let mut sessions: Vec<String> = entries.iter().map(|e| e.session_id.clone()).collect();
@@ -1066,23 +1060,14 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
     // Sort by timestamp
     entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
 
-    // Convert sources::TimelineEntry → output::TimelineEntry
-    let output_entries: Vec<output::TimelineEntry> = entries
-        .iter()
-        .map(|e| output::TimelineEntry {
-            timestamp: e.timestamp,
-            agent: e.agent.clone(),
-            session_id: e.session_id.clone(),
-            role: e.role.clone(),
-            message: if redact_secrets {
-                ai_contexters::redact::redact_secrets(&e.message)
-            } else {
-                e.message.clone()
-            },
-            branch: e.branch.clone(),
-            cwd: e.cwd.clone(),
-        })
-        .collect();
+    // Apply secret redaction in-place (TimelineEntry is now single definition in sources)
+    if redact_secrets {
+        for e in &mut entries {
+            e.message = ai_contexters::redact::redact_secrets(&e.message);
+        }
+    }
+    #[allow(clippy::redundant_clone)]
+    let output_entries = entries.clone();
 
     // Collect unique sessions
     let mut sessions: Vec<String> = entries.iter().map(|e| e.session_id.clone()).collect();

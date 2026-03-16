@@ -11,7 +11,7 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
@@ -69,19 +69,8 @@ pub enum OutputMode {
     AppendTimeline(PathBuf),
 }
 
-/// A single timeline entry from an agent session.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TimelineEntry {
-    pub timestamp: DateTime<Utc>,
-    pub agent: String,
-    pub session_id: String,
-    pub role: String,
-    pub message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub branch: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cwd: Option<String>,
-}
+/// Re-export from sources — single definition, no twin.
+pub use crate::sources::TimelineEntry;
 
 /// Metadata about the generated report.
 #[derive(Debug, Clone, Serialize)]

@@ -301,6 +301,45 @@ mod tests {
         assert!(safe_project_name("CodeScribe").is_ok());
     }
 
+}
+
+// ============================================================================
+// Query normalization (PL/EN diacritics + case folding)
+// ============================================================================
+
+/// Normalize text for fuzzy matching: lowercase + strip Polish diacritics.
+///
+/// Maps: ą→a, ć→c, ę→e, ł→l, ń→n, ó→o, ś→s, ź→z, ż→z
+/// Enables "wdrozenie" to match "wdrożenie", "zrodlo" to match "źródło", etc.
+pub fn normalize_query(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            'Ą' | 'ą' => 'a',
+            'Ć' | 'ć' => 'c',
+            'Ę' | 'ę' => 'e',
+            'Ł' | 'ł' => 'l',
+            'Ń' | 'ń' => 'n',
+            'Ó' | 'ó' => 'o',
+            'Ś' | 'ś' => 's',
+            'Ź' | 'ź' | 'Ż' | 'ż' => 'z',
+            _ => c,
+        })
+        .collect::<String>()
+        .to_lowercase()
+}
+
+#[cfg(test)]
+mod normalize_tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_query_strips_diacritics() {
+        assert_eq!(normalize_query("wdrożenie"), "wdrozenie");
+        assert_eq!(normalize_query("źródło ŁĄCZNOŚCI"), "zrodlo lacznosci");
+        assert_eq!(normalize_query("Deploy Vista"), "deploy vista");
+        assert_eq!(normalize_query("ąćęłńóśźż"), "acelnoszz");
+    }
+
     #[test]
     fn test_safe_project_name_rejects_bad() {
         assert!(safe_project_name("../etc").is_err());

@@ -462,11 +462,12 @@ fn run_fuzzy_search(
 ) -> Result<(Vec<FuzzySearchResult>, usize)> {
     // Auto-rescan: quick incremental extraction so results are always fresh.
     // This is fast (skips already-processed entries via watermarks).
+    // Non-blocking auto-rescan: spawn child and don't wait.
     let _ = std::process::Command::new("aicx")
         .args(["store", "-H", "24", "--incremental"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status();
+        .spawn();
 
     let normalized = normalize_query(query);
     let query_terms: Vec<&str> = normalized.split_whitespace().collect();
@@ -572,9 +573,7 @@ fn run_fuzzy_search(
 /// Semantic search via rmcp-memex vector DB.
 ///
 /// Shells out to `rmcp-memex search --json` for vector similarity.
-async fn semantic_search(
-    params: Result<Query<SemanticSearchParams>, QueryRejection>,
-) -> Response {
+async fn semantic_search(params: Result<Query<SemanticSearchParams>, QueryRejection>) -> Response {
     let Query(params) = match params {
         Ok(q) => q,
         Err(rejection) => {
@@ -669,9 +668,7 @@ fn run_memex_search(
 /// Cross-namespace semantic search via rmcp-memex.
 ///
 /// Searches all namespaces at once, merging and ranking results.
-async fn cross_search(
-    params: Result<Query<CrossSearchParams>, QueryRejection>,
-) -> Response {
+async fn cross_search(params: Result<Query<CrossSearchParams>, QueryRejection>) -> Response {
     let Query(params) = match params {
         Ok(q) => q,
         Err(rejection) => {
@@ -753,30 +750,7 @@ fn run_memex_cross_search(query: &str, limit: usize, mode: &str) -> Result<Memex
     })
 }
 
-// ============================================================================
-// Query normalization (PL/EN diacritics + case folding)
-// ============================================================================
-
-/// Normalize text for fuzzy matching: lowercase + strip Polish diacritics.
-///
-/// Maps: ą→a, ć→c, ę→e, ł→l, ń→n, ó→o, ś→s, ź→z, ż→z
-/// This enables "wdrozenie" to match "wdrożenie", "zrodlo" to match "źródło", etc.
-fn normalize_query(text: &str) -> String {
-    text.chars()
-        .map(|c| match c {
-            'Ą' | 'ą' => 'a',
-            'Ć' | 'ć' => 'c',
-            'Ę' | 'ę' => 'e',
-            'Ł' | 'ł' => 'l',
-            'Ń' | 'ń' => 'n',
-            'Ó' | 'ó' => 'o',
-            'Ś' | 'ś' => 's',
-            'Ź' | 'ź' | 'Ż' | 'ż' => 'z',
-            _ => c,
-        })
-        .collect::<String>()
-        .to_lowercase()
-}
+use crate::sanitize::normalize_query;
 
 fn rebuild_dashboard(config: &DashboardServerConfig) -> Result<BuildOutput> {
     let artifact = dashboard::build_dashboard(&DashboardConfig {
