@@ -884,10 +884,7 @@ fn run_extract_file(
             e.message = ai_contexters::redact::redact_secrets(&e.message);
         }
     }
-    #[allow(clippy::redundant_clone)]
-    let output_entries = entries.clone();
-
-    // Collect unique sessions
+    // Collect derived data from entries before moving them.
     let mut sessions: Vec<String> = entries.iter().map(|e| e.session_id.clone()).collect();
     sessions.sort();
     sessions.dedup();
@@ -901,6 +898,8 @@ fn run_extract_file(
         .first()
         .map(|e| (Utc::now() - e.timestamp).num_hours().max(0) as u64)
         .unwrap_or(0);
+
+    let output_entries = entries;
 
     let metadata = ReportMetadata {
         generated_at: Utc::now(),
@@ -1074,13 +1073,12 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
             e.message = ai_contexters::redact::redact_secrets(&e.message);
         }
     }
-    #[allow(clippy::redundant_clone)]
-    let output_entries = entries.clone();
-
-    // Collect unique sessions
+    // Collect derived data from entries before moving them.
     let mut sessions: Vec<String> = entries.iter().map(|e| e.session_id.clone()).collect();
     sessions.sort();
     sessions.dedup();
+
+    let output_entries = entries;
 
     let metadata = ReportMetadata {
         generated_at: Utc::now(),
@@ -1091,7 +1089,7 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
         },
         hours_back: hours,
         total_entries: output_entries.len(),
-        sessions: sessions.clone(),
+        sessions,
     };
 
     // ── Store-first: group entries by repo (from cwd) × agent × date ──
@@ -1241,10 +1239,10 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
     }
 
     // Update state (hashes already marked during dedup filtering above)
-    if !entries.is_empty() {
+    if !output_entries.is_empty() {
         if force {
             // When --force skips dedup, we still mark entries as seen for future runs
-            for e in &entries {
+            for e in &output_entries {
                 let exact =
                     StateManager::content_hash(&e.agent, e.timestamp.timestamp(), &e.message);
                 let overlap = StateManager::overlap_hash(e.timestamp.timestamp(), &e.message);
@@ -1263,13 +1261,13 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
                     project.join("+")
                 }
             );
-            if let Some(latest) = entries.last() {
+            if let Some(latest) = output_entries.last() {
                 state.update_watermark(&source_key, latest.timestamp);
             }
         }
 
         state.record_run(
-            entries.len(),
+            output_entries.len(),
             agents.iter().map(|s| s.to_string()).collect(),
         );
         state.prune_old_hashes(50_000);
@@ -1279,7 +1277,7 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
     if output_entries.is_empty() {
         eprintln!(
             "✓ 0 entries from {} sessions ({})",
-            sessions.len(),
+            metadata.sessions.len(),
             agents.join("+"),
         );
     }

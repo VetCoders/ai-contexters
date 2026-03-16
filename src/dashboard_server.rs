@@ -28,6 +28,9 @@ use tokio::sync::RwLock;
 use crate::dashboard::{self, DashboardConfig, DashboardStats};
 use crate::rank;
 
+/// Guard that prevents concurrent `aicx store` child-process spawns from dashboard search.
+static DASHBOARD_RESCAN_RUNNING: AtomicBool = AtomicBool::new(false);
+
 const REGENERATE_HEADER_NAME: &str = "x-ai-contexters-action";
 const REGENERATE_HEADER_VALUE: &str = "regenerate";
 
@@ -460,112 +463,40 @@ fn run_fuzzy_search(
     limit: usize,
     project_filter: Option<&str>,
 ) -> Result<(Vec<FuzzySearchResult>, usize)> {
-    // Auto-rescan: quick incremental extraction so results are always fresh.
-    // This is fast (skips already-processed entries via watermarks).
-    // Non-blocking auto-rescan: spawn child and don't wait.
-    let _ = std::process::Command::new("aicx")
-        .args(["store", "-H", "24", "--incremental"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
-
-    let normalized = normalize_query(query);
-    let query_terms: Vec<&str> = normalized.split_whitespace().collect();
-    let mut results = Vec::new();
-    let mut total_scanned = 0usize;
-
-    let project_filter_lower = project_filter.map(|p| p.to_lowercase());
-
-    // Walk project dirs in store
-    for proj_entry in fs::read_dir(store_root)?.filter_map(|e| e.ok()) {
-        let proj_path = proj_entry.path();
-        if !proj_path.is_dir() {
-            continue;
-        }
-        let project = proj_path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-
-        if project == "memex" {
-            continue;
-        }
-
-        // Apply project filter (case-insensitive substring)
-        if let Some(ref filter) = project_filter_lower
-            && !project.to_lowercase().contains(filter)
+    // Non-blocking auto-rescan with rate-limit guard.
+    if !DASHBOARD_RESCAN_RUNNING.swap(true, Ordering::SeqCst) {
+        match std::process::Command::new("aicx")
+            .args(["store", "-H", "24", "--incremental"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
         {
-            continue;
-        }
-
-        // Walk date dirs
-        for date_entry in fs::read_dir(&proj_path)?.filter_map(|e| e.ok()) {
-            let date_path = date_entry.path();
-            if !date_path.is_dir() {
-                continue;
-            }
-            let date = date_path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-
-            // Read chunk files
-            for file_entry in fs::read_dir(&date_path)?.filter_map(|e| e.ok()) {
-                let fpath = file_entry.path();
-                if fpath.extension().is_none_or(|ext| ext != "md") {
-                    continue;
-                }
-                total_scanned += 1;
-
-                let Ok(content) = fs::read_to_string(&fpath) else {
-                    continue;
-                };
-
-                let content_normalized = normalize_query(&content);
-
-                // Check if ALL query terms appear in file (AND matching)
-                if !query_terms.iter().all(|t| content_normalized.contains(t)) {
-                    continue;
-                }
-
-                // Collect matching lines
-                let matched_lines: Vec<String> = content
-                    .lines()
-                    .filter(|line| {
-                        let norm = normalize_query(line);
-                        query_terms.iter().any(|t| norm.contains(t))
-                    })
-                    .take(5)
-                    .map(|l| l.trim().to_string())
-                    .collect();
-
-                // Score the chunk for quality
-                let chunk_score = rank::score_chunk_content(&content);
-
-                let file_name = fpath
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string();
-
-                results.push(FuzzySearchResult {
-                    file: file_name,
-                    project: project.clone(),
-                    date: date.clone(),
-                    score: chunk_score.score,
-                    label: chunk_score.label.to_string(),
-                    signal_density: chunk_score.density,
-                    matched_lines,
+            Ok(_) => {
+                std::thread::spawn(|| {
+                    std::thread::sleep(std::time::Duration::from_secs(30));
+                    DASHBOARD_RESCAN_RUNNING.store(false, Ordering::SeqCst);
                 });
+            }
+            Err(_) => {
+                DASHBOARD_RESCAN_RUNNING.store(false, Ordering::SeqCst);
             }
         }
     }
 
-    // Sort by quality score desc, then by date desc
-    results.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| b.date.cmp(&a.date)));
-    results.truncate(limit);
+    let (results, total_scanned) =
+        rank::fuzzy_search_store(store_root, query, limit, project_filter)?;
+    let results = results
+        .into_iter()
+        .map(|result| FuzzySearchResult {
+            file: result.file,
+            project: result.project,
+            date: result.date,
+            score: result.score,
+            label: result.label,
+            signal_density: result.density,
+            matched_lines: result.matched_lines,
+        })
+        .collect();
 
     Ok((results, total_scanned))
 }
@@ -749,8 +680,6 @@ fn run_memex_cross_search(query: &str, limit: usize, mode: &str) -> Result<Memex
         results,
     })
 }
-
-use crate::sanitize::normalize_query;
 
 fn rebuild_dashboard(config: &DashboardServerConfig) -> Result<BuildOutput> {
     let artifact = dashboard::build_dashboard(&DashboardConfig {

@@ -12,8 +12,12 @@ use rmcp::{
     ErrorData as McpError, handler::server::tool::ToolRouter, handler::server::wrapper::Parameters,
     model::*, tool, tool_router,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Guard that prevents concurrent `aicx store` child-process spawns.
+static RESCAN_RUNNING: AtomicBool = AtomicBool::new(false);
 
 use crate::rank;
 use crate::store;
@@ -84,19 +88,6 @@ fn default_store_hours() -> u64 {
     24
 }
 
-#[derive(Debug, Serialize)]
-struct SearchResult {
-    file: String,
-    project: String,
-    date: String,
-    score: u8,
-    label: String,
-    density: f32,
-    matched_lines: Vec<String>,
-}
-
-use crate::sanitize::normalize_query;
-
 // ============================================================================
 // MCP Server
 // ============================================================================
@@ -134,105 +125,30 @@ impl AicxMcpServer {
         let store_root = store::store_base_dir()
             .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
 
-        // Non-blocking auto-rescan: spawn child and don't wait.
-        let _ = std::process::Command::new("aicx")
-            .args(["store", "-H", "24", "--incremental"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-
-        let normalized = normalize_query(&query);
-        let terms: Vec<&str> = normalized.split_whitespace().collect();
-        let project_lower = project.as_deref().map(|p| p.to_lowercase());
-
-        let mut results: Vec<SearchResult> = Vec::new();
-        let mut scanned = 0usize;
-
-        let entries = std::fs::read_dir(&store_root)
-            .map_err(|e| McpError::internal_error(format!("Read store: {e}"), None))?;
-
-        for proj_entry in entries.filter_map(|e| e.ok()) {
-            let proj_path = proj_entry.path();
-            if !proj_path.is_dir() {
-                continue;
-            }
-            let proj_name = proj_path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            if proj_name == "memex" {
-                continue;
-            }
-            if let Some(ref f) = project_lower
-                && !proj_name.to_lowercase().contains(f)
+        // Non-blocking auto-rescan with rate-limit guard.
+        if !RESCAN_RUNNING.swap(true, Ordering::SeqCst) {
+            match std::process::Command::new("aicx")
+                .args(["store", "-H", "24", "--incremental"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
             {
-                continue;
-            }
-
-            let Ok(dates) = std::fs::read_dir(&proj_path) else {
-                continue;
-            };
-            for date_entry in dates.filter_map(|e| e.ok()) {
-                let date_path = date_entry.path();
-                if !date_path.is_dir() {
-                    continue;
-                }
-                let date = date_path
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string();
-
-                let Ok(files) = std::fs::read_dir(&date_path) else {
-                    continue;
-                };
-                for file_entry in files.filter_map(|e| e.ok()) {
-                    let fpath = file_entry.path();
-                    if fpath.extension().is_none_or(|ext| ext != "md") {
-                        continue;
-                    }
-                    scanned += 1;
-
-                    let Ok(content) = std::fs::read_to_string(&fpath) else {
-                        continue;
-                    };
-                    let content_norm = normalize_query(&content);
-
-                    if !terms.iter().all(|t| content_norm.contains(t)) {
-                        continue;
-                    }
-
-                    let matched: Vec<String> = content
-                        .lines()
-                        .filter(|l| {
-                            let n = normalize_query(l);
-                            terms.iter().any(|t| n.contains(t))
-                        })
-                        .take(5)
-                        .map(|l| l.trim().to_string())
-                        .collect();
-
-                    let cs = rank::score_chunk_content(&content);
-                    results.push(SearchResult {
-                        file: fpath
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .to_string(),
-                        project: proj_name.clone(),
-                        date: date.clone(),
-                        score: cs.score,
-                        label: cs.label.to_string(),
-                        density: cs.density,
-                        matched_lines: matched,
+                Ok(_) => {
+                    std::thread::spawn(|| {
+                        std::thread::sleep(std::time::Duration::from_secs(30));
+                        RESCAN_RUNNING.store(false, Ordering::SeqCst);
                     });
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to spawn aicx store rescan: {e}");
+                    RESCAN_RUNNING.store(false, Ordering::SeqCst);
                 }
             }
         }
 
-        results.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| b.date.cmp(&a.date)));
-        results.truncate(limit);
+        let (results, scanned) =
+            rank::fuzzy_search_store(&store_root, &query, limit, project.as_deref())
+                .map_err(|e| McpError::internal_error(format!("Read store: {e}"), None))?;
 
         let json = serde_json::to_string_pretty(&serde_json::json!({
             "scanned": scanned,
@@ -458,6 +374,7 @@ impl AicxMcpServer {
 impl rmcp::handler::server::ServerHandler for AicxMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new("aicx-mcp", env!("CARGO_PKG_VERSION")))
     }
 }
 

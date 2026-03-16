@@ -7,7 +7,10 @@
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
+use serde::Serialize;
 use std::path::Path;
+
+use crate::sanitize::normalize_query;
 
 // ============================================================================
 // Noise patterns — lines that inflate chunk size without adding value
@@ -130,10 +133,16 @@ const SIGNAL_CONTAINS: &[&str] = &[
     "regression",
     "panic",
     "crash",
-    "failed",
+    " failed",
+    "test failed",
+    "check failed",
     // Git & deployment
-    "commit",
-    "merge",
+    "git commit",
+    " committed",
+    "commit ",
+    "git merge",
+    "merge pr",
+    " merged",
     "pr #",
     "deploy",
     "release",
@@ -146,7 +155,10 @@ const SIGNAL_CONTAINS: &[&str] = &[
     "p1=",
     "p2=",
     "/100",
-    "pass",
+    " passed",
+    "tests pass",
+    "all pass",
+    "check pass",
     "clippy",
     "semgrep",
     "cargo test",
@@ -208,6 +220,127 @@ pub struct ChunkScore {
     pub density: f32,
     /// Human label.
     pub label: &'static str,
+}
+
+/// Shared fuzzy-search result for a stored chunk.
+#[derive(Debug, Clone, Serialize)]
+pub struct FuzzyResult {
+    pub file: String,
+    pub project: String,
+    pub date: String,
+    pub score: u8,
+    pub label: String,
+    pub density: f32,
+    pub matched_lines: Vec<String>,
+}
+
+/// Fuzzy-search stored chunk files with normalized AND-matching and quality scoring.
+pub fn fuzzy_search_store(
+    store_root: &Path,
+    query: &str,
+    limit: usize,
+    project_filter: Option<&str>,
+) -> std::io::Result<(Vec<FuzzyResult>, usize)> {
+    let normalized_query = normalize_query(query);
+    let query_terms: Vec<&str> = normalized_query.split_whitespace().collect();
+    let project_filter_lower = project_filter.map(|filter| filter.to_lowercase());
+
+    let mut results = Vec::new();
+    let mut total_scanned = 0usize;
+
+    for project_entry in std::fs::read_dir(store_root)?.filter_map(|entry| entry.ok()) {
+        let project_path = project_entry.path();
+        if !project_path.is_dir() {
+            continue;
+        }
+
+        let project = project_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+
+        if project == "memex" {
+            continue;
+        }
+
+        if let Some(ref filter) = project_filter_lower
+            && !project.to_lowercase().contains(filter)
+        {
+            continue;
+        }
+
+        let Ok(date_entries) = std::fs::read_dir(&project_path) else {
+            continue;
+        };
+        for date_entry in date_entries.filter_map(|entry| entry.ok()) {
+            let date_path = date_entry.path();
+            if !date_path.is_dir() {
+                continue;
+            }
+
+            let date = date_path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+
+            let Ok(file_entries) = std::fs::read_dir(&date_path) else {
+                continue;
+            };
+            for file_entry in file_entries.filter_map(|entry| entry.ok()) {
+                let file_path = file_entry.path();
+                if file_path.extension().is_none_or(|ext| ext != "md") {
+                    continue;
+                }
+                total_scanned += 1;
+
+                let Ok(content) = std::fs::read_to_string(&file_path) else {
+                    continue;
+                };
+
+                let content_normalized = normalize_query(&content);
+                if !query_terms
+                    .iter()
+                    .all(|term| content_normalized.contains(term))
+                {
+                    continue;
+                }
+
+                let matched_lines = content
+                    .lines()
+                    .filter(|line| {
+                        let normalized_line = normalize_query(line);
+                        query_terms
+                            .iter()
+                            .any(|term| normalized_line.contains(term))
+                    })
+                    .take(5)
+                    .map(|line| line.trim().to_string())
+                    .collect();
+
+                let chunk_score = score_chunk_content(&content);
+                results.push(FuzzyResult {
+                    file: file_path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string(),
+                    project: project.clone(),
+                    date: date.clone(),
+                    score: chunk_score.score,
+                    label: chunk_score.label.to_string(),
+                    density: chunk_score.density,
+                    matched_lines,
+                });
+            }
+        }
+    }
+
+    results.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| b.date.cmp(&a.date)));
+    results.truncate(limit);
+
+    Ok((results, total_scanned))
 }
 
 /// Score a chunk file's content quality.
