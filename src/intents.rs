@@ -558,15 +558,9 @@ fn extract_transcript_candidates(
                 _ => STRICT_CONFIDENCE,
             };
 
-            if let Some(candidate) = build_candidate(
-                kind,
-                line,
-                context,
-                file,
-                project,
-                source_chunk,
-                confidence,
-            ) {
+            if let Some(candidate) =
+                build_candidate(kind, line, context, file, project, source_chunk, confidence)
+            {
                 candidates.push(candidate);
             }
         }
@@ -762,8 +756,8 @@ fn extract_evidence(text: &str) -> Vec<String> {
 fn looks_like_file_ref(token: &str) -> bool {
     let lower = token.to_lowercase();
     const EXTENSIONS: &[&str] = &[
-        ".rs", ".md", ".json", ".jsonl", ".toml", ".yaml", ".yml", ".ts", ".tsx", ".js",
-        ".jsx", ".py", ".sh", ".txt",
+        ".rs", ".md", ".json", ".jsonl", ".toml", ".yaml", ".yml", ".ts", ".tsx", ".js", ".jsx",
+        ".py", ".sh", ".txt",
     ];
 
     EXTENSIONS.iter().any(|ext| {
@@ -838,7 +832,10 @@ fn dedup_candidates(
             })
     });
 
-    values.into_iter().map(|item| item.candidate.record).collect()
+    values
+        .into_iter()
+        .map(|item| item.candidate.record)
+        .collect()
 }
 
 fn finalize_tasks(
@@ -882,8 +879,7 @@ fn finalize_tasks(
         }
     }
 
-    let mut tasks: Vec<TaskAccumulator> =
-        map.into_values().filter(|acc| acc.is_open).collect();
+    let mut tasks: Vec<TaskAccumulator> = map.into_values().filter(|acc| acc.is_open).collect();
 
     tasks.sort_by(|left, right| {
         right
@@ -899,7 +895,10 @@ fn finalize_tasks(
             })
     });
 
-    tasks.into_iter().map(|task| task.candidate.record).collect()
+    tasks
+        .into_iter()
+        .map(|task| task.candidate.record)
+        .collect()
 }
 
 fn merge_candidate(existing: &mut CandidateAccumulator, incoming: IntentCandidate) {
@@ -915,10 +914,8 @@ fn merge_candidate(existing: &mut CandidateAccumulator, incoming: IntentCandidat
         existing.candidate.record.context = incoming.record.context.clone();
     }
 
-    existing.candidate.record.summary = prefer_summary(
-        &existing.candidate.record.summary,
-        &incoming.record.summary,
-    );
+    existing.candidate.record.summary =
+        prefer_summary(&existing.candidate.record.summary, &incoming.record.summary);
     existing.candidate.confidence = existing.candidate.confidence.max(incoming.confidence);
 
     let should_replace_record = incoming.timestamp > existing.candidate.timestamp
@@ -951,7 +948,10 @@ fn merge_task(existing: &mut TaskAccumulator, incoming: TaskEvent) {
         &existing.candidate.record.summary,
         &incoming.candidate.record.summary,
     );
-    existing.candidate.confidence = existing.candidate.confidence.max(incoming.candidate.confidence);
+    existing.candidate.confidence = existing
+        .candidate
+        .confidence
+        .max(incoming.candidate.confidence);
 
     let should_replace_record = incoming.candidate.timestamp > existing.candidate.timestamp
         || (incoming.candidate.timestamp == existing.candidate.timestamp
@@ -1071,7 +1071,10 @@ RED LIGHT: checklist detected (open: 0, done: 1)
         assert!(records.iter().any(|record| {
             record.kind == IntentKind::Decision
                 && record.summary.contains("Reuse normalize_key")
-                && record.evidence.iter().any(|item| item == "src/chunker.rs:508")
+                && record
+                    .evidence
+                    .iter()
+                    .any(|item| item == "src/chunker.rs:508")
         }));
         assert!(records.iter().any(|record| {
             record.kind == IntentKind::Intent
@@ -1085,10 +1088,8 @@ RED LIGHT: checklist detected (open: 0, done: 1)
 
     #[test]
     fn extracts_raw_lines_and_keeps_surviving_open_tasks() {
-        let tmp = std::env::temp_dir().join(format!(
-            "ai-contexters-intents-{}-raw",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("ai-contexters-intents-{}-raw", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
 
         let chunk = r#"[project: demo | agent: claude | date: 2026-03-14]
@@ -1129,7 +1130,10 @@ commit abcdef1 proves the old path was wrong.
         }));
         assert!(records.iter().any(|record| {
             record.kind == IntentKind::Decision
-                && record.evidence.iter().any(|item| item == "src/intents.rs:1")
+                && record
+                    .evidence
+                    .iter()
+                    .any(|item| item == "src/intents.rs:1")
                 && record.evidence.iter().any(|item| item == "abcdef1")
         }));
         assert!(records.iter().any(|record| {

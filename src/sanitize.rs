@@ -300,7 +300,6 @@ mod tests {
         assert!(safe_project_name("lbrx-services").is_ok());
         assert!(safe_project_name("CodeScribe").is_ok());
     }
-
 }
 
 // ============================================================================
@@ -390,10 +389,7 @@ pub fn is_self_echo(message: &str) -> bool {
 }
 
 /// Filter a vec of timeline entries, removing self-echo messages.
-pub fn filter_self_echo<T>(
-    entries: Vec<T>,
-    get_message: impl Fn(&T) -> &str,
-) -> Vec<T> {
+pub fn filter_self_echo<T>(entries: Vec<T>, get_message: impl Fn(&T) -> &str) -> Vec<T> {
     entries
         .into_iter()
         .filter(|e| !is_self_echo(get_message(e)))
