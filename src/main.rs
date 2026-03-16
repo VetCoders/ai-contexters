@@ -1060,6 +1060,14 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
     // Sort by timestamp
     entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
 
+    // Filter self-echo (aicx's own search/rank/store calls that create feedback loops)
+    let pre_echo = entries.len();
+    entries.retain(|e| !ai_contexters::sanitize::is_self_echo(&e.message));
+    let echo_filtered = pre_echo - entries.len();
+    if echo_filtered > 0 {
+        eprintln!("  Filtered {echo_filtered} self-echo entries");
+    }
+
     // Apply secret redaction in-place (TimelineEntry is now single definition in sources)
     if redact_secrets {
         for e in &mut entries {
@@ -1352,29 +1360,25 @@ fn run_store(
 
     all_entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
 
+    // Filter self-echo (prevents feedback loops from aicx's own tool calls)
+    let pre_echo = all_entries.len();
+    all_entries.retain(|e| !ai_contexters::sanitize::is_self_echo(&e.message));
+    let echo_filtered = pre_echo - all_entries.len();
+    if echo_filtered > 0 {
+        eprintln!("  Filtered {echo_filtered} self-echo entries");
+    }
+
     if all_entries.is_empty() {
         eprintln!("No entries found.");
         return Ok(());
     }
 
-    // Convert to output::TimelineEntry
-    let output_entries: Vec<output::TimelineEntry> = all_entries
-        .iter()
-        .map(|e| output::TimelineEntry {
-            timestamp: e.timestamp,
-            agent: e.agent.clone(),
-            session_id: e.session_id.clone(),
-            role: e.role.clone(),
-            message: if redact_secrets {
-                ai_contexters::redact::redact_secrets(&e.message)
-            } else {
-                e.message.clone()
-            },
-            branch: e.branch.clone(),
-            cwd: e.cwd.clone(),
-        })
-        .collect();
-
+    // Apply redaction in-place (single TimelineEntry type)
+    if redact_secrets {
+        for e in &mut all_entries {
+            e.message = ai_contexters::redact::redact_secrets(&e.message);
+        }
+    }
     // Group by repo (from cwd) × agent × date and write chunked to central store
     let chunker_config = ai_contexters::chunker::ChunkerConfig::default();
     let mut index = store::load_index();
@@ -1386,7 +1390,7 @@ fn run_store(
         Vec<output::TimelineEntry>,
     > = std::collections::BTreeMap::new();
 
-    for entry in &output_entries {
+    for entry in &all_entries {
         let repo = sources::repo_name_from_cwd(entry.cwd.as_deref(), &project);
         let date = entry.timestamp.format("%Y-%m-%d").to_string();
         repo_groups
@@ -1444,7 +1448,7 @@ fn run_store(
     }
 
     // Chunk and sync to memex if requested
-    if sync_memex && !output_entries.is_empty() {
+    if sync_memex && !all_entries.is_empty() {
         let agent_label = agents.join("+");
         let store_proj = if project.is_empty() {
             "_global".to_string()
@@ -1453,7 +1457,7 @@ fn run_store(
         };
         let chunker_config = ChunkerConfig::default();
         let chunks =
-            chunker::chunk_entries(&output_entries, &store_proj, &agent_label, &chunker_config);
+            chunker::chunk_entries(&all_entries, &store_proj, &agent_label, &chunker_config);
 
         if !chunks.is_empty() {
             let chunks_dir = store::chunks_dir()?;

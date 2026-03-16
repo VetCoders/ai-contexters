@@ -328,6 +328,120 @@ pub fn normalize_query(text: &str) -> String {
         .to_lowercase()
 }
 
+// ============================================================================
+// Self-echo filtering (prevents feedback loops)
+// ============================================================================
+
+/// Patterns in messages that indicate aicx's own operational traffic.
+/// These create feedback loops: search → log → extract → search matches own query.
+const SELF_ECHO_PATTERNS: &[&str] = &[
+    // MCP tool calls
+    "aicx_search",
+    "aicx_rank",
+    "aicx_refs",
+    "aicx_store",
+    // Dashboard API calls
+    "/api/search/fuzzy",
+    "/api/search/semantic",
+    "/api/search/cross",
+    "/api/health",
+    "/api/regenerate",
+    "/api/status",
+    // MCP JSON-RPC
+    "\"method\":\"tools/call\"",
+    "\"method\":\"tools/list\"",
+    "\"method\":\"initialize\"",
+    // CLI self-invocations
+    "aicx store -H",
+    "aicx rank -p",
+    "aicx refs -H",
+    "aicx serve",
+    "aicx dashboard-serve",
+];
+
+/// Returns true if a message is aicx operational self-echo that should be
+/// filtered from extraction to prevent feedback loops.
+///
+/// A message is self-echo if >50% of its non-empty lines match patterns.
+/// This avoids false positives on messages that merely *mention* aicx once.
+pub fn is_self_echo(message: &str) -> bool {
+    let lines: Vec<&str> = message
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+
+    if lines.is_empty() {
+        return false;
+    }
+
+    let echo_lines = lines
+        .iter()
+        .filter(|line| {
+            let lower = line.to_lowercase();
+            SELF_ECHO_PATTERNS
+                .iter()
+                .any(|pat| lower.contains(&pat.to_lowercase()))
+        })
+        .count();
+
+    // Message is self-echo if majority of lines match
+    echo_lines > 0 && echo_lines * 2 >= lines.len()
+}
+
+/// Filter a vec of timeline entries, removing self-echo messages.
+pub fn filter_self_echo<T>(
+    entries: Vec<T>,
+    get_message: impl Fn(&T) -> &str,
+) -> Vec<T> {
+    entries
+        .into_iter()
+        .filter(|e| !is_self_echo(get_message(e)))
+        .collect()
+}
+
+#[cfg(test)]
+mod echo_tests {
+    use super::*;
+
+    #[test]
+    fn test_normal_message_not_echo() {
+        assert!(!is_self_echo("Fix the login regression in auth middleware"));
+        assert!(!is_self_echo("Decision: use per-chunk scoring"));
+        assert!(!is_self_echo("TODO: add tests for edge cases"));
+    }
+
+    #[test]
+    fn test_search_call_is_echo() {
+        assert!(is_self_echo(
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"aicx_search","arguments":{"query":"deploy vistacare"}}}"#
+        ));
+    }
+
+    #[test]
+    fn test_api_call_is_echo() {
+        assert!(is_self_echo(
+            r#"curl -s "http://127.0.0.1:8033/api/search/fuzzy?q=deploy+vistacare&limit=3""#
+        ));
+    }
+
+    #[test]
+    fn test_cli_self_invocation_is_echo() {
+        assert!(is_self_echo("aicx store -H 24 --incremental"));
+        assert!(is_self_echo("aicx rank -p ai-contexters -H 72 --strict"));
+    }
+
+    #[test]
+    fn test_mention_in_larger_message_not_echo() {
+        // Mere mention of aicx in a discussion should NOT be filtered
+        let msg = "We should add aicx_search to the MCP server.\n\
+                   The architecture looks clean.\n\
+                   Let's proceed with implementation.\n\
+                   Decision: expose 4 tools via rmcp.";
+        assert!(!is_self_echo(msg));
+    }
+}
+
 #[cfg(test)]
 mod normalize_tests {
     use super::*;
