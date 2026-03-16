@@ -70,6 +70,14 @@ enum StdoutEmit {
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
+enum RefsEmit {
+    /// Print a compact per-project summary.
+    Summary,
+    /// Print raw file paths (one per line).
+    Paths,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
 enum ExtractInputFormat {
     Claude,
     Codex,
@@ -132,8 +140,8 @@ enum Commands {
         #[arg(long)]
         force: bool,
 
-        /// What to print to stdout: paths, json, none (default: paths)
-        #[arg(long, value_enum, default_value_t = StdoutEmit::Paths)]
+        /// What to print to stdout: paths, json, none (default: none)
+        #[arg(long, value_enum, default_value_t = StdoutEmit::None)]
         emit: StdoutEmit,
     },
 
@@ -191,8 +199,8 @@ enum Commands {
         #[arg(long)]
         force: bool,
 
-        /// What to print to stdout: paths, json, none (default: paths)
-        #[arg(long, value_enum, default_value_t = StdoutEmit::Paths)]
+        /// What to print to stdout: paths, json, none (default: none)
+        #[arg(long, value_enum, default_value_t = StdoutEmit::None)]
         emit: StdoutEmit,
     },
 
@@ -246,8 +254,8 @@ enum Commands {
         #[arg(long)]
         force: bool,
 
-        /// What to print to stdout: paths, json, none (default: paths)
-        #[arg(long, value_enum, default_value_t = StdoutEmit::Paths)]
+        /// What to print to stdout: paths, json, none (default: none)
+        #[arg(long, value_enum, default_value_t = StdoutEmit::None)]
         emit: StdoutEmit,
     },
 
@@ -305,6 +313,10 @@ enum Commands {
         /// Also chunk and sync to memex
         #[arg(long)]
         memex: bool,
+
+        /// What to print to stdout: paths, json, none (default: none)
+        #[arg(long, value_enum, default_value_t = StdoutEmit::None)]
+        emit: StdoutEmit,
     },
 
     /// Sync stored chunks to rmcp-memex vector memory
@@ -335,8 +347,12 @@ enum Commands {
         #[arg(short, long)]
         project: Option<String>,
 
-        /// Compact summary instead of raw file paths
-        #[arg(short, long)]
+        /// What to print to stdout: summary, paths (default: summary)
+        #[arg(long, value_enum, default_value_t = RefsEmit::Summary)]
+        emit: RefsEmit,
+
+        /// Legacy alias for `--emit summary`
+        #[arg(short, long, hide = true)]
         summary: bool,
 
         /// Filter out low-signal noise (<15 lines, task-notifications only)
@@ -655,6 +671,7 @@ fn main() -> Result<()> {
             user_only,
             include_assistant: include_assistant_flag,
             memex,
+            emit,
         }) => {
             let include_assistant = include_assistant_flag || !user_only;
             run_store(
@@ -663,6 +680,7 @@ fn main() -> Result<()> {
                 hours,
                 include_assistant,
                 memex,
+                emit,
                 redact_secrets,
             )?;
         }
@@ -727,10 +745,12 @@ fn main() -> Result<()> {
         Some(Commands::Refs {
             hours,
             project,
+            emit,
             summary,
             strict,
         }) => {
-            run_refs(hours, project, summary, strict)?;
+            let emit = if summary { RefsEmit::Summary } else { emit };
+            run_refs(hours, project, emit, strict)?;
         }
         Some(Commands::Rank {
             hours,
@@ -1095,7 +1115,7 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
     // ── Store-first: group entries by repo (from cwd) × agent × date ──
     //
     // Writes agent-friendly chunks (~1500 tokens) to central store.
-    // Paths go to stdout so agents can read them directly.
+    // Raw path emission is opt-in via `--emit paths` / `--emit json`.
     let chunker_config = ai_contexters::chunker::ChunkerConfig::default();
     let mut all_written_paths: Vec<std::path::PathBuf> = Vec::new();
 
@@ -1326,6 +1346,7 @@ fn run_store(
     hours: u64,
     include_assistant: bool,
     sync_memex: bool,
+    emit: StdoutEmit,
     redact_secrets: bool,
 ) -> Result<()> {
     let cutoff = Utc::now() - chrono::Duration::hours(hours as i64);
@@ -1440,9 +1461,28 @@ fn run_store(
         eprintln!("  {}: {} entries ({})", repo, total, detail.join(", "));
     }
 
-    // stdout: agent-readable paths
-    for path in &all_written_paths {
-        println!("{}", path.display());
+    match emit {
+        StdoutEmit::Paths => {
+            for path in &all_written_paths {
+                println!("{}", path.display());
+            }
+        }
+        StdoutEmit::Json => {
+            let store_paths: Vec<String> = all_written_paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "total_entries": stored_count,
+                    "total_chunks": all_written_paths.len(),
+                    "store_paths": store_paths,
+                    "repos": repo_summary,
+                }))?
+            );
+        }
+        StdoutEmit::None => {}
     }
 
     // Chunk and sync to memex if requested
@@ -1727,7 +1767,7 @@ fn is_noise_artifact(path: &std::path::Path) -> bool {
 }
 
 /// List context files from the global store, filtered by recency.
-fn run_refs(hours: u64, project: Option<String>, summary: bool, strict: bool) -> Result<()> {
+fn run_refs(hours: u64, project: Option<String>, emit: RefsEmit, strict: bool) -> Result<()> {
     let base = store::store_base_dir()?;
 
     let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(hours * 3600);
@@ -1773,27 +1813,30 @@ fn run_refs(hours: u64, project: Option<String>, summary: bool, strict: bool) ->
 
     if files.is_empty() {
         eprintln!("No context files found within last {} hours.", hours);
-    } else if summary {
-        print_refs_summary(&files)?;
     } else {
-        let stdout = io::stdout();
-        let mut out = io::BufWriter::new(stdout.lock());
-        for f in &files {
-            if let Err(err) = writeln!(out, "{}", f.display()) {
-                if err.kind() == io::ErrorKind::BrokenPipe {
-                    return Ok(());
+        match emit {
+            RefsEmit::Summary => print_refs_summary(&files)?,
+            RefsEmit::Paths => {
+                let stdout = io::stdout();
+                let mut out = io::BufWriter::new(stdout.lock());
+                for f in &files {
+                    if let Err(err) = writeln!(out, "{}", f.display()) {
+                        if err.kind() == io::ErrorKind::BrokenPipe {
+                            return Ok(());
+                        }
+                        return Err(err.into());
+                    }
                 }
-                return Err(err.into());
+                if let Err(err) = out.flush() {
+                    if err.kind() == io::ErrorKind::BrokenPipe {
+                        return Ok(());
+                    }
+                    return Err(err.into());
+                }
+                if io::stderr().is_terminal() {
+                    eprintln!("({} files)", files.len());
+                }
             }
-        }
-        if let Err(err) = out.flush() {
-            if err.kind() == io::ErrorKind::BrokenPipe {
-                return Ok(());
-            }
-            return Err(err.into());
-        }
-        if io::stderr().is_terminal() {
-            eprintln!("({} files)", files.len());
         }
     }
 
@@ -1892,63 +1935,26 @@ fn print_refs_summary(files: &[PathBuf]) -> Result<()> {
     let stdout = io::stdout();
     let mut out = io::BufWriter::new(stdout.lock());
 
-    for (idx, (project, summary)) in by_project.iter().enumerate() {
-        if idx > 0
-            && let Err(err) = writeln!(out)
-        {
-            if err.kind() == io::ErrorKind::BrokenPipe {
-                return Ok(());
-            }
-            return Err(err.into());
-        }
-
+    for (project, summary) in &by_project {
         let date_range = match (&summary.min_date, &summary.max_date) {
             (Some(min), Some(max)) => format!("{min} .. {max}"),
             _ => "unknown".to_string(),
         };
 
+        let agent_details = summary
+            .agents
+            .iter()
+            .map(|(agent, data)| format!("{agent}: {} files/{} days", data.files, data.days.len()))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let latest = summary.latest.as_deref().unwrap_or("unknown");
+
         if let Err(err) = writeln!(
             out,
-            "{}: {} files ({})",
-            project, summary.total_files, date_range
+            "{}: {} files ({}) [{}] latest: {}",
+            project, summary.total_files, date_range, agent_details, latest
         ) {
-            if err.kind() == io::ErrorKind::BrokenPipe {
-                return Ok(());
-            }
-            return Err(err.into());
-        }
-
-        let agent_width = summary
-            .agents
-            .keys()
-            .map(|agent| agent.len() + 1)
-            .max()
-            .unwrap_or(1);
-        let files_width = summary
-            .agents
-            .values()
-            .map(|agent| agent.files.to_string().len())
-            .max()
-            .unwrap_or(1);
-
-        for (agent, data) in &summary.agents {
-            let agent_label = format!("{agent}:");
-            if let Err(err) = writeln!(
-                out,
-                "  {agent_label:agent_width$} {files:>files_width$} files ({days} days)",
-                files = data.files,
-                days = data.days.len(),
-            ) {
-                if err.kind() == io::ErrorKind::BrokenPipe {
-                    return Ok(());
-                }
-                return Err(err.into());
-            }
-        }
-
-        if let Some(latest) = &summary.latest
-            && let Err(err) = writeln!(out, "  latest: {}", latest)
-        {
             if err.kind() == io::ErrorKind::BrokenPipe {
                 return Ok(());
             }
@@ -2153,4 +2159,95 @@ fn run_dashboard(args: DashboardRunArgs) -> Result<()> {
 
     println!("{}", output_path.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn claude_defaults_to_silent_stdout() {
+        let cli = Cli::try_parse_from(["aicx", "claude"]).expect("claude command should parse");
+
+        match cli.command {
+            Some(Commands::Claude { emit, .. }) => {
+                assert!(matches!(emit, StdoutEmit::None));
+            }
+            _ => panic!("expected claude command"),
+        }
+    }
+
+    #[test]
+    fn codex_defaults_to_silent_stdout() {
+        let cli = Cli::try_parse_from(["aicx", "codex"]).expect("codex command should parse");
+
+        match cli.command {
+            Some(Commands::Codex { emit, .. }) => {
+                assert!(matches!(emit, StdoutEmit::None));
+            }
+            _ => panic!("expected codex command"),
+        }
+    }
+
+    #[test]
+    fn all_defaults_to_silent_stdout() {
+        let cli = Cli::try_parse_from(["aicx", "all"]).expect("all command should parse");
+
+        match cli.command {
+            Some(Commands::All { emit, .. }) => {
+                assert!(matches!(emit, StdoutEmit::None));
+            }
+            _ => panic!("expected all command"),
+        }
+    }
+
+    #[test]
+    fn store_defaults_to_silent_stdout() {
+        let cli = Cli::try_parse_from(["aicx", "store"]).expect("store command should parse");
+
+        match cli.command {
+            Some(Commands::Store { emit, .. }) => {
+                assert!(matches!(emit, StdoutEmit::None));
+            }
+            other => panic!("expected store command, got {:?}", other.map(|_| "other")),
+        }
+    }
+
+    #[test]
+    fn store_accepts_explicit_paths_emit() {
+        let cli = Cli::try_parse_from(["aicx", "store", "--emit", "paths"])
+            .expect("store command with explicit emit should parse");
+
+        match cli.command {
+            Some(Commands::Store { emit, .. }) => {
+                assert!(matches!(emit, StdoutEmit::Paths));
+            }
+            other => panic!("expected store command, got {:?}", other.map(|_| "other")),
+        }
+    }
+
+    #[test]
+    fn refs_default_to_summary_stdout() {
+        let cli = Cli::try_parse_from(["aicx", "refs"]).expect("refs command should parse");
+
+        match cli.command {
+            Some(Commands::Refs { emit, .. }) => {
+                assert!(matches!(emit, RefsEmit::Summary));
+            }
+            _ => panic!("expected refs command"),
+        }
+    }
+
+    #[test]
+    fn refs_accept_explicit_paths_emit() {
+        let cli = Cli::try_parse_from(["aicx", "refs", "--emit", "paths"])
+            .expect("refs command with explicit emit should parse");
+
+        match cli.command {
+            Some(Commands::Refs { emit, .. }) => {
+                assert!(matches!(emit, RefsEmit::Paths));
+            }
+            _ => panic!("expected refs command"),
+        }
+    }
 }
