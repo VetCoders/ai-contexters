@@ -1,6 +1,6 @@
 [package]
 name = "ai-contexters"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
 description = "Extract timeline and memory from AI agent sessions (Claude Code, Codex, Gemini)"
 authors = ["Maciej Gad <void@div0.space>", "Monika Szymanska <hello@vetcoders.io>"]
@@ -23,7 +23,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 regex = "1"
 axum = "0.8"
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "signal"] }
+rmcp = { version = "1.2", features = ["server", "schemars", "transport-io", "transport-streamable-http-server", "transport-streamable-http-server-session"] }
 
 [dev-dependencies]
 filetime = "0.2"
@@ -31,6 +32,10 @@ filetime = "0.2"
 [[bin]]
 name = "aicx"
 path = "src/main.rs"
+
+[[bin]]
+name = "aicx-mcp"
+path = "src/bin/aicx_mcp.rs"
 
 [profile.release]
 lto = true

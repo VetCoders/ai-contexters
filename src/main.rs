@@ -27,6 +27,7 @@ use ai_contexters::output::{self, OutputConfig, OutputFormat, OutputMode, Report
 use ai_contexters::rank;
 use ai_contexters::sources::{self, ExtractionConfig};
 use ai_contexters::state::StateManager;
+use ai_contexters::intents;
 use ai_contexters::store;
 
 /// AI Contexters - timeline and decisions from AI sessions
@@ -423,6 +424,40 @@ enum Commands {
         preview_chars: usize,
     },
 
+    /// Extract structured intents and decisions from stored context
+    Intents {
+        /// Project filter (required)
+        #[arg(short, long)]
+        project: String,
+
+        /// Hours to look back (default: 720 = 30 days)
+        #[arg(short = 'H', long, default_value = "720")]
+        hours: u64,
+
+        /// Output format: markdown or json
+        #[arg(long, default_value = "markdown", value_parser = ["markdown", "json"])]
+        emit: String,
+
+        /// Only show high-confidence intents
+        #[arg(long)]
+        strict: bool,
+
+        /// Filter by kind: decision, intent, outcome, task
+        #[arg(long, value_parser = ["decision", "intent", "outcome", "task"])]
+        kind: Option<String>,
+    },
+
+    /// Run aicx as an MCP server (stdio or streamable HTTP)
+    Serve {
+        /// Transport: stdio (default) or sse
+        #[arg(long, default_value = "stdio", value_parser = ["stdio", "sse"])]
+        transport: String,
+
+        /// Port for SSE transport (default: 8044)
+        #[arg(long, default_value = "8044")]
+        port: u16,
+    },
+
     /// Initialize repo context and run an agent
     Init {
         /// Project name override
@@ -742,10 +777,71 @@ fn main() -> Result<()> {
                 preview_chars,
             })?;
         }
+        Some(Commands::Intents {
+            project,
+            hours,
+            emit,
+            strict,
+            kind,
+        }) => {
+            run_intents(&project, hours, &emit, strict, kind.as_deref())?;
+        }
+        Some(Commands::Serve { transport, port }) => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async {
+                match transport.as_str() {
+                    "sse" => ai_contexters::mcp::run_sse(port).await,
+                    _ => ai_contexters::mcp::run_stdio().await,
+                }
+            })?;
+        }
         None => {
             let project = cli.project.unwrap_or_else(sources::detect_project_name);
             let hours = cli.hours;
             run_rank(hours, &project, redact_secrets, false, None)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn run_intents(
+    project: &str,
+    hours: u64,
+    emit: &str,
+    strict: bool,
+    kind: Option<&str>,
+) -> Result<()> {
+    let kind_filter = kind.map(|k| match k {
+        "decision" => intents::IntentKind::Decision,
+        "intent" => intents::IntentKind::Intent,
+        "outcome" => intents::IntentKind::Outcome,
+        "task" => intents::IntentKind::Task,
+        _ => unreachable!("clap validates this"),
+    });
+
+    let config = intents::IntentsConfig {
+        project: project.to_string(),
+        hours,
+        strict,
+        kind_filter,
+    };
+
+    let records = intents::extract_intents(&config)?;
+
+    if records.is_empty() {
+        eprintln!("No intents found for project '{}' in last {} hours.", project, hours);
+        return Ok(());
+    }
+
+    match emit {
+        "json" => {
+            let json = intents::format_intents_json(&records)?;
+            println!("{}", json);
+        }
+        _ => {
+            let md = intents::format_intents_markdown(&records);
+            print!("{}", md);
         }
     }
 

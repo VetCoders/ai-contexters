@@ -299,7 +299,7 @@ const MAX_INTENT_LINES: usize = 6;
 const MAX_RESULT_LINES: usize = 6;
 const MAX_TAG_BLOCK_LINES: usize = 4;
 
-const INTENT_KEYWORDS: &[&str] = &[
+pub(crate) const INTENT_KEYWORDS: &[&str] = &[
     // Polish
     "mam pomysl",
     "mam pomysł",
@@ -413,7 +413,7 @@ fn extract_checklist_items(entries: &[&TimelineEntry]) -> (Vec<String>, Vec<Stri
     (open, done)
 }
 
-fn parse_checklist_task(line: &str) -> Option<(bool, String)> {
+pub(crate) fn parse_checklist_task(line: &str) -> Option<(bool, String)> {
     let l = line.trim_start();
     let mut chars = l.chars();
     let bullet = chars.next()?;
@@ -469,7 +469,7 @@ fn extract_intent_lines(entries: &[&TimelineEntry]) -> Vec<String> {
     out
 }
 
-fn is_intent_line(line: &str) -> bool {
+pub(crate) fn is_intent_line(line: &str) -> bool {
     let lower = line.to_lowercase();
     INTENT_KEYWORDS.iter().any(|kw| lower.contains(kw))
 }
@@ -500,19 +500,19 @@ fn extract_result_lines(entries: &[&TimelineEntry]) -> Vec<String> {
     out
 }
 
-fn is_result_line(line: &str) -> bool {
+pub(crate) fn is_result_line(line: &str) -> bool {
     let lower = line.to_lowercase();
     RESULT_KEYWORDS.iter().any(|kw| lower.contains(kw))
 }
 
-fn normalize_key(s: &str) -> String {
+pub(crate) fn normalize_key(s: &str) -> String {
     s.split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
         .to_lowercase()
 }
 
-fn truncate_signal_line(line: &str) -> String {
+pub(crate) fn truncate_signal_line(line: &str) -> String {
     const MAX_BYTES: usize = 240;
     if line.len() <= MAX_BYTES {
         return line.to_string();
@@ -552,12 +552,12 @@ fn is_skill_tag(line: &str) -> bool {
         || lower.contains("vetcoders-workflow")
 }
 
-fn is_decision_tag(line: &str) -> bool {
+pub(crate) fn is_decision_tag(line: &str) -> bool {
     let lower = line.to_lowercase();
     lower.contains("[decision]") || lower.starts_with("decision:")
 }
 
-fn is_outcome_tag(line: &str) -> bool {
+pub(crate) fn is_outcome_tag(line: &str) -> bool {
     let lower = line.to_lowercase();
     lower.contains("[skill_outcome]")
         || lower.starts_with("outcome:")

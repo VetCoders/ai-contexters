@@ -6,17 +6,40 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-03-16
+
 ### Added
 
-- `aicx rank` subcommand with skill-based structured signals and `--strict` filter.
-- Rank optimization: command made optional (`aicx -p proj`), auto-extract before ranking.
-- Dashboard search endpoints and `aicx-dashboard.html` generator.
-- `rank.rs` module extracted from main.
+- **MCP server** (`aicx serve` / standalone `aicx-mcp` binary): 4 tools (search, rank, refs, store) over stdio and streamable HTTP transports.
+- **Per-chunk quality scoring** (`rank.rs`): content-level signal/noise classification (0-10 scale) replacing the old all-SIGNAL output.
+- `aicx rank` subcommand with `--strict` (hide noise) and `--top N` flags.
+- **Dashboard search API**: `/api/search/fuzzy`, `/api/search/semantic`, `/api/search/cross` endpoints with rmcp-memex integration.
+- `/api/health` and `/health` endpoints.
+- Polish diacritics normalization for fuzzy search (wdrozenie matches wdrozenie).
+- `project=` filter on fuzzy search (scopes to single project).
+- Auto-rescan before search queries (incremental, milliseconds).
+- Unified JSON error contract for all 400 responses.
+- `aicx intents` subcommand for structured intent/decision extraction.
+
+### Changed
+
+- Rank made default command (`aicx -p proj` runs rank).
+- Skills removed from repo — canonical source: VetCoders/vetcoders-skills.
+- Package excludes: `*.html`, `*.patch`, `*.orig`, `.ai-agents/`, `skills/`.
+
+### Added (Governance)
+
+- LICENSE (MIT), CONTRIBUTING.md, CHANGELOG.md, SECURITY.md.
+- GitHub Actions CI workflow (ubuntu + macos-14).
+- Issue templates (bug report, feature request).
+- Cargo.toml: keywords, categories, homepage, excludes.
 
 ### Fixed
 
 - Bundle grouping bug in rank output.
 - `.ai-agents/` paths now repo-relative, not absolute.
+- Trailing whitespace in `is_noise_artifact`.
+- Redundant closure in default command path.
 
 ## [0.3.1] - 2026-03-13
 

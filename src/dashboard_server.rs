@@ -5,7 +5,7 @@
 use anyhow::{Context, Result, anyhow};
 use axum::{
     Json, Router,
-    extract::{Query, State},
+    extract::{Query, State, rejection::QueryRejection},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
@@ -117,6 +117,8 @@ struct FuzzySearchParams {
     q: String,
     #[serde(default = "default_search_limit")]
     limit: usize,
+    /// Optional project filter (case-insensitive substring match)
+    project: Option<String>,
 }
 
 fn default_search_limit() -> usize {
@@ -207,6 +209,8 @@ pub async fn run_dashboard_server(config: DashboardServerConfig) -> Result<()> {
 
     let app = Router::new()
         .route("/", get(get_dashboard_html))
+        .route("/api/health", get(get_health))
+        .route("/health", get(get_health))
         .route("/api/status", get(get_status))
         .route("/api/regenerate", post(regenerate_dashboard))
         .route("/api/search/fuzzy", get(fuzzy_search))
@@ -254,6 +258,14 @@ async fn get_dashboard_html(State(state): State<Arc<DashboardServerState>>) -> i
     let mut headers = HeaderMap::new();
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     (headers, Html(snapshot.html.clone()))
+}
+
+async fn get_health() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "ok": true,
+        "service": "aicx-dashboard",
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
 }
 
 async fn get_status(
@@ -374,8 +386,22 @@ async fn regenerate_dashboard(
 /// and scores each match using the rank module.
 async fn fuzzy_search(
     State(state): State<Arc<DashboardServerState>>,
-    Query(params): Query<FuzzySearchParams>,
+    params: Result<Query<FuzzySearchParams>, QueryRejection>,
 ) -> Response {
+    let Query(params) = match params {
+        Ok(q) => q,
+        Err(rejection) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    ok: false,
+                    error: format!("Invalid query parameters: {rejection}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+
     let query = params.q.trim().to_string();
     if query.is_empty() {
         return (
@@ -388,13 +414,15 @@ async fn fuzzy_search(
             .into_response();
     }
 
+    let limit = params.limit.min(100);
     let store_root = state.config.store_root.clone();
-    let limit = params.limit;
+    let project_filter = params.project;
     let query_clone = query.clone();
 
-    let result =
-        tokio::task::spawn_blocking(move || run_fuzzy_search(&store_root, &query_clone, limit))
-            .await;
+    let result = tokio::task::spawn_blocking(move || {
+        run_fuzzy_search(&store_root, &query_clone, limit, project_filter.as_deref())
+    })
+    .await;
 
     match result {
         Ok(Ok((results, total_scanned))) => (
@@ -430,11 +458,22 @@ fn run_fuzzy_search(
     store_root: &Path,
     query: &str,
     limit: usize,
+    project_filter: Option<&str>,
 ) -> Result<(Vec<FuzzySearchResult>, usize)> {
-    let query_lower = query.to_lowercase();
-    let query_terms: Vec<&str> = query_lower.split_whitespace().collect();
+    // Auto-rescan: quick incremental extraction so results are always fresh.
+    // This is fast (skips already-processed entries via watermarks).
+    let _ = std::process::Command::new("aicx")
+        .args(["store", "-H", "24", "--incremental"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    let normalized = normalize_query(query);
+    let query_terms: Vec<&str> = normalized.split_whitespace().collect();
     let mut results = Vec::new();
     let mut total_scanned = 0usize;
+
+    let project_filter_lower = project_filter.map(|p| p.to_lowercase());
 
     // Walk project dirs in store
     for proj_entry in fs::read_dir(store_root)?.filter_map(|e| e.ok()) {
@@ -449,6 +488,13 @@ fn run_fuzzy_search(
             .to_string();
 
         if project == "memex" {
+            continue;
+        }
+
+        // Apply project filter (case-insensitive substring)
+        if let Some(ref filter) = project_filter_lower
+            && !project.to_lowercase().contains(filter)
+        {
             continue;
         }
 
@@ -476,10 +522,10 @@ fn run_fuzzy_search(
                     continue;
                 };
 
-                let content_lower = content.to_lowercase();
+                let content_normalized = normalize_query(&content);
 
                 // Check if ALL query terms appear in file (AND matching)
-                if !query_terms.iter().all(|t| content_lower.contains(t)) {
+                if !query_terms.iter().all(|t| content_normalized.contains(t)) {
                     continue;
                 }
 
@@ -487,8 +533,8 @@ fn run_fuzzy_search(
                 let matched_lines: Vec<String> = content
                     .lines()
                     .filter(|line| {
-                        let lower = line.to_lowercase();
-                        query_terms.iter().any(|t| lower.contains(t))
+                        let norm = normalize_query(line);
+                        query_terms.iter().any(|t| norm.contains(t))
                     })
                     .take(5)
                     .map(|l| l.trim().to_string())
@@ -526,7 +572,23 @@ fn run_fuzzy_search(
 /// Semantic search via rmcp-memex vector DB.
 ///
 /// Shells out to `rmcp-memex search --json` for vector similarity.
-async fn semantic_search(Query(params): Query<SemanticSearchParams>) -> Response {
+async fn semantic_search(
+    params: Result<Query<SemanticSearchParams>, QueryRejection>,
+) -> Response {
+    let Query(params) = match params {
+        Ok(q) => q,
+        Err(rejection) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    ok: false,
+                    error: format!("Invalid query parameters: {rejection}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+
     let query = params.q.trim().to_string();
     if query.is_empty() {
         return (
@@ -607,7 +669,22 @@ fn run_memex_search(
 /// Cross-namespace semantic search via rmcp-memex.
 ///
 /// Searches all namespaces at once, merging and ranking results.
-async fn cross_search(Query(params): Query<CrossSearchParams>) -> Response {
+async fn cross_search(
+    params: Result<Query<CrossSearchParams>, QueryRejection>,
+) -> Response {
+    let Query(params) = match params {
+        Ok(q) => q,
+        Err(rejection) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    ok: false,
+                    error: format!("Invalid query parameters: {rejection}"),
+                }),
+            )
+                .into_response();
+        }
+    };
     let query = params.q.trim().to_string();
     if query.is_empty() {
         return (
@@ -674,6 +751,31 @@ fn run_memex_cross_search(query: &str, limit: usize, mode: &str) -> Result<Memex
         source: format!("rmcp-memex cross-search --mode {}", mode),
         results,
     })
+}
+
+// ============================================================================
+// Query normalization (PL/EN diacritics + case folding)
+// ============================================================================
+
+/// Normalize text for fuzzy matching: lowercase + strip Polish diacritics.
+///
+/// Maps: ą→a, ć→c, ę→e, ł→l, ń→n, ó→o, ś→s, ź→z, ż→z
+/// This enables "wdrozenie" to match "wdrożenie", "zrodlo" to match "źródło", etc.
+fn normalize_query(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            'Ą' | 'ą' => 'a',
+            'Ć' | 'ć' => 'c',
+            'Ę' | 'ę' => 'e',
+            'Ł' | 'ł' => 'l',
+            'Ń' | 'ń' => 'n',
+            'Ó' | 'ó' => 'o',
+            'Ś' | 'ś' => 's',
+            'Ź' | 'ź' | 'Ż' | 'ż' => 'z',
+            _ => c,
+        })
+        .collect::<String>()
+        .to_lowercase()
 }
 
 fn rebuild_dashboard(config: &DashboardServerConfig) -> Result<BuildOutput> {
