@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-03-17
+
+### Fixed
+
+- Corrected the `SECURITY.md` disclosure path so private vulnerability reports go to the public `VetCoders/ai-contexters` repository instead of a stale owner link.
+- Updated GitHub Actions workflow dependencies to current major versions for `checkout`, `cache`, `setup-python`, `upload-artifact`, and `download-artifact`, removing the Node 20 deprecation surface from future CI and release runs.
+
 ## [0.4.2] - 2026-03-17
 
 ### Added

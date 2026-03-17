@@ -54,8 +54,8 @@ Each archive contains:
 3. Create an annotated tag that matches the crate version.
 
 ```bash
-git tag -a v0.4.2 -m "ai-contexters v0.4.2"
-git push origin v0.4.2
+git tag -a v0.4.3 -m "ai-contexters v0.4.3"
+git push origin v0.4.3
 ```
 
 4. Wait for the `Release` workflow to finish and confirm the GitHub Release has all archives and `.sha256` files.
