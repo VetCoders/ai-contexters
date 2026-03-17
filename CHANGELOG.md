@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-03-17
+
+### Added
+
+- Tracked `Cargo.lock`, so `--locked` now works in CI and release automation instead of failing on GitHub runners.
+- Shared validated filesystem helpers in `sanitize.rs` for safe file creation, file reads, and directory reads.
+
+### Changed
+
+- Public install docs and `install.sh` now reflect the live crates.io path, while still supporting local checkout and git install modes.
+- Security-sensitive file and directory reads now go through validated helper paths across `init`, `intents`, `main`, `rank`, and `sources`.
+
 ## [0.4.1] - 2026-03-17
 
 ### Added

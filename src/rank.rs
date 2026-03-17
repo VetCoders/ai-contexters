@@ -499,7 +499,7 @@ pub fn score_chunk_content(content: &str) -> ChunkScore {
 
 /// Score a chunk file by path.
 pub fn score_chunk_file(path: &Path) -> ChunkScore {
-    match std::fs::read_to_string(path) {
+    match sanitize::read_to_string_validated(path) {
         Ok(content) => score_chunk_content(&content),
         Err(_) => ChunkScore {
             score: 0,

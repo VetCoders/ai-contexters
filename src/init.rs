@@ -528,11 +528,8 @@ fn resolve_agent_prompt(inline: Option<String>, file: Option<PathBuf>) -> Result
     let mut merged = inline.filter(|s| !s.trim().is_empty());
 
     if let Some(path) = file {
-        let validated = sanitize::validate_read_path(&path)?;
-        // SECURITY: path sanitized via validate_read_path (traversal + canonicalize + allowlist)
-        let content = fs::read_to_string(&validated).with_context(|| {
-            format!("Failed to read agent prompt file: {}", validated.display())
-        })?;
+        let content = sanitize::read_to_string_validated(&path)
+            .with_context(|| format!("Failed to read agent prompt file: {}", path.display()))?;
         if !content.trim().is_empty() {
             merged = Some(match merged {
                 Some(mut existing) => {
@@ -555,9 +552,7 @@ fn build_prompt(
     action: Option<&str>,
     agent_prompt: Option<&str>,
 ) -> Result<usize> {
-    let validated_prompt = sanitize::validate_write_path(prompt_path)?;
-    // SECURITY: path sanitized via validate_write_path (traversal + allowlist)
-    let mut file = File::create(&validated_prompt)?; // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+    let mut file = sanitize::create_file_validated(prompt_path)?;
 
     let share_dir = context_dir
         .parent()
@@ -722,7 +717,7 @@ fn build_prompt(
     let mut artifacts: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
 
     if context_dir.exists() {
-        for entry in fs::read_dir(context_dir)?.filter_map(|e| e.ok()) {
+        for entry in sanitize::read_dir_validated(context_dir)?.filter_map(|e| e.ok()) {
             let path = entry.path();
             if path.is_file()
                 && !path
@@ -745,7 +740,7 @@ fn build_prompt(
     if let Some(dir) = share_dir
         && dir.exists()
     {
-        for entry in fs::read_dir(dir)?.filter_map(|e| e.ok()) {
+        for entry in sanitize::read_dir_validated(&dir)?.filter_map(|e| e.ok()) {
             let path = entry.path();
             if path.is_file()
                 && let Ok(meta) = path.metadata()
@@ -958,8 +953,7 @@ fn run_codex(
         dispatch_terminal(&cmd)?;
         wait_for_report(&validated_report, std::time::Duration::from_secs(60 * 60))?;
     } else {
-        // SECURITY: path sanitized via validate_read_path (traversal + canonicalize + allowlist)
-        let prompt_file = File::open(&bootstrap_path)?; // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+        let prompt_file = sanitize::open_file_validated(&bootstrap_path)?;
         let mut cmd = Command::new("codex");
         cmd.arg("--dangerously-bypass-approvals-and-sandbox")
             .arg("exec")
@@ -1116,7 +1110,7 @@ fn append_summary(path: &Path, block: &str) -> Result<()> {
         fs::write(&validated, "# AI Context Summary\n\n")?;
     }
 
-    let mut content = fs::read_to_string(&validated)?;
+    let mut content = sanitize::read_to_string_validated(&validated)?;
     if !content.ends_with('\n') {
         content.push('\n');
     }
@@ -1128,7 +1122,7 @@ fn append_summary(path: &Path, block: &str) -> Result<()> {
 }
 
 fn trim_summary(path: &Path, max_lines: usize) -> Result<()> {
-    let content = fs::read_to_string(path)?;
+    let content = sanitize::read_to_string_validated(path)?;
     let parts: Vec<&str> = content.split("\n## ").collect();
     if parts.len() <= 1 {
         return Ok(());

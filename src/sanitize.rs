@@ -175,6 +175,14 @@ pub fn open_file_validated(path: &Path) -> Result<std::fs::File> {
         .map_err(|e| anyhow!("Failed to open '{}': {}", validated.display(), e))
 }
 
+/// Create or truncate a file only after validating the write path.
+pub fn create_file_validated(path: &Path) -> Result<std::fs::File> {
+    let validated = validate_write_path(path)?;
+    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+    std::fs::File::create(&validated)
+        .map_err(|e| anyhow!("Failed to create '{}': {}", validated.display(), e))
+}
+
 /// Read a UTF-8 text file only after validating the path.
 pub fn read_to_string_validated(path: &Path) -> Result<String> {
     let validated = validate_read_path(path)?;
@@ -331,6 +339,24 @@ mod tests {
         fs::write(&test_file, "hello").unwrap();
 
         let content = read_to_string_validated(&test_file).unwrap();
+        assert_eq!(content, "hello");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_create_file_validated() {
+        let tmp = std::env::temp_dir().join("ai-ctx-san-create-file");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let test_file = tmp.join("test.txt");
+
+        let mut created = create_file_validated(&test_file).unwrap();
+        use std::io::Write as _;
+        created.write_all(b"hello").unwrap();
+        drop(created);
+
+        let content = fs::read_to_string(&test_file).unwrap();
         assert_eq!(content, "hello");
 
         let _ = fs::remove_dir_all(&tmp);

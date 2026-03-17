@@ -29,9 +29,10 @@ for arg in "$@"; do
       echo "  Run from the repo root or any local checkout that contains Cargo.toml."
       echo ""
       echo "Install source is controlled by AICX_INSTALL_MODE:"
-      echo "  auto  - prefer local checkout, otherwise install from git"
+      echo "  auto   - prefer local checkout, otherwise install from crates.io"
       echo "  local - cargo install --path <checkout> --locked"
-      echo "  git   - cargo install --git \$AICX_GIT_URL --locked ai-contexters"
+      echo "  crates - cargo install ai-contexters --locked"
+      echo "  git    - cargo install --git \$AICX_GIT_URL --locked ai-contexters"
       exit 0
       ;;
   esac
@@ -89,14 +90,14 @@ resolve_install_mode() {
       if [ "$HAS_LOCAL_MANIFEST" -eq 1 ]; then
         echo "local"
       else
-        echo "git"
+        echo "crates"
       fi
       ;;
-    local|git)
+    local|crates|git)
       echo "$AICX_INSTALL_MODE"
       ;;
     *)
-      echo "Error: unsupported AICX_INSTALL_MODE='$AICX_INSTALL_MODE' (expected auto, local, or git)." >&2
+      echo "Error: unsupported AICX_INSTALL_MODE='$AICX_INSTALL_MODE' (expected auto, local, crates, or git)." >&2
       exit 1
       ;;
   esac
@@ -113,11 +114,14 @@ if [ "$SKIP_INSTALL" -eq 0 ]; then
   if [ "$INSTALL_MODE" = "local" ]; then
     echo "[1/4] Installing aicx + aicx-mcp from this checkout..."
     cargo install --path "$SCRIPT_DIR" --locked --force --bin aicx --bin aicx-mcp 2>&1 | tail -5
+  elif [ "$INSTALL_MODE" = "crates" ]; then
+    echo "[1/4] Installing aicx + aicx-mcp from crates.io..."
+    cargo install ai-contexters --locked 2>&1 | tail -20
   else
     echo "[1/4] Installing aicx + aicx-mcp from git..."
     if ! cargo install --git "$AICX_GIT_URL" --locked ai-contexters 2>&1 | tail -20; then
       echo "Error: git install failed."
-      echo "  If the repo is private or not accessible, clone it locally and run ./install.sh from that checkout."
+      echo "  If you only need the published release, use AICX_INSTALL_MODE=crates or run 'cargo install ai-contexters --locked'."
       exit 1
     fi
   fi

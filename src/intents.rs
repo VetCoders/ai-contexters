@@ -232,7 +232,6 @@ fn collect_chunk_files(
 
     let mut files = Vec::new();
 
-    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
     for date_entry in sanitize::read_dir_validated(&project_root)
         .with_context(|| format!("Failed to read project dir: {}", project_root.display()))?
     {
@@ -254,7 +253,6 @@ fn collect_chunk_files(
             continue;
         };
 
-        // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
         for file_entry in sanitize::read_dir_validated(&date_path)
             .with_context(|| format!("Failed to read date dir: {}", date_path.display()))?
         {

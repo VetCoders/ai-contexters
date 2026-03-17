@@ -7,11 +7,11 @@
 
 This document is the maintainer path from green CI to public release artifacts.
 
-## Current Constraints
+## Current Shape
 
-- `crates.io` publishing is not live yet.
-- Until the repo is public or otherwise accessible, outside users still need a source checkout from a channel they can reach.
-- `install.sh` is intentionally source-first today and only uses git install as a fallback when the repo is reachable.
+- Public install paths now exist through crates.io, GitHub Releases, and source checkout.
+- `install.sh` prefers a local checkout when one exists and otherwise installs from crates.io.
+- `AICX_INSTALL_MODE=git` remains available for testing unreleased source directly from GitHub.
 
 ## What the Release Workflow Produces
 
@@ -54,8 +54,8 @@ Each archive contains:
 3. Create an annotated tag that matches the crate version.
 
 ```bash
-git tag -a v0.4.1 -m "ai-contexters v0.4.1"
-git push origin v0.4.1
+git tag -a v0.4.2 -m "ai-contexters v0.4.2"
+git push origin v0.4.2
 ```
 
 4. Wait for the `Release` workflow to finish and confirm the GitHub Release has all archives and `.sha256` files.

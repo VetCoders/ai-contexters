@@ -15,7 +15,11 @@ Supported sources:
 
 ## Install
 
-Supported install paths today are source-based.
+Public install from crates.io:
+
+```bash
+cargo install ai-contexters --locked
+```
 
 From a local checkout:
 
@@ -25,7 +29,7 @@ From a local checkout:
 
 `install.sh` installs `aicx` + `aicx-mcp` from the current checkout and configures Claude Code, Codex, and Gemini when their MCP settings directories already exist.
 
-From an accessible GitHub repo:
+From an accessible GitHub repo when you want unreleased source:
 
 ```bash
 cargo install --git https://github.com/VetCoders/ai-contexters --locked ai-contexters
@@ -44,7 +48,7 @@ cargo install --path . --locked --bin aicx --bin aicx-mcp
 ./install.sh --skip-install
 ```
 
-Public `crates.io` distribution is not live yet.
+`install.sh` prefers the local checkout when one is present. Outside a checkout, it now defaults to the published crates.io package.
 
 ## Quickstart
 

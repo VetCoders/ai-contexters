@@ -14,7 +14,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File};
+use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
@@ -232,9 +232,7 @@ fn parse_claude_jsonl(
     session_id: &str,
     config: &ExtractionConfig,
 ) -> Result<Vec<TimelineEntry>> {
-    let validated = sanitize::validate_read_path(path)?;
-    // SECURITY: path sanitized via validate_read_path (traversal + canonicalize + allowlist)
-    let file = File::open(&validated)?; // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+    let file = sanitize::open_file_validated(path)?;
     let reader = BufReader::new(file);
     let mut entries = Vec::new();
 
@@ -307,13 +305,11 @@ fn parse_claude_jsonl(
 /// `~/.claude/projects/**` nor to have a `.jsonl` extension (Claude task outputs
 /// often end with `.output` but are still JSONL).
 pub fn extract_claude_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
-    let validated = sanitize::validate_read_path(path)?;
-    // SECURITY: path sanitized via validate_read_path (traversal + canonicalize + allowlist)
-    let file = File::open(&validated)?; // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+    let file = sanitize::open_file_validated(path)?;
     let reader = BufReader::new(file);
     let mut entries = Vec::new();
 
-    let default_session_id = validated
+    let default_session_id = path
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "unknown".to_string());
@@ -390,7 +386,6 @@ pub fn extract_claude_file(path: &Path, config: &ExtractionConfig) -> Result<Vec
 /// - Codex history format (`~/.codex/history.jsonl`) — `CodexEntry` per line.
 /// - Codex session format (`~/.codex/sessions/**/**/*.jsonl`) — `CodexSessionEvent` per line.
 pub fn extract_codex_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
-    let validated = sanitize::validate_read_path(path)?;
     let file = sanitize::open_file_validated(path)?;
     let reader = BufReader::new(file);
 
@@ -511,14 +506,14 @@ pub fn extract_codex_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
 
     // Session file: parse as CodexSessionEvent (delegate to existing parser).
     if serde_json::from_str::<CodexSessionEvent>(&first_line).is_ok() {
-        let mut entries = parse_codex_session_file(&validated, config)?;
+        let mut entries = parse_codex_session_file(path, config)?;
         entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
         return Ok(entries);
     }
 
     Err(anyhow::anyhow!(
         "Unsupported codex file format: {}",
-        validated.display()
+        path.display()
     ))
 }
 
@@ -527,9 +522,7 @@ pub fn extract_codex_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
 /// Gemini sessions are JSON (not JSONL) and live under:
 /// `~/.gemini/tmp/<hash>/chats/session-*.json`
 pub fn extract_gemini_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
-    let validated = sanitize::validate_read_path(path)?;
-    // SECURITY: path sanitized via validate_read_path (traversal + canonicalize + allowlist)
-    let mut entries = parse_gemini_session(&validated, config)?;
+    let mut entries = parse_gemini_session(path, config)?;
     entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
     Ok(entries)
 }
@@ -567,7 +560,7 @@ pub fn extract_claude_history(config: &ExtractionConfig) -> Result<Vec<TimelineE
         return Ok(vec![]);
     }
 
-    let file = File::open(&history_path)?;
+    let file = sanitize::open_file_validated(&history_path)?;
     let reader = BufReader::new(file);
     let mut entries = Vec::new();
 
@@ -673,7 +666,7 @@ pub fn extract_codex(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
         return Ok(vec![]);
     }
 
-    let file = File::open(&codex_path)?;
+    let file = sanitize::open_file_validated(&codex_path)?;
     let reader = BufReader::new(file);
 
     // First pass: read all entries, group by session
@@ -822,9 +815,7 @@ pub fn extract_codex_sessions(config: &ExtractionConfig) -> Result<Vec<TimelineE
 
 /// Parse a single Codex session JSONL file.
 fn parse_codex_session_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
-    let validated = sanitize::validate_read_path(path)?;
-    // SECURITY: path sanitized via validate_read_path (traversal + canonicalize + allowlist)
-    let file = File::open(&validated)?; // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+    let file = sanitize::open_file_validated(path)?;
     let reader = BufReader::new(file);
 
     let mut events: Vec<CodexSessionEvent> = Vec::new();
@@ -1038,7 +1029,7 @@ fn parse_gemini_session(
     path: &std::path::Path,
     config: &ExtractionConfig,
 ) -> Result<Vec<TimelineEntry>> {
-    let content = fs::read_to_string(path)?;
+    let content = sanitize::read_to_string_validated(path)?;
     let session: GeminiSession = serde_json::from_str(&content)?;
 
     let session_id = session
@@ -1419,9 +1410,7 @@ pub fn detect_project_name() -> String {
 
 /// Count unique sessions in the Codex history file.
 fn count_codex_sessions(path: &std::path::Path) -> Result<usize> {
-    let validated = sanitize::validate_read_path(path)?;
-    // SECURITY: path sanitized via validate_read_path (traversal + canonicalize + allowlist)
-    let file = File::open(&validated)?; // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+    let file = sanitize::open_file_validated(path)?;
     let reader = BufReader::new(file);
     let mut sessions: HashSet<String> = HashSet::new();
 
