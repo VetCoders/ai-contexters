@@ -22,3 +22,5 @@ agents/state/
 *.orig
 *.patch
 aicx-dashboard.html
+GEMINI.md
+CLAUDE.md

@@ -45,6 +45,17 @@ These are meant for indexing via `rmcp-memex`:
 
 The `aicx memex-sync` command wraps this behavior and maintains a minimal sync state (see `src/memex.rs`).
 
+## Identity Model & Compatibility Rules (v0.5.0+)
+
+Historically, `aicx` grouped contexts directly extracted from specific files under a file-centric identity (e.g., `file: session.jsonl`). Starting in v0.5.0, AICX has shifted to a strictly repo-centric identity model:
+- Project directories and memex namespaces are now grouped by the inferred repository name first.
+- The source file path is retained only as secondary metadata (`provenance`).
+
+**Compatibility Rules:**
+- If you have scripts, queries, or memex pipelines that rely on the old `file: <name>` groupings, you should update them to query by your repository name.
+- Older stored artifacts are NOT automatically orphaned or silently broken on read. However, they will no longer be updated.
+- To maintain a single coherent history, run `aicx migrate`. This command will cleanly move your older `file: *` contexts into the correct repository-named directories and update your `index.json`.
+
 ## Repo Init Workspace: `.ai-context/`
 
 Created by `aicx init` (see `src/init.rs`).

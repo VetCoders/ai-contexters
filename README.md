@@ -12,6 +12,7 @@ Supported sources:
 - Claude Code: `~/.claude/projects/*/*.jsonl`
 - Codex: `~/.codex/history.jsonl`
 - Gemini CLI: `~/.gemini/tmp/<hash>/chats/session-*.json`
+- Gemini Antigravity direct extract: `~/.gemini/antigravity/conversations/<uuid>.pb` or `~/.gemini/antigravity/brain/<uuid>/`
 
 ## Install
 
@@ -116,6 +117,14 @@ Memex sync (vector memory):
 ```bash
 aicx all -H 48 --memex
 aicx memex-sync --namespace ai-contexts
+```
+
+Single-session Gemini Antigravity extract (conversation artifacts first, explicit step-output fallback):
+
+```bash
+aicx extract --format gemini-antigravity \
+  ~/.gemini/antigravity/conversations/<uuid>.pb \
+  -o /tmp/antigravity-report.md
 ```
 
 ## Docs

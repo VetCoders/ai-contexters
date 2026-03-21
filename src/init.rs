@@ -1187,7 +1187,10 @@ mod tests {
     use filetime::{FileTime, set_file_mtime};
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TEMP_ROOT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     struct TempRoot {
         path: PathBuf,
@@ -1200,7 +1203,13 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            dir.push(format!("ai-ctx-init-test-{}-{}", std::process::id(), nanos));
+            let seq = TEMP_ROOT_COUNTER.fetch_add(1, Ordering::Relaxed);
+            dir.push(format!(
+                "ai-ctx-init-test-{}-{}-{}",
+                std::process::id(),
+                nanos,
+                seq
+            ));
             fs::create_dir_all(&dir).unwrap();
             Self { path: dir }
         }

@@ -123,11 +123,13 @@ aicx all -H 48 --user-only
 Extract timeline from a single agent session file (direct path).
 
 ```bash
-aicx extract --format <claude|codex|gemini> --output <FILE> <INPUT>
+aicx extract --format <claude|codex|gemini|gemini-antigravity> --output <FILE> <INPUT>
 ```
 
 Options:
 - `--format <FORMAT>` input format / agent
+- `gemini` reads classic Gemini CLI JSON sessions from `~/.gemini/tmp/.../session-*.json`
+- `gemini-antigravity` resolves either `conversations/<uuid>.pb` or `brain/<uuid>/`, prefers readable conversation artifacts inside `brain/<uuid>/`, and explicitly falls back to `.system_generated/steps/*/output.txt` when no chat-grade artifact is readable
 - `-o, --output <OUTPUT>` output file path
 - `--user-only` exclude assistant + reasoning messages
 - `--max-message-chars <N>` truncate huge messages in markdown (`0` = no truncation)
@@ -136,6 +138,7 @@ Example:
 
 ```bash
 aicx extract --format claude /path/to/session.jsonl -o /tmp/report.md
+aicx extract --format gemini-antigravity ~/.gemini/antigravity/conversations/<uuid>.pb -o /tmp/report.md
 ```
 
 ## `aicx store`

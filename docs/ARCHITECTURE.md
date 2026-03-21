@@ -44,6 +44,7 @@ High-level sequence (see `src/main.rs::run_extraction`):
    - Claude: `~/.claude/projects/*/*.jsonl`
    - Codex: `~/.codex/history.jsonl`
    - Gemini: `~/.gemini/tmp/<hash>/chats/session-*.json`
+   - Gemini Antigravity direct extract: `~/.gemini/antigravity/conversations/<uuid>.pb` or `~/.gemini/antigravity/brain/<uuid>/`
 3. Normalize into timeline entries.
 4. Deduplicate:
    - exact hash: `(agent, timestamp, message)`

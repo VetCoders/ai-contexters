@@ -4,6 +4,7 @@
 //! - Claude Code: ~/.claude/projects/*/*.jsonl
 //! - Codex: ~/.codex/history.jsonl
 //! - Gemini: ~/.gemini/tmp/<hash>/chats/session-*.json
+//! - Gemini Antigravity: ~/.gemini/antigravity/{conversations/<uuid>.pb,brain/<uuid>/}
 //!
 //! Features: incremental extraction, deduplication, rotation, append mode.
 //!
@@ -82,6 +83,7 @@ enum ExtractInputFormat {
     Claude,
     Codex,
     Gemini,
+    GeminiAntigravity,
 }
 
 #[derive(Subcommand)]
@@ -143,6 +145,10 @@ enum Commands {
         /// What to print to stdout: paths, json, none (default: none)
         #[arg(long, value_enum, default_value_t = StdoutEmit::None)]
         emit: StdoutEmit,
+
+        /// Conversation-first mode: emit denoised user/assistant transcript only
+        #[arg(long)]
+        conversation: bool,
     },
 
     /// Extract timeline from Codex history
@@ -202,6 +208,10 @@ enum Commands {
         /// What to print to stdout: paths, json, none (default: none)
         #[arg(long, value_enum, default_value_t = StdoutEmit::None)]
         emit: StdoutEmit,
+
+        /// Conversation-first mode: emit denoised user/assistant transcript only
+        #[arg(long)]
+        conversation: bool,
     },
 
     /// Extract from all agents (Claude + Codex + Gemini)
@@ -257,6 +267,10 @@ enum Commands {
         /// What to print to stdout: paths, json, none (default: none)
         #[arg(long, value_enum, default_value_t = StdoutEmit::None)]
         emit: StdoutEmit,
+
+        /// Conversation-first mode: emit denoised user/assistant transcript only
+        #[arg(long)]
+        conversation: bool,
     },
 
     /// Extract timeline from a single agent session file (direct path).
@@ -264,11 +278,15 @@ enum Commands {
     /// Example:
     ///   aicx extract --format claude /path/to/session.jsonl -o /tmp/report.md
     Extract {
-        /// Input format (agent): claude | codex | gemini
+        /// Input format (agent): claude | codex | gemini | gemini-antigravity
         #[arg(long, value_enum, alias = "input-format")]
         format: ExtractInputFormat,
 
-        /// Input file path (JSONL / JSON depending on agent)
+        /// Explicit project/repo name (overrides inference)
+        #[arg(short, long)]
+        project: Option<String>,
+
+        /// Input path (JSONL / JSON / Antigravity brain directory depending on agent)
         input: PathBuf,
 
         /// Output file path (e.g. /tmp/report.md)
@@ -286,6 +304,10 @@ enum Commands {
         /// Maximum message characters in markdown (0 = no truncation)
         #[arg(long, default_value = "0")]
         max_message_chars: usize,
+
+        /// Conversation-first mode: emit denoised user/assistant transcript only
+        #[arg(long)]
+        conversation: bool,
     },
 
     /// Store contexts in central store (~/.ai-contexters/) and optionally sync to memex
@@ -528,6 +550,13 @@ enum Commands {
         #[arg(long)]
         no_gitignore: bool,
     },
+
+    /// Migrate older file-centric contexts to canonical repo-centric directories
+    Migrate {
+        /// Dry run: show what would be moved without modifying files
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -557,6 +586,7 @@ fn main() -> Result<()> {
             memex,
             force,
             emit,
+            conversation,
         }) => {
             let include_assistant = include_assistant_flag || !user_only;
             run_extraction(ExtractionParams {
@@ -575,6 +605,7 @@ fn main() -> Result<()> {
                 force,
                 redact_secrets,
                 emit,
+                conversation,
             })?;
         }
         Some(Commands::Codex {
@@ -592,6 +623,7 @@ fn main() -> Result<()> {
             memex,
             force,
             emit,
+            conversation,
         }) => {
             let include_assistant = include_assistant_flag || !user_only;
             run_extraction(ExtractionParams {
@@ -610,6 +642,7 @@ fn main() -> Result<()> {
                 force,
                 redact_secrets,
                 emit,
+                conversation,
             })?;
         }
         Some(Commands::All {
@@ -626,6 +659,7 @@ fn main() -> Result<()> {
             memex,
             force,
             emit,
+            conversation,
         }) => {
             let include_assistant = include_assistant_flag || !user_only;
             run_extraction(ExtractionParams {
@@ -644,24 +678,29 @@ fn main() -> Result<()> {
                 force,
                 redact_secrets,
                 emit,
+                conversation,
             })?;
         }
         Some(Commands::Extract {
             format,
+            project,
             input,
             output,
             user_only,
             include_assistant: include_assistant_flag,
             max_message_chars,
+            conversation,
         }) => {
             let include_assistant = include_assistant_flag || !user_only;
             run_extract_file(
                 format,
+                project,
                 input,
                 output,
                 include_assistant,
                 max_message_chars,
                 redact_secrets,
+                conversation,
             )?;
         }
         Some(Commands::Store {
@@ -815,6 +854,9 @@ fn main() -> Result<()> {
                 }
             })?;
         }
+        Some(Commands::Migrate { dry_run }) => {
+            ai_contexters::store::run_migration(dry_run)?;
+        }
         None => {
             let project = cli.project.unwrap_or_else(sources::detect_project_name);
             let hours = cli.hours;
@@ -871,13 +913,16 @@ fn run_intents(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_extract_file(
     format: ExtractInputFormat,
+    explicit_project: Option<String>,
     input: PathBuf,
     output_path: PathBuf,
     include_assistant: bool,
     max_message_chars: usize,
     redact_secrets: bool,
+    conversation: bool,
 ) -> Result<()> {
     // For direct file extraction we intentionally don't apply a time cutoff;
     // set cutoff far in the past.
@@ -893,6 +938,9 @@ fn run_extract_file(
         ExtractInputFormat::Claude => sources::extract_claude_file(&input, &config)?,
         ExtractInputFormat::Codex => sources::extract_codex_file(&input, &config)?,
         ExtractInputFormat::Gemini => sources::extract_gemini_file(&input, &config)?,
+        ExtractInputFormat::GeminiAntigravity => {
+            sources::extract_gemini_antigravity_file(&input, &config)?
+        }
     };
 
     // Sort by timestamp (extractors should already do this).
@@ -909,10 +957,20 @@ fn run_extract_file(
     sessions.sort();
     sessions.dedup();
 
+    // Canonical Precedence: Explicit --project > Inferred Repo > File Provenance
     let file_label = input
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "(unknown)".to_string());
+
+    let inferred_repos = sources::repo_labels_from_entries(&entries, &[]);
+    let project_identity = explicit_project.unwrap_or_else(|| {
+        if inferred_repos.is_empty() {
+            format!("file: {file_label}")
+        } else {
+            inferred_repos.join("+")
+        }
+    });
 
     let hours_back = entries
         .first()
@@ -923,28 +981,49 @@ fn run_extract_file(
 
     let metadata = ReportMetadata {
         generated_at: Utc::now(),
-        project_filter: Some(format!("file: {file_label}")),
+        project_filter: Some(project_identity),
         hours_back,
         total_entries: output_entries.len(),
         sessions,
     };
 
-    let ext = output_path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("md")
-        .to_lowercase();
+    if conversation {
+        let project_filter = metadata
+            .project_filter
+            .as_ref()
+            .map(|p| vec![p.clone()])
+            .unwrap_or_default();
+        let conv_msgs = sources::to_conversation(&output_entries, &project_filter);
 
-    if ext == "json" {
-        output::write_json_report_to_path(&output_path, &output_entries, &metadata)?;
+        let ext = output_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("md")
+            .to_lowercase();
+
+        if ext == "json" {
+            output::write_conversation_json(&output_path, &conv_msgs, &metadata)?;
+        } else {
+            output::write_conversation_markdown(&output_path, &conv_msgs, &metadata)?;
+        }
     } else {
-        output::write_markdown_report_to_path(
-            &output_path,
-            &output_entries,
-            &metadata,
-            max_message_chars,
-            None,
-        )?;
+        let ext = output_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("md")
+            .to_lowercase();
+
+        if ext == "json" {
+            output::write_json_report_to_path(&output_path, &output_entries, &metadata)?;
+        } else {
+            output::write_markdown_report_to_path(
+                &output_path,
+                &output_entries,
+                &metadata,
+                max_message_chars,
+                None,
+            )?;
+        }
     }
 
     Ok(())
@@ -964,6 +1043,7 @@ struct ExtractionParams<'a> {
     project_root: Option<PathBuf>,
     sync_memex: bool,
     force: bool,
+    conversation: bool,
     redact_secrets: bool,
     emit: StdoutEmit,
 }
@@ -983,6 +1063,7 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
         project_root,
         sync_memex,
         force,
+        conversation,
         redact_secrets,
         emit,
     } = params;
@@ -1188,72 +1269,121 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
             }
         }
         StdoutEmit::Json => {
-            #[derive(Serialize)]
-            struct JsonStdoutReport<'a> {
-                generated_at: chrono::DateTime<Utc>,
-                project_filter: &'a Option<String>,
-                hours_back: u64,
-                total_entries: usize,
-                sessions: &'a [String],
-                entries: &'a [output::TimelineEntry],
-                store_paths: Vec<String>,
-            }
-
             let store_paths: Vec<String> = all_written_paths
                 .iter()
                 .map(|p| p.display().to_string())
                 .collect();
 
-            let report = JsonStdoutReport {
-                generated_at: metadata.generated_at,
-                project_filter: &metadata.project_filter,
-                hours_back: metadata.hours_back,
-                total_entries: metadata.total_entries,
-                sessions: &metadata.sessions,
-                entries: &output_entries,
-                store_paths,
-            };
+            if conversation {
+                #[derive(Serialize)]
+                struct JsonConvStdout<'a> {
+                    generated_at: chrono::DateTime<Utc>,
+                    project_filter: &'a Option<String>,
+                    hours_back: u64,
+                    total_messages: usize,
+                    sessions: &'a [String],
+                    messages: Vec<sources::ConversationMessage>,
+                    store_paths: Vec<String>,
+                }
 
-            println!("{}", serde_json::to_string_pretty(&report)?);
+                let conv_msgs = sources::to_conversation(&output_entries, &project);
+                let report = JsonConvStdout {
+                    generated_at: metadata.generated_at,
+                    project_filter: &metadata.project_filter,
+                    hours_back: metadata.hours_back,
+                    total_messages: conv_msgs.len(),
+                    sessions: &metadata.sessions,
+                    messages: conv_msgs,
+                    store_paths,
+                };
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                #[derive(Serialize)]
+                struct JsonStdoutReport<'a> {
+                    generated_at: chrono::DateTime<Utc>,
+                    project_filter: &'a Option<String>,
+                    hours_back: u64,
+                    total_entries: usize,
+                    sessions: &'a [String],
+                    entries: &'a [output::TimelineEntry],
+                    store_paths: Vec<String>,
+                }
+
+                let report = JsonStdoutReport {
+                    generated_at: metadata.generated_at,
+                    project_filter: &metadata.project_filter,
+                    hours_back: metadata.hours_back,
+                    total_entries: metadata.total_entries,
+                    sessions: &metadata.sessions,
+                    entries: &output_entries,
+                    store_paths,
+                };
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
         }
         StdoutEmit::None => {}
     }
 
     // ── Optional local output (only when -o explicitly passed) ──
     if let Some(local_dir) = output_dir {
-        let out_format = match format {
-            "md" => OutputFormat::Markdown,
-            "json" => OutputFormat::Json,
-            _ => OutputFormat::Both,
-        };
+        if conversation {
+            // Conversation-first mode: denoised transcript output
+            let conv_msgs = sources::to_conversation(&output_entries, &project);
+            let date_str = metadata.generated_at.format("%Y%m%d_%H%M%S");
+            let prefix = metadata.project_filter.as_deref().unwrap_or("all");
 
-        let mode = if let Some(ref path) = append_to {
-            OutputMode::AppendTimeline(path.clone())
+            let out_format = match format {
+                "md" => OutputFormat::Markdown,
+                "json" => OutputFormat::Json,
+                _ => OutputFormat::Both,
+            };
+
+            fs::create_dir_all(local_dir)?;
+
+            if out_format == OutputFormat::Markdown || out_format == OutputFormat::Both {
+                let md_path = local_dir.join(format!("{}_conversation_{}.md", prefix, date_str));
+                output::write_conversation_markdown(&md_path, &conv_msgs, &metadata)?;
+            }
+            if out_format == OutputFormat::Json || out_format == OutputFormat::Both {
+                let json_path =
+                    local_dir.join(format!("{}_conversation_{}.json", prefix, date_str));
+                output::write_conversation_json(&json_path, &conv_msgs, &metadata)?;
+            }
         } else {
-            OutputMode::NewFile
-        };
+            let out_format = match format {
+                "md" => OutputFormat::Markdown,
+                "json" => OutputFormat::Json,
+                _ => OutputFormat::Both,
+            };
 
-        let out_config = OutputConfig {
-            dir: local_dir.to_path_buf(),
-            format: out_format,
-            mode,
-            max_files: rotate,
-            max_message_chars: 0,
-            include_loctree,
-            project_root,
-        };
+            let mode = if let Some(ref path) = append_to {
+                OutputMode::AppendTimeline(path.clone())
+            } else {
+                OutputMode::NewFile
+            };
 
-        let written = output::write_report(&out_config, &output_entries, &metadata)?;
-        for path in &written {
-            eprintln!("  → {}", path.display());
-        }
+            let out_config = OutputConfig {
+                dir: local_dir.to_path_buf(),
+                format: out_format,
+                mode,
+                max_files: rotate,
+                max_message_chars: 0,
+                include_loctree,
+                project_root,
+            };
 
-        // Rotation
-        if rotate > 0 {
-            let prefix = agents.join("_");
-            let deleted = output::rotate_outputs(local_dir, &prefix, rotate)?;
-            if deleted > 0 {
-                eprintln!("  Rotated: deleted {} old files", deleted);
+            let written = output::write_report(&out_config, &output_entries, &metadata)?;
+            for path in &written {
+                eprintln!("  → {}", path.display());
+            }
+
+            // Rotation
+            if rotate > 0 {
+                let prefix = agents.join("_");
+                let deleted = output::rotate_outputs(local_dir, &prefix, rotate)?;
+                if deleted > 0 {
+                    eprintln!("  Rotated: deleted {} old files", deleted);
+                }
             }
         }
     }
@@ -1540,6 +1670,7 @@ fn run_rank(
         project_root: None,
         sync_memex: false,
         force: false,
+        conversation: false,
         redact_secrets,
         emit: StdoutEmit::None,
     });
@@ -2182,6 +2313,27 @@ fn run_dashboard(args: DashboardRunArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use filetime::{FileTime, set_file_mtime};
+    use std::fs;
+
+    fn unique_test_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "aicx-main-{name}-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ))
+    }
+
+    fn write_file(path: &Path, content: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, content).unwrap();
+    }
+
+    fn set_mtime(path: &Path, unix_seconds: i64) {
+        set_file_mtime(path, FileTime::from_unix_time(unix_seconds, 0)).unwrap();
+    }
 
     #[test]
     fn claude_defaults_to_silent_stdout() {
@@ -2267,5 +2419,63 @@ mod tests {
             }
             _ => panic!("expected refs command"),
         }
+    }
+
+    #[test]
+    fn extract_accepts_gemini_antigravity_format() {
+        let cli = Cli::try_parse_from([
+            "aicx",
+            "extract",
+            "--format",
+            "gemini-antigravity",
+            "/tmp/brain/uuid",
+            "-o",
+            "/tmp/report.md",
+        ])
+        .expect("extract command with gemini-antigravity should parse");
+
+        match cli.command {
+            Some(Commands::Extract { format, .. }) => {
+                assert!(matches!(format, ExtractInputFormat::GeminiAntigravity));
+            }
+            _ => panic!("expected extract command"),
+        }
+    }
+
+    #[test]
+    fn run_extract_file_uses_repo_identity_over_file_provenance() {
+        let root = unique_test_dir("extract-repo-identity");
+        let brain = root.join("brain").join("conv-9");
+        let step_output = brain
+            .join(".system_generated")
+            .join("steps")
+            .join("001")
+            .join("output.txt");
+        let report = root.join("report.md");
+
+        write_file(
+            &step_output,
+            r#"{"project":"/Users/tester/workspace/RepoDelta","decision":"Group by repo identity."}"#,
+        );
+        set_mtime(&step_output, 1_706_745_900);
+
+        run_extract_file(
+            ExtractInputFormat::GeminiAntigravity,
+            None,
+            brain,
+            report.clone(),
+            true,
+            0,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let output = fs::read_to_string(&report).unwrap();
+        assert!(output.contains("| Filter | RepoDelta |"));
+        assert!(output.contains("Gemini Antigravity recovery report"));
+        assert!(!output.contains("| Filter | file:"));
+
+        let _ = fs::remove_dir_all(&root);
     }
 }
