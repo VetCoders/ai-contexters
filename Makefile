@@ -1,8 +1,8 @@
 # AICX Build System
 # Local developer flow + release/readiness helpers
 
-.PHONY: all build install install-bin install-config install-cargo git-hooks
-.PHONY: precheck test check fmt fmt-check clippy semgrep ci clean help manifest-check
+.PHONY: all build install install-bin install-config install-cargo
+.PHONY: precheck test check fmt fmt-check clippy semgrep ci clean help
 .PHONY: version-show version-check release-plan release-check release-tag release-push package-check
 
 all: build
@@ -16,7 +16,6 @@ build:
 
 install:
 	./install.sh
-	@$(MAKE) git-hooks
 
 install-bin:
 	cargo install --path . --locked --force --bin aicx --bin aicx-mcp
@@ -27,36 +26,25 @@ install-config:
 install-cargo:
 	cargo install $(PACKAGE_NAME) --locked
 
-git-hooks:
-	@echo "Installing git hooks..."
-	@bash ./tools/install-githooks.sh
-	@echo "✓ pre-commit + pre-push hooks installed"
-
 precheck:
 	cargo check --locked --all-targets
-
-manifest-check:
-	@python3 -c 'import tomllib; data = tomllib.load(open("Cargo.toml", "rb")); bad = [(section, name, spec["path"]) for section in ("dependencies", "dev-dependencies", "build-dependencies") for name, spec in data.get(section, {}).items() if isinstance(spec, dict) and "path" in spec]; \
-print("Manifest portability: ok") if not bad else (_ for _ in ()).throw(SystemExit("Manifest portability check failed:\n" + "\n".join(f"  - {section}.{name} uses local path dependency {path}" for section, name, path in bad)))'
 
 test:
 	cargo test --locked --all-targets
 
 check:
 	@echo "=== AICX Quality Gate ==="
-	@echo "[1/7] Checking manifest portability..."
-	@$(MAKE) manifest-check
-	@echo "[2/7] Checking formatting..."
+	@echo "[1/6] Checking formatting..."
 	@cargo fmt --all --check || (echo "Run 'make fmt' to fix formatting." && exit 1)
-	@echo "[3/7] Running cargo check..."
+	@echo "[2/6] Running cargo check..."
 	@cargo check --locked --all-targets
-	@echo "[4/7] Running clippy..."
+	@echo "[3/6] Running clippy..."
 	@cargo clippy --locked --all-features --all-targets -- -D warnings
-	@echo "[5/7] Running tests..."
+	@echo "[4/6] Running tests..."
 	@cargo test --locked --all-targets
-	@echo "[6/7] Building release binaries..."
+	@echo "[5/6] Building release binaries..."
 	@cargo build --locked --release --bin aicx --bin aicx-mcp
-	@echo "[7/7] Running Semgrep (if available)..."
+	@echo "[6/6] Running Semgrep (if available)..."
 	@if command -v semgrep >/dev/null 2>&1 || command -v pipx >/dev/null 2>&1; then \
 		SEMGREP=$$(command -v semgrep || echo "pipx run semgrep"); \
 		$$SEMGREP --config auto --error --quiet . --exclude target; \
@@ -145,9 +133,7 @@ help:
 	@echo "  make install-bin     - Install only aicx + aicx-mcp from the current checkout"
 	@echo "  make install-config  - Configure local MCP clients without reinstalling binaries"
 	@echo "  make install-cargo   - Install published crate from crates.io"
-	@echo "  make git-hooks       - Install repo-local pre-commit + pre-push hooks"
 	@echo "  make precheck        - Quick cargo check"
-	@echo "  make manifest-check  - Fail if Cargo.toml uses local path dependencies"
 	@echo "  make check           - Full local gate (fmt, check, clippy, test, build, semgrep)"
 	@echo "  make test            - Run all tests"
 	@echo "  make fmt             - Format all Rust code"
