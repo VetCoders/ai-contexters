@@ -168,6 +168,7 @@ struct FuzzySearchResult {
     label: String,
     signal_density: f32,
     matched_lines: Vec<String>,
+    excerpt: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -490,17 +491,21 @@ fn run_fuzzy_search(
         rank::fuzzy_search_store(store_root, query, limit, project_filter)?;
     let results = results
         .into_iter()
-        .map(|result| FuzzySearchResult {
-            file: result.file,
-            path: result.path,
-            project: result.project,
-            kind: result.kind,
-            agent: result.agent,
-            date: result.date,
-            score: result.score,
-            label: result.label,
-            signal_density: result.density,
-            matched_lines: result.matched_lines,
+        .map(|result| {
+            let excerpt = result.matched_lines.join(" ... ");
+            FuzzySearchResult {
+                file: result.file,
+                path: result.path,
+                project: result.project,
+                kind: result.kind,
+                agent: result.agent,
+                date: result.date,
+                score: result.score,
+                label: result.label,
+                signal_density: result.density,
+                matched_lines: result.matched_lines,
+                excerpt,
+            }
         })
         .collect();
 

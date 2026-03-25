@@ -20,7 +20,9 @@ agents/state/
 /.ai-agents
 /skills
 *.orig
-*.patch
-aicx-dashboard.html
+/*patch*
+/*.html
 GEMINI.md
 CLAUDE.md
+/*.rs
+*.out

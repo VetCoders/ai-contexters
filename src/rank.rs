@@ -273,10 +273,15 @@ pub fn fuzzy_search_store(
         };
 
         let content_normalized = normalize_query(&content);
-        if !query_terms
+        
+        let matched_terms = query_terms
             .iter()
-            .all(|term| content_normalized.contains(term))
-        {
+            .filter(|&term| content_normalized.contains(term))
+            .count();
+
+        // Must match at least one term to be considered.
+        // If query is multi-term, we don't strictly require ALL, but at least partial intersection
+        if matched_terms == 0 {
             continue;
         }
 
@@ -293,6 +298,10 @@ pub fn fuzzy_search_store(
             .collect();
 
         let chunk_score = score_chunk_content(&content);
+        
+        let match_ratio = matched_terms as f32 / query_terms.len() as f32;
+        let final_score = (chunk_score.score as f32 * 0.5 + 5.0 * match_ratio) as u8;
+
         results.push(FuzzyResult {
             file: stored_file
                 .path
@@ -305,7 +314,7 @@ pub fn fuzzy_search_store(
             kind: stored_file.kind.dir_name().to_string(),
             agent: stored_file.agent,
             date: stored_file.date_iso,
-            score: chunk_score.score,
+            score: final_score,
             label: chunk_score.label.to_string(),
             density: chunk_score.density,
             matched_lines,
