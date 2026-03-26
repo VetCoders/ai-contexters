@@ -637,9 +637,13 @@ fn strip_case_insensitive_prefix<'a>(text: &'a str, prefix: &str) -> &'a str {
         return text;
     }
 
-    let candidate = &text[..prefix.len()];
+    let Some(candidate) = text.get(..prefix.len()) else {
+        return text;
+    };
+
     if candidate.eq_ignore_ascii_case(prefix) {
-        text[prefix.len()..]
+        text.get(prefix.len()..)
+            .unwrap_or("")
             .trim_start_matches([' ', '-', ':'])
             .trim_start()
     } else {
@@ -1184,5 +1188,11 @@ commit abcdef1 proves the old path was wrong.
         assert!(json.contains("\"kind\": \"outcome\""));
         assert!(json.contains("\"summary\": \"p0=0 after validation\""));
         assert!(json.contains("\"source_chunk\": \"/tmp/demo/2026-03-15/120500_claude-002.md\""));
+    }
+
+    #[test]
+    fn strip_case_prefix_is_utf8_safe() {
+        let text = "Działa pięknie — pełny artifact pack z Rust flow...";
+        assert_eq!(strip_case_insensitive_prefix(text, "validation:"), text);
     }
 }

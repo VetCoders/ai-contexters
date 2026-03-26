@@ -1997,6 +1997,7 @@ fn run_memex_sync(namespace: &str, per_chunk: bool, db_path: Option<PathBuf>) ->
         namespace: namespace.to_string(),
         db_path,
         batch_mode: !per_chunk,
+        preprocess: true,
     };
 
     eprintln!("Syncing chunks from: {}", chunks_dir.display());
@@ -2004,9 +2005,9 @@ fn run_memex_sync(namespace: &str, per_chunk: bool, db_path: Option<PathBuf>) ->
     eprintln!(
         "  Mode: {}",
         if config.batch_mode {
-            "batch"
+            "batch (preprocessed)"
         } else {
-            "per-chunk"
+            "per-chunk (metadata-rich)"
         }
     );
 

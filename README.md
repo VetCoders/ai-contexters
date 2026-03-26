@@ -117,7 +117,10 @@ Memex sync (vector memory):
 ```bash
 aicx all -H 48 --memex
 aicx memex-sync --namespace ai-contexts
+aicx memex-sync --namespace ai-contexts --per-chunk
 ```
+
+Batch sync preprocesses common boilerplate before indexing. Use `--per-chunk` when you want richer per-document metadata forwarded to memex (`project`, `agent`, `date`, `session_id`, `kind`).
 
 Single-session Gemini Antigravity extract (conversation artifacts first, explicit step-output fallback):
 

@@ -177,7 +177,7 @@ aicx memex-sync [OPTIONS]
 
 Options:
 - `-n, --namespace <NAMESPACE>` vector namespace (default: `ai-contexts`)
-- `--per-chunk` use per-chunk upsert instead of batch index
+- `--per-chunk` use per-chunk upsert instead of batch index; preserves structured metadata (`project`, `agent`, `date`, `session_id`, `kind`) via sidecars
 - `--db-path <DB_PATH>` override LanceDB path
 
 Example:
@@ -185,6 +185,10 @@ Example:
 ```bash
 aicx memex-sync --namespace ai-contexts
 ```
+
+Notes:
+- Default batch sync now enables `rmcp-memex index --preprocess` to strip common boilerplate before embedding.
+- `--per-chunk` is slower, but it keeps metadata-rich upserts ready for future project/agent/date-aware filtering.
 
 ## `aicx refs`
 

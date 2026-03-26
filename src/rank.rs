@@ -273,7 +273,7 @@ pub fn fuzzy_search_store(
         };
 
         let content_normalized = normalize_query(&content);
-        
+
         let matched_terms = query_terms
             .iter()
             .filter(|&term| content_normalized.contains(term))
@@ -298,7 +298,7 @@ pub fn fuzzy_search_store(
             .collect();
 
         let chunk_score = score_chunk_content(&content);
-        
+
         let match_ratio = matched_terms as f32 / query_terms.len() as f32;
         let final_score = (chunk_score.score as f32 * 0.5 + 5.0 * match_ratio) as u8;
 

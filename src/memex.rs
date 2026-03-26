@@ -30,6 +30,8 @@ pub struct MemexConfig {
     pub db_path: Option<PathBuf>,
     /// Use batch `index` command (true) or per-chunk `upsert` (false)
     pub batch_mode: bool,
+    /// Preprocess known boilerplate/noise before batch indexing.
+    pub preprocess: bool,
 }
 
 impl Default for MemexConfig {
@@ -38,6 +40,7 @@ impl Default for MemexConfig {
             namespace: "ai-contexts".to_string(),
             db_path: None,
             batch_mode: true,
+            preprocess: true,
         }
     }
 }
@@ -159,6 +162,10 @@ pub fn sync_chunks_batch(chunks_dir: &Path, config: &MemexConfig) -> Result<Sync
         .arg("--dedup")
         .arg("true");
 
+    if config.preprocess {
+        cmd.arg("--preprocess");
+    }
+
     if let Some(ref db_path) = config.db_path {
         cmd.arg("--db-path").arg(db_path);
     }
@@ -199,6 +206,80 @@ fn parse_indexed_count(output: &str) -> Option<usize> {
         }
     }
     None
+}
+
+fn chunk_sidecar_path(chunk_path: &Path) -> PathBuf {
+    chunk_path.with_extension("meta.json")
+}
+
+fn chunk_metadata_from_header(text: &str) -> serde_json::Map<String, serde_json::Value> {
+    let mut metadata = serde_json::Map::new();
+    let Some(first_line) = text.lines().next() else {
+        return metadata;
+    };
+
+    if !first_line.starts_with('[') || !first_line.ends_with(']') {
+        return metadata;
+    }
+
+    let inner = &first_line[1..first_line.len() - 1];
+    for part in inner.split('|') {
+        let Some((key, value)) = part.split_once(':') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        if key.is_empty() || value.is_empty() {
+            continue;
+        }
+        metadata.insert(
+            key.to_string(),
+            serde_json::Value::String(value.to_string()),
+        );
+    }
+
+    metadata
+}
+
+fn chunk_metadata_for_upsert(chunk_path: &Path, chunk_id: &str, text: &str) -> serde_json::Value {
+    let mut metadata = serde_json::Map::from_iter([
+        (
+            "source".to_string(),
+            serde_json::Value::String("ai-contexters".to_string()),
+        ),
+        (
+            "chunk_id".to_string(),
+            serde_json::Value::String(chunk_id.to_string()),
+        ),
+    ]);
+
+    let sidecar = fs::read_to_string(chunk_sidecar_path(chunk_path))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<crate::chunker::ChunkMetadataSidecar>(&raw).ok());
+
+    if let Some(sidecar) = sidecar {
+        metadata.insert(
+            "project".to_string(),
+            serde_json::Value::String(sidecar.project),
+        );
+        metadata.insert(
+            "agent".to_string(),
+            serde_json::Value::String(sidecar.agent),
+        );
+        metadata.insert("date".to_string(), serde_json::Value::String(sidecar.date));
+        metadata.insert(
+            "session_id".to_string(),
+            serde_json::Value::String(sidecar.session_id),
+        );
+        metadata.insert(
+            "kind".to_string(),
+            serde_json::Value::String(sidecar.kind.dir_name().to_string()),
+        );
+    } else {
+        metadata.extend(chunk_metadata_from_header(text));
+    }
+
+    serde_json::Value::Object(metadata)
 }
 
 // ============================================================================
@@ -320,10 +401,7 @@ pub fn sync_new_chunks(chunks_dir: &Path, config: &MemexConfig) -> Result<SyncRe
                 }
             };
 
-            let metadata = serde_json::json!({
-                "source": "ai-contexters",
-                "chunk_id": id,
-            });
+            let metadata = chunk_metadata_for_upsert(&validated_file, &id, &text);
 
             match sync_chunk_single(&id, &text, &metadata, config) {
                 Ok(()) => result.chunks_pushed += 1,
@@ -391,6 +469,7 @@ mod tests {
         assert_eq!(config.namespace, "ai-contexts");
         assert!(config.db_path.is_none());
         assert!(config.batch_mode);
+        assert!(config.preprocess);
     }
 
     #[test]
@@ -451,5 +530,53 @@ mod tests {
     fn test_check_memex_available() {
         // Just verify it doesn't panic — actual result depends on system
         let _ = check_memex_available();
+    }
+
+    #[test]
+    fn test_chunk_metadata_from_header() {
+        let text = "[project: prview-rs | agent: claude | date: 2026-03-24]\n\nhello";
+        let metadata = chunk_metadata_from_header(text);
+
+        assert_eq!(metadata.get("project").unwrap(), "prview-rs");
+        assert_eq!(metadata.get("agent").unwrap(), "claude");
+        assert_eq!(metadata.get("date").unwrap(), "2026-03-24");
+    }
+
+    #[test]
+    fn test_chunk_metadata_for_upsert_prefers_sidecar() {
+        let tmp = std::env::temp_dir().join(format!("ai-ctx-memex-sidecar-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        let chunk_path = tmp.join("chunk.txt");
+        fs::write(
+            &chunk_path,
+            "[project: wrong | agent: wrong | date: 2026-01-01]\n\nbody",
+        )
+        .unwrap();
+        fs::write(
+            chunk_sidecar_path(&chunk_path),
+            serde_json::to_vec_pretty(&crate::chunker::ChunkMetadataSidecar {
+                id: "chunk".to_string(),
+                project: "prview-rs".to_string(),
+                agent: "claude".to_string(),
+                date: "2026-03-24".to_string(),
+                session_id: "sess-1".to_string(),
+                kind: crate::store::Kind::Conversations,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let metadata = chunk_metadata_for_upsert(&chunk_path, "chunk", "body");
+        let object = metadata.as_object().unwrap();
+
+        assert_eq!(object.get("project").unwrap(), "prview-rs");
+        assert_eq!(object.get("agent").unwrap(), "claude");
+        assert_eq!(object.get("date").unwrap(), "2026-03-24");
+        assert_eq!(object.get("session_id").unwrap(), "sess-1");
+        assert_eq!(object.get("kind").unwrap(), "conversations");
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 }
