@@ -6,6 +6,7 @@
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -37,6 +38,30 @@ pub struct Chunk {
     pub token_estimate: usize,
     /// Decision/plan highlights extracted from the chunk
     pub highlights: Vec<String>,
+}
+
+/// Structured metadata sidecar persisted alongside each memex chunk file.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChunkMetadataSidecar {
+    pub id: String,
+    pub project: String,
+    pub agent: String,
+    pub date: String,
+    pub session_id: String,
+    pub kind: crate::store::Kind,
+}
+
+impl From<&Chunk> for ChunkMetadataSidecar {
+    fn from(chunk: &Chunk) -> Self {
+        Self {
+            id: chunk.id.clone(),
+            project: chunk.project.clone(),
+            agent: chunk.agent.clone(),
+            date: chunk.date.clone(),
+            session_id: chunk.session_id.clone(),
+            kind: chunk.kind,
+        }
+    }
 }
 
 /// Configuration for the chunker.
@@ -768,6 +793,9 @@ pub fn write_chunks_to_dir(chunks: &[Chunk], dir: &Path) -> Result<Vec<PathBuf>>
         let filename = format!("{}.txt", chunk.id);
         let path = dir.join(&filename);
         fs::write(&path, &chunk.text)?;
+        let sidecar_path = dir.join(format!("{}.meta.json", chunk.id));
+        let sidecar = ChunkMetadataSidecar::from(chunk);
+        fs::write(&sidecar_path, serde_json::to_vec_pretty(&sidecar)?)?;
         paths.push(path);
     }
 
@@ -992,6 +1020,13 @@ mod tests {
 
         let content = fs::read_to_string(&paths[0]).unwrap();
         assert_eq!(content, "chunk one content");
+
+        let sidecar = fs::read_to_string(tmp.join("proj_claude_2026-01-22_001.meta.json")).unwrap();
+        let metadata: ChunkMetadataSidecar = serde_json::from_str(&sidecar).unwrap();
+        assert_eq!(metadata.project, "proj");
+        assert_eq!(metadata.agent, "claude");
+        assert_eq!(metadata.date, "2026-01-22");
+        assert_eq!(metadata.kind, crate::store::Kind::Conversations);
 
         let _ = fs::remove_dir_all(&tmp);
     }

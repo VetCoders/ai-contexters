@@ -38,12 +38,14 @@ It is updated on every store write.
 ### `memex/chunks/`
 
 `memex/chunks/` contains pre-chunked `.txt` files written by `src/chunker.rs::write_chunks_to_dir`.
+Each chunk also gets a sibling `.meta.json` sidecar with structured metadata (`project`, `agent`, `date`, `session_id`, `kind`).
 
 These are meant for indexing via `rmcp-memex`:
 - batch mode: `rmcp-memex index <dir> ...`
 - per-chunk mode: `rmcp-memex upsert <chunk_id> ...`
 
 The `aicx memex-sync` command wraps this behavior and maintains a minimal sync state (see `src/memex.rs`).
+Batch sync uses `rmcp-memex index --preprocess`; per-chunk sync reads the sidecars and forwards structured metadata with each upsert.
 
 ## Identity Model & Compatibility Rules (v0.5.0+)
 
@@ -82,4 +84,3 @@ Recommended sharing rules:
 - Commit `share/artifacts/SUMMARY.md` and `share/artifacts/TIMELINE.md` by default.
 - Decide case-by-case for `TRIAGE.md` and `prompts/` (often useful for multi-agent teams).
 - Keep `.ai-context/local/` uncommitted.
-

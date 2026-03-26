@@ -230,12 +230,18 @@ fn truncate_gemini_large_data(value: &mut serde_json::Value) {
             if let Some(inline_data) = map.get("inlineData") {
                 let placeholder = render_gemini_inline_data_placeholder(inline_data);
                 map.remove("inlineData");
-                map.insert("inlineDataPlaceholder".to_string(), serde_json::Value::String(placeholder));
+                map.insert(
+                    "inlineDataPlaceholder".to_string(),
+                    serde_json::Value::String(placeholder),
+                );
             }
             if let Some(file_data) = map.get("fileData") {
                 let placeholder = render_gemini_file_data_placeholder(file_data);
                 map.remove("fileData");
-                map.insert("fileDataPlaceholder".to_string(), serde_json::Value::String(placeholder));
+                map.insert(
+                    "fileDataPlaceholder".to_string(),
+                    serde_json::Value::String(placeholder),
+                );
             }
             for v in map.values_mut() {
                 truncate_gemini_large_data(v);
@@ -760,7 +766,7 @@ pub fn extract_codex_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
 
     // Check for legacy JSON format ({"session": {...}, "items": [...]})
     // We read the full file because it's usually formatted JSON.
-    if let Ok(content) = fs::read_to_string(path) {
+    if let Ok(content) = sanitize::read_to_string_validated(path) {
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
             if val.get("session").is_some() && val.get("items").is_some() {
                 anyhow::bail!(
