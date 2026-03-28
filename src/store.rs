@@ -580,10 +580,19 @@ fn write_context_session_first_at(
 
         let write_path = sanitize::validate_write_path(&path)?;
         fs::write(&write_path, &chunk.text)?;
+        write_chunk_sidecar(&path, chunk)?;
         written.push(path);
     }
 
     Ok(written)
+}
+
+fn write_chunk_sidecar(path: &Path, chunk: &chunker::Chunk) -> Result<()> {
+    let sidecar_path = path.with_extension("meta.json");
+    let write_path = sanitize::validate_write_path(&sidecar_path)?;
+    let sidecar = chunker::ChunkMetadataSidecar::from(chunk);
+    fs::write(&write_path, serde_json::to_vec_pretty(&sidecar)?)?;
+    Ok(())
 }
 
 pub fn store_semantic_segments(
@@ -719,6 +728,56 @@ pub fn context_files_since(
         matches_project && matches_cutoff
     });
     Ok(files)
+}
+
+/// Load the metadata sidecar for a context file, if it exists.
+pub fn load_sidecar(chunk_path: &Path) -> Option<chunker::ChunkMetadataSidecar> {
+    let sidecar_path = chunk_path.with_extension("meta.json");
+    let sidecar_path = sanitize::validate_read_path(&sidecar_path).ok()?;
+    let content = fs::read_to_string(&sidecar_path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+/// Find stored chunks whose sidecar metadata matches a run ID.
+pub fn chunks_by_run_id(run_id: &str, project: Option<&str>) -> Result<Vec<StoredContextFile>> {
+    let cutoff = SystemTime::now() - std::time::Duration::from_secs(7 * 24 * 3600);
+    chunks_by_run_id_at(&store_base_dir()?, run_id, project, cutoff)
+}
+
+fn chunks_by_run_id_at(
+    base: &Path,
+    run_id: &str,
+    project: Option<&str>,
+    cutoff: SystemTime,
+) -> Result<Vec<StoredContextFile>> {
+    let filter = project.map(|value| value.to_ascii_lowercase());
+    let mut matched = Vec::new();
+
+    for file in scan_context_files_at(base)? {
+        let matches_project = filter
+            .as_ref()
+            .is_none_or(|needle| file.project.to_ascii_lowercase().contains(needle));
+        let matches_cutoff = file
+            .path
+            .metadata()
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .is_some_and(|modified| modified >= cutoff);
+
+        if !matches_project || !matches_cutoff {
+            continue;
+        }
+
+        if load_sidecar(&file.path)
+            .and_then(|sidecar| sidecar.run_id)
+            .as_deref()
+            == Some(run_id)
+        {
+            matched.push(file);
+        }
+    }
+
+    Ok(matched)
 }
 
 fn scan_repo_store(root: &Path, files: &mut Vec<StoredContextFile>) -> Result<()> {
@@ -2581,6 +2640,74 @@ mod tests {
 
         assert!(full_subpath.contains("conversations/claude"));
         assert!(full_subpath.ends_with("2026_0321_claude_sess-abc123_001.md"));
+    }
+
+    #[test]
+    fn canonical_store_writes_sidecar_with_frontmatter_telemetry() {
+        let root = retrieval_test_root("telemetry-sidecar");
+        let _ = fs::remove_dir_all(&root);
+
+        let entries = vec![TimelineEntry {
+            timestamp: Utc.with_ymd_and_hms(2026, 3, 27, 10, 0, 0).unwrap(),
+            agent: "codex".to_string(),
+            session_id: "sess-telemetry".to_string(),
+            role: "assistant".to_string(),
+            message: "---\nrun_id: mrbl-001\nprompt_id: api-redesign_20260327\nmodel: gpt-5.4\nstarted_at: 2026-03-27T10:00:00Z\ncompleted_at: 2026-03-27T10:01:00Z\ntoken_usage: 1234\nfindings_count: 4\n---\n## Findings\nTelemetry wiring landed.\n".to_string(),
+            branch: None,
+            cwd: None,
+        }];
+
+        let written = write_context_session_first_at(
+            &root.join("store"),
+            SessionWriteSpec {
+                project: Some("VetCoders/ai-contexters"),
+                agent: "codex",
+                date: "2026-03-27",
+                session_id: "sess-telemetry",
+                kind: Some(Kind::Reports),
+            },
+            &entries,
+            &ChunkerConfig::default(),
+        )
+        .expect("write canonical context");
+
+        assert_eq!(written.len(), 1);
+        let chunk_path = &written[0];
+        assert!(chunk_path.exists());
+
+        let content = fs::read_to_string(chunk_path).expect("read stored chunk");
+        assert!(content.contains("## Findings"));
+        assert!(!content.contains("run_id: mrbl-001"));
+
+        let sidecar_path = chunk_path.with_extension("meta.json");
+        assert!(sidecar_path.exists());
+
+        let sidecar = load_sidecar(chunk_path).expect("load sidecar");
+        assert_eq!(sidecar.run_id.as_deref(), Some("mrbl-001"));
+        assert_eq!(sidecar.prompt_id.as_deref(), Some("api-redesign_20260327"));
+        assert_eq!(sidecar.agent_model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(sidecar.started_at.as_deref(), Some("2026-03-27T10:00:00Z"));
+        assert_eq!(
+            sidecar.completed_at.as_deref(),
+            Some("2026-03-27T10:01:00Z")
+        );
+        assert_eq!(sidecar.token_usage, Some(1234));
+        assert_eq!(sidecar.findings_count, Some(4));
+
+        let scanned = scan_context_files_at(&root).expect("scan canonical store");
+        assert_eq!(scanned.len(), 1, "sidecar files must not scan as chunks");
+
+        let matched = chunks_by_run_id_at(
+            &root,
+            "mrbl-001",
+            Some("ai-contexters"),
+            SystemTime::UNIX_EPOCH,
+        )
+        .expect("query by run id");
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].path.file_name(), chunk_path.file_name());
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     fn semantic_entry(

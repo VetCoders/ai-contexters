@@ -7,6 +7,7 @@
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -30,6 +31,20 @@ pub struct Chunk {
     pub session_id: String,
     /// Classified kind for this chunk's content
     pub kind: crate::store::Kind,
+    /// Optional correlation ID for the originating run
+    pub run_id: Option<String>,
+    /// Optional prompt or task identity for the originating run
+    pub prompt_id: Option<String>,
+    /// Optional agent model reported by the source frontmatter
+    pub agent_model: Option<String>,
+    /// Optional run start timestamp reported by the source frontmatter
+    pub started_at: Option<String>,
+    /// Optional run completion timestamp reported by the source frontmatter
+    pub completed_at: Option<String>,
+    /// Optional token usage reported by the source frontmatter
+    pub token_usage: Option<u64>,
+    /// Optional findings count reported by the source frontmatter
+    pub findings_count: Option<u32>,
     /// Index range in original day's entries (start, end exclusive)
     pub msg_range: (usize, usize),
     /// Formatted chunk text with header
@@ -49,6 +64,20 @@ pub struct ChunkMetadataSidecar {
     pub date: String,
     pub session_id: String,
     pub kind: crate::store::Kind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_usage: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub findings_count: Option<u32>,
 }
 
 impl From<&Chunk> for ChunkMetadataSidecar {
@@ -60,6 +89,13 @@ impl From<&Chunk> for ChunkMetadataSidecar {
             date: chunk.date.clone(),
             session_id: chunk.session_id.clone(),
             kind: chunk.kind,
+            run_id: chunk.run_id.clone(),
+            prompt_id: chunk.prompt_id.clone(),
+            agent_model: chunk.agent_model.clone(),
+            started_at: chunk.started_at.clone(),
+            completed_at: chunk.completed_at.clone(),
+            token_usage: chunk.token_usage,
+            findings_count: chunk.findings_count,
         }
     }
 }
@@ -100,6 +136,43 @@ pub fn estimate_tokens(text: &str) -> usize {
     text.len().div_ceil(4)
 }
 
+fn prepare_entries_for_chunking<'a>(
+    entries: &'a [TimelineEntry],
+) -> (
+    Option<crate::frontmatter::ReportFrontmatter>,
+    Cow<'a, [TimelineEntry]>,
+) {
+    let Some(first) = entries.first() else {
+        return (None, Cow::Borrowed(entries));
+    };
+
+    if !first.message.trim_start().starts_with("---") {
+        return (None, Cow::Borrowed(entries));
+    }
+
+    let (frontmatter, body) = crate::frontmatter::parse(&first.message);
+    let Some(frontmatter) = frontmatter else {
+        return (None, Cow::Borrowed(entries));
+    };
+
+    let mut stripped_entries = entries.to_vec();
+    if let Some(stripped_first) = stripped_entries.first_mut() {
+        stripped_first.message = body.to_string();
+    }
+
+    (Some(frontmatter), Cow::Owned(stripped_entries))
+}
+
+fn apply_frontmatter(chunk: &mut Chunk, frontmatter: &crate::frontmatter::ReportFrontmatter) {
+    chunk.run_id = frontmatter.run_id.clone();
+    chunk.prompt_id = frontmatter.prompt_id.clone();
+    chunk.agent_model = frontmatter.model.clone();
+    chunk.started_at = frontmatter.started_at.clone();
+    chunk.completed_at = frontmatter.completed_at.clone();
+    chunk.token_usage = frontmatter.token_usage;
+    chunk.findings_count = frontmatter.findings_count;
+}
+
 // ============================================================================
 // Chunking logic
 // ============================================================================
@@ -118,9 +191,12 @@ pub fn chunk_entries(
         return vec![];
     }
 
+    let (frontmatter, prepared_entries) = prepare_entries_for_chunking(entries);
+    let prepared_entries = prepared_entries.as_ref();
+
     // Group entries by date
     let mut by_date: BTreeMap<String, Vec<(usize, &TimelineEntry)>> = BTreeMap::new();
-    for (idx, entry) in entries.iter().enumerate() {
+    for (idx, entry) in prepared_entries.iter().enumerate() {
         let date = entry.timestamp.format("%Y-%m-%d").to_string();
         by_date.entry(date).or_default().push((idx, entry));
     }
@@ -128,7 +204,12 @@ pub fn chunk_entries(
     let mut chunks = Vec::new();
 
     for (date, day_entries) in &by_date {
-        let day_chunks = chunk_day_entries(day_entries, project, agent, date, config);
+        let mut day_chunks = chunk_day_entries(day_entries, project, agent, date, config);
+        if let Some(frontmatter) = frontmatter.as_ref() {
+            for chunk in &mut day_chunks {
+                apply_frontmatter(chunk, frontmatter);
+            }
+        }
         chunks.extend(day_chunks);
     }
 
@@ -198,6 +279,13 @@ fn chunk_day_entries(
             date: date.to_string(),
             session_id,
             kind,
+            run_id: None,
+            prompt_id: None,
+            agent_model: None,
+            started_at: None,
+            completed_at: None,
+            token_usage: None,
+            findings_count: None,
             msg_range: (global_start, global_end),
             text,
             token_estimate,
@@ -982,6 +1070,30 @@ mod tests {
     }
 
     #[test]
+    fn test_chunk_entries_extracts_frontmatter_telemetry() {
+        let entries = vec![make_entry(
+            14,
+            30,
+            "assistant",
+            "---\nrun_id: mrbl-001\nprompt_id: api-redesign_20260327\nmodel: gpt-5.4\nstarted_at: 2026-03-27T10:00:00Z\ncompleted_at: 2026-03-27T10:01:00Z\ntoken_usage: 1234\nfindings_count: 4\n---\n## Report\nContent here",
+        )];
+
+        let chunks = chunk_entries(&entries, "proj", "claude", &ChunkerConfig::default());
+        assert_eq!(chunks.len(), 1);
+
+        let chunk = &chunks[0];
+        assert_eq!(chunk.run_id.as_deref(), Some("mrbl-001"));
+        assert_eq!(chunk.prompt_id.as_deref(), Some("api-redesign_20260327"));
+        assert_eq!(chunk.agent_model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(chunk.started_at.as_deref(), Some("2026-03-27T10:00:00Z"));
+        assert_eq!(chunk.completed_at.as_deref(), Some("2026-03-27T10:01:00Z"));
+        assert_eq!(chunk.token_usage, Some(1234));
+        assert_eq!(chunk.findings_count, Some(4));
+        assert!(chunk.text.contains("## Report"));
+        assert!(!chunk.text.contains("run_id: mrbl-001"));
+    }
+
+    #[test]
     fn test_write_chunks_to_dir() {
         let tmp = std::env::temp_dir().join("ai-ctx-chunker-test");
         let _ = fs::remove_dir_all(&tmp);
@@ -994,6 +1106,13 @@ mod tests {
                 date: "2026-01-22".to_string(),
                 session_id: "s1".to_string(),
                 kind: crate::store::Kind::Conversations,
+                run_id: None,
+                prompt_id: None,
+                agent_model: None,
+                started_at: None,
+                completed_at: None,
+                token_usage: None,
+                findings_count: None,
                 msg_range: (0, 5),
                 text: "chunk one content".to_string(),
                 token_estimate: 4,
@@ -1006,6 +1125,13 @@ mod tests {
                 date: "2026-01-22".to_string(),
                 session_id: "s1".to_string(),
                 kind: crate::store::Kind::Conversations,
+                run_id: None,
+                prompt_id: None,
+                agent_model: None,
+                started_at: None,
+                completed_at: None,
+                token_usage: None,
+                findings_count: None,
                 msg_range: (3, 8),
                 text: "chunk two content".to_string(),
                 token_estimate: 4,
@@ -1081,6 +1207,13 @@ mod tests {
                 date: "2026-01-20".to_string(),
                 session_id: "s".to_string(),
                 kind: crate::store::Kind::Conversations,
+                run_id: None,
+                prompt_id: None,
+                agent_model: None,
+                started_at: None,
+                completed_at: None,
+                token_usage: None,
+                findings_count: None,
                 msg_range: (0, 5),
                 text: "x".repeat(100),
                 token_estimate: 25,
@@ -1093,6 +1226,13 @@ mod tests {
                 date: "2026-01-21".to_string(),
                 session_id: "s".to_string(),
                 kind: crate::store::Kind::Conversations,
+                run_id: None,
+                prompt_id: None,
+                agent_model: None,
+                started_at: None,
+                completed_at: None,
+                token_usage: None,
+                findings_count: None,
                 msg_range: (5, 10),
                 text: "y".repeat(200),
                 token_estimate: 50,
