@@ -1364,9 +1364,12 @@ mod tests {
 
     #[test]
     fn test_loctree_snapshot_missing_binary() {
+        let dir = unique_test_dir("loctree_missing_bin");
+        std::fs::create_dir_all(&dir).unwrap();
         // loct may or may not be on PATH -- either way this should not panic
-        let result = capture_loctree_snapshot(Path::new("/tmp")).unwrap();
+        let result = capture_loctree_snapshot(&dir).unwrap();
         let _ = result; // Just verify it doesn't error
+        cleanup(&dir);
     }
 
     // --- Config defaults ---
