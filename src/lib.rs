@@ -5,6 +5,7 @@
 pub mod chunker;
 pub mod dashboard;
 pub mod dashboard_server;
+pub mod frontmatter;
 pub mod init;
 pub mod intents;
 pub mod mcp;

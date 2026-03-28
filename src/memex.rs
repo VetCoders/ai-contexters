@@ -563,6 +563,13 @@ mod tests {
                 date: "2026-03-24".to_string(),
                 session_id: "sess-1".to_string(),
                 kind: crate::store::Kind::Conversations,
+                run_id: None,
+                prompt_id: None,
+                agent_model: None,
+                started_at: None,
+                completed_at: None,
+                token_usage: None,
+                findings_count: None,
             })
             .unwrap(),
         )
