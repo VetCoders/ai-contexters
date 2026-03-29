@@ -499,7 +499,10 @@ fn render_dashboard_html(payload: &DashboardPayload, title: &str) -> Result<Stri
     </header>
 
     <section class="controls">
-      <input id="ctx-search" type="search" placeholder="Fuzzy search in extracts..." autocomplete="off" />
+      <input id="ctx-search" type="search" placeholder="Fuzzy search… (Enter or pause to trigger)" autocomplete="off" />
+      <label class="live-toggle" title="Live search (search while typing)">
+        <input id="ctx-live" type="checkbox" /> <span>Live</span>
+      </label>
       <select id="ctx-project"><option value="">All projects</option></select>
       <select id="ctx-agent"><option value="">All agents/sources</option></select>
       <select id="ctx-kind"><option value="">All kinds</option></select>
@@ -726,9 +729,25 @@ body {
 
 .controls {
   display: grid;
-  grid-template-columns: minmax(320px, 2fr) repeat(3, minmax(150px, 1fr));
+  grid-template-columns: minmax(280px, 2fr) auto repeat(3, minmax(140px, 1fr));
   gap: 10px;
   margin-bottom: 12px;
+}
+
+.live-toggle {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+  font-size: 0.8rem;
+  color: var(--muted);
+  white-space: nowrap;
+  user-select: none;
+}
+
+.live-toggle input:checked + span {
+  color: var(--accent, #4fc3f7);
+  font-weight: 600;
 }
 
 .controls input,
@@ -1184,11 +1203,44 @@ const DASHBOARD_SCRIPT: &str = r#"
     runHooks('afterRender', rows);
   };
 
+  /* --- debounced search ------------------------------------------------- */
+  const DEBOUNCE_MS = 800;
+  let debounceTimer = null;
+  const liveCheckbox = document.getElementById('ctx-live');
+
+  const scheduleRefresh = () => {
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(refresh, DEBOUNCE_MS);
+  };
+
+  ui.search.addEventListener('input', () => {
+    if (liveCheckbox.checked) {
+      scheduleRefresh();              // live mode: 800 ms debounce
+    }
+    // non-live: wait for Enter or space (handled below)
+  });
+
+  ui.search.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      clearTimeout(debounceTimer);
+      refresh();
+    }
+    if (e.key === ' ' && !liveCheckbox.checked) {
+      // first space in non-live mode triggers immediate refresh
+      clearTimeout(debounceTimer);
+      setTimeout(refresh, 0);         // after the space char is inserted
+    }
+  });
+
+  // dropdowns always refresh immediately
   ['input', 'change'].forEach((eventName) => {
-    ui.search.addEventListener(eventName, refresh);
     ui.project.addEventListener(eventName, refresh);
     ui.agent.addEventListener(eventName, refresh);
     ui.kind.addEventListener(eventName, refresh);
+  });
+
+  liveCheckbox.addEventListener('change', () => {
+    if (liveCheckbox.checked) scheduleRefresh();
   });
 
   ui.copyPath.addEventListener('click', async () => {

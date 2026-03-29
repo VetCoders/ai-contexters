@@ -22,7 +22,6 @@ use std::path::{Path, PathBuf};
 use ai_contexters::chunker::{self, ChunkerConfig};
 use ai_contexters::dashboard::{self, DashboardConfig};
 use ai_contexters::dashboard_server::{self, DashboardServerConfig};
-use ai_contexters::init::{self, InitOptions};
 use ai_contexters::intents;
 use ai_contexters::memex::{self, MemexConfig};
 use ai_contexters::output::{self, OutputConfig, OutputFormat, OutputMode, ReportMetadata};
@@ -551,6 +550,29 @@ enum Commands {
         no_gitignore: bool,
     },
 
+    /// Ad-hoc terminal fuzzy search across the aicx store (no dashboard needed)
+    Search {
+        /// Search query string
+        query: String,
+
+        /// Project filter (org/repo substring, case-insensitive)
+        #[arg(short, long)]
+        project: Option<String>,
+
+        /// Hours to look back (0 = all time)
+        #[arg(short = 'H', long, default_value = "0")]
+        hours: u64,
+
+        /// Filter by date: single day (2026-03-28), range (2026-03-20..2026-03-28),
+        /// or open-ended (2026-03-20.. or ..2026-03-28)
+        #[arg(short, long)]
+        date: Option<String>,
+
+        /// Maximum results to return
+        #[arg(short, long, default_value = "10")]
+        limit: usize,
+    },
+
     /// Truthfully rebuild legacy contexts into canonical AICX store or salvage them under legacy-store
     Migrate {
         /// Dry run: show what would be moved without modifying files
@@ -756,38 +778,11 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Some(Commands::Init {
-            project,
-            agent,
-            model,
-            hours,
-            max_lines,
-            action,
-            agent_prompt,
-            agent_prompt_file,
-            user_only,
-            include_assistant: include_assistant_flag,
-            no_run,
-            no_confirm,
-            no_gitignore,
-        }) => {
-            let include_assistant = include_assistant_flag || !user_only;
-            let opts = InitOptions {
-                project,
-                agent,
-                model,
-                horizon_hours: hours,
-                max_lines,
-                include_assistant,
-                redact_secrets,
-                action,
-                agent_prompt,
-                agent_prompt_file,
-                no_run,
-                no_confirm,
-                no_gitignore,
-            };
-            init::run_init(opts)?;
+        Some(Commands::Init { .. }) => {
+            eprintln!("aicx init has been retired.");
+            eprintln!("Context initialisation is now handled by /vc-init inside Claude Code.");
+            eprintln!("See: https://vibecrafted.io/");
+            std::process::exit(0);
         }
         Some(Commands::Refs {
             hours,
@@ -861,6 +856,15 @@ fn main() -> Result<()> {
                     _ => ai_contexters::mcp::run_stdio().await,
                 }
             })?;
+        }
+        Some(Commands::Search {
+            query,
+            project,
+            hours,
+            date,
+            limit,
+        }) => {
+            run_search(&query, project.as_deref(), hours, date.as_deref(), limit)?;
         }
         Some(Commands::Migrate {
             dry_run,
@@ -1800,6 +1804,230 @@ fn is_noise_artifact(path: &std::path::Path) -> bool {
     }
 
     is_noise
+}
+
+/// Month names → number, supports English + Polish.
+fn month_number(s: &str) -> Option<u32> {
+    match s {
+        "january" | "jan" | "styczen" | "stycznia" | "styczeń" => Some(1),
+        "february" | "feb" | "luty" | "lutego" => Some(2),
+        "march" | "mar" | "marzec" | "marca" => Some(3),
+        "april" | "apr" | "kwiecien" | "kwietnia" | "kwiecień" => Some(4),
+        "may" | "maj" | "maja" => Some(5),
+        "june" | "jun" | "czerwiec" | "czerwca" => Some(6),
+        "july" | "jul" | "lipiec" | "lipca" => Some(7),
+        "august" | "aug" | "sierpien" | "sierpnia" | "sierpień" => Some(8),
+        "september" | "sep" | "wrzesien" | "września" | "wrzesień" => Some(9),
+        "october" | "oct" | "pazdziernik" | "października" | "październik" => Some(10),
+        "november" | "nov" | "listopad" | "listopada" => Some(11),
+        "december" | "dec" | "grudzien" | "grudnia" | "grudzień" => Some(12),
+        _ => None,
+    }
+}
+
+/// Extract inline date hints from query, returning (cleaned_query, Option<date_filter>).
+/// Recognises: "january 2026", "march 2026", "2026-03", "2026-01-15".
+fn extract_date_from_query(query: &str) -> (String, Option<String>) {
+    let words: Vec<&str> = query.split_whitespace().collect();
+    let lower: Vec<String> = words.iter().map(|w| w.to_lowercase()).collect();
+    let mut used = vec![false; words.len()];
+    let mut date_filter: Option<String> = None;
+
+    // Pattern 1: "<month> <year>" e.g. "january 2026"
+    for i in 0..words.len().saturating_sub(1) {
+        if let Some(m) = month_number(&lower[i]) {
+            if let Ok(y) = lower[i + 1].parse::<u32>() {
+                if (2020..=2099).contains(&y) {
+                    let days = days_in_month(y, m);
+                    let lo = format!("{y:04}-{m:02}-01");
+                    let hi = format!("{y:04}-{m:02}-{days:02}");
+                    date_filter = Some(format!("{lo}..{hi}"));
+                    used[i] = true;
+                    used[i + 1] = true;
+                }
+            }
+        }
+    }
+
+    // Pattern 2: "<year> <month>" e.g. "2026 january"
+    if date_filter.is_none() {
+        for i in 0..words.len().saturating_sub(1) {
+            if let Ok(y) = lower[i].parse::<u32>() {
+                if (2020..=2099).contains(&y) {
+                    if let Some(m) = month_number(&lower[i + 1]) {
+                        let days = days_in_month(y, m);
+                        let lo = format!("{y:04}-{m:02}-01");
+                        let hi = format!("{y:04}-{m:02}-{days:02}");
+                        date_filter = Some(format!("{lo}..{hi}"));
+                        used[i] = true;
+                        used[i + 1] = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // Pattern 3: YYYY-MM (no day) e.g. "2026-01"
+    if date_filter.is_none() {
+        let re_ym = regex::Regex::new(r"^(\d{4})-(\d{2})$").unwrap();
+        for (i, w) in lower.iter().enumerate() {
+            if let Some(caps) = re_ym.captures(w) {
+                let y: u32 = caps[1].parse().unwrap();
+                let m: u32 = caps[2].parse().unwrap();
+                if (1..=12).contains(&m) {
+                    let days = days_in_month(y, m);
+                    let lo = format!("{y:04}-{m:02}-01");
+                    let hi = format!("{y:04}-{m:02}-{days:02}");
+                    date_filter = Some(format!("{lo}..{hi}"));
+                    used[i] = true;
+                }
+            }
+        }
+    }
+
+    // Pattern 4: full ISO date YYYY-MM-DD → single day
+    if date_filter.is_none() {
+        let re_ymd = regex::Regex::new(r"^(\d{4}-\d{2}-\d{2})$").unwrap();
+        for (i, w) in lower.iter().enumerate() {
+            if re_ymd.is_match(w) {
+                date_filter = Some(w.clone());
+                used[i] = true;
+            }
+        }
+    }
+
+    let cleaned: Vec<&str> = words
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !used[*i])
+        .map(|(_, w)| *w)
+        .collect();
+
+    (cleaned.join(" "), date_filter)
+}
+
+fn days_in_month(year: u32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 30,
+    }
+}
+
+/// Parse a date filter string into (Option<start>, Option<end>) inclusive bounds.
+/// Formats: "2026-03-28", "2026-03-20..2026-03-28", "2026-03-20..", "..2026-03-28"
+fn parse_date_filter(s: &str) -> Result<(Option<String>, Option<String>)> {
+    if let Some((left, right)) = s.split_once("..") {
+        let lo = if left.is_empty() {
+            None
+        } else {
+            Some(left.to_string())
+        };
+        let hi = if right.is_empty() {
+            None
+        } else {
+            Some(right.to_string())
+        };
+        Ok((lo, hi))
+    } else {
+        // single day
+        Ok((Some(s.to_string()), Some(s.to_string())))
+    }
+}
+
+/// Ad-hoc terminal fuzzy search across the aicx store.
+fn run_search(
+    query: &str,
+    project: Option<&str>,
+    hours: u64,
+    date: Option<&str>,
+    limit: usize,
+) -> Result<()> {
+    // Extract inline date hints from query if no explicit --date given
+    let (effective_query, inline_date) = if date.is_none() {
+        extract_date_from_query(query)
+    } else {
+        (query.to_string(), None)
+    };
+    let effective_date = date.map(String::from).or(inline_date);
+    let search_query = if effective_date.is_some() && effective_query.is_empty() {
+        // date-only query: match everything, rely on date filter
+        "*".to_string()
+    } else if !effective_query.is_empty() {
+        effective_query
+    } else {
+        query.to_string()
+    };
+
+    let root = store::store_base_dir()?;
+    // Fetch more results pre-filter so date filtering has material to work with
+    let fetch_limit = if effective_date.is_some() {
+        limit.saturating_mul(5).max(50)
+    } else {
+        limit
+    };
+    let (results, scanned) = rank::fuzzy_search_store(&root, &search_query, fetch_limit, project)?;
+
+    if results.is_empty() {
+        eprintln!(
+            "No matches for {:?} (scanned {} chunks).",
+            query, scanned
+        );
+        return Ok(());
+    }
+
+    // Apply date filter (day granularity) — takes priority over hours
+    let results: Vec<_> = if let Some(ref d) = effective_date {
+        let (lo, hi) = parse_date_filter(d)?;
+        results
+            .into_iter()
+            .filter(|r| {
+                lo.as_ref().is_none_or(|lo| r.date.as_str() >= lo.as_str())
+                    && hi.as_ref().is_none_or(|hi| r.date.as_str() <= hi.as_str())
+            })
+            .collect()
+    } else if hours > 0 {
+        let cutoff = chrono::Utc::now() - chrono::Duration::hours(hours as i64);
+        let cutoff_date = cutoff.format("%Y-%m-%d").to_string();
+        results
+            .into_iter()
+            .filter(|r| r.date >= cutoff_date)
+            .collect()
+    } else {
+        results
+    };
+    // Truncate to requested limit after date filtering
+    let results: Vec<_> = results.into_iter().take(limit).collect();
+
+    let stdout = io::stdout();
+    let mut out = io::BufWriter::new(stdout.lock());
+    for r in &results {
+        let _ = writeln!(
+            out,
+            "[{}/10 {}] {} | {} | {} | {}",
+            r.score, r.label, r.project, r.agent, r.date, r.file
+        );
+        for line in &r.matched_lines {
+            let _ = writeln!(out, "  > {}", line);
+        }
+    }
+    let _ = out.flush();
+    if io::stderr().is_terminal() {
+        eprintln!(
+            "\n{} result(s) from {} scanned chunks.",
+            results.len(),
+            scanned
+        );
+    }
+
+    Ok(())
 }
 
 /// List context files from the global store, filtered by recency.

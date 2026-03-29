@@ -322,9 +322,59 @@ pub fn fuzzy_search_store(
     }
 
     results.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| b.date.cmp(&a.date)));
-    results.truncate(limit);
 
-    Ok((results, total_scanned))
+    // --- Dedup layer --------------------------------------------------------
+    // 1. Content-hash dedup: remove exact file duplicates (e.g. typo project dirs)
+    let mut seen_hashes = std::collections::HashSet::new();
+    results.retain(|r| {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        r.matched_lines.hash(&mut h);
+        r.file.hash(&mut h);
+        seen_hashes.insert(h.finish())
+    });
+
+    // 2. Session-sibling dedup: from N chunks of the same session, keep only the
+    //    highest-scoring one.  Session ID = filename prefix before the chunk seq
+    //    number, e.g. "2026_0227_codex_019c9c80-cd4" from "_003.md".
+    let mut best_per_session: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for (idx, r) in results.iter().enumerate() {
+        let session_key = extract_session_key(&r.file);
+        best_per_session
+            .entry(session_key)
+            .and_modify(|prev| {
+                if r.score > results[*prev].score {
+                    *prev = idx;
+                }
+            })
+            .or_insert(idx);
+    }
+    let keep: std::collections::HashSet<usize> = best_per_session.values().copied().collect();
+    let mut deduped = Vec::with_capacity(keep.len());
+    for (idx, r) in results.into_iter().enumerate() {
+        if keep.contains(&idx) {
+            deduped.push(r);
+        }
+    }
+    deduped.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| b.date.cmp(&a.date)));
+    deduped.truncate(limit);
+
+    Ok((deduped, total_scanned))
+}
+
+/// Extract session key from chunk filename, stripping the trailing `_NNN` sequence.
+/// "2026_0227_codex_019c9c80-cd4_003.md" → "2026_0227_codex_019c9c80-cd4"
+fn extract_session_key(filename: &str) -> String {
+    let stem = filename.strip_suffix(".md").unwrap_or(filename);
+    // Strip trailing _NNN chunk sequence
+    if let Some(pos) = stem.rfind('_') {
+        let suffix = &stem[pos + 1..];
+        if suffix.len() <= 3 && suffix.chars().all(|c| c.is_ascii_digit()) {
+            return stem[..pos].to_string();
+        }
+    }
+    stem.to_string()
 }
 
 /// Score a chunk file's content quality.
