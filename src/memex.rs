@@ -562,6 +562,7 @@ mod tests {
                 agent: "claude".to_string(),
                 date: "2026-03-24".to_string(),
                 session_id: "sess-1".to_string(),
+                cwd: None,
                 kind: crate::store::Kind::Conversations,
                 run_id: None,
                 prompt_id: None,
