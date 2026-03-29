@@ -1,7 +1,7 @@
 //! AI Contexters dashboard generator.
 //!
 //! Builds a static HTML dashboard for daily browsing of raw extracted notes
-//! from the AICX store (`~/.aicx` by default).
+//! from the ai-contexters store (`~/.ai-contexters` by default).
 //!
 //! Layout: Search -> List -> Content
 //!
@@ -28,7 +28,7 @@ const MAX_DETAIL_CHARS: usize = 32_000;
 /// Configuration for dashboard generation.
 #[derive(Debug, Clone)]
 pub struct DashboardConfig {
-    /// Store root directory (`~/.aicx`).
+    /// Store root directory (`~/.ai-contexters`).
     pub store_root: PathBuf,
     /// HTML document title.
     pub title: String,
@@ -66,37 +66,37 @@ pub struct DashboardStats {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct DashboardPayload {
-    pub generated_at: String,
-    pub store_root: String,
-    pub stats: DashboardStats,
-    pub assumptions: Vec<String>,
-    pub projects: Vec<String>,
-    pub agents: Vec<String>,
-    pub kinds: Vec<String>,
-    pub records: Vec<DashboardRecord>,
+struct DashboardPayload {
+    generated_at: String,
+    store_root: String,
+    stats: DashboardStats,
+    assumptions: Vec<String>,
+    projects: Vec<String>,
+    agents: Vec<String>,
+    kinds: Vec<String>,
+    records: Vec<DashboardRecord>,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct DashboardRecord {
-    pub id: usize,
-    pub project: String,
-    pub agent: String,
-    pub date: String,
-    pub time: String,
-    pub kind: String,
-    pub extension: String,
-    pub file_name: String,
-    pub relative_path: String,
-    pub absolute_path: String,
-    pub bytes: u64,
-    pub size_human: String,
-    pub modified_utc: String,
-    pub sort_ts: i64,
-    pub entry_count: Option<usize>,
-    pub preview: String,
-    pub search_blob: String,
-    pub detail_text: String,
+struct DashboardRecord {
+    id: usize,
+    project: String,
+    agent: String,
+    date: String,
+    time: String,
+    kind: String,
+    extension: String,
+    file_name: String,
+    relative_path: String,
+    absolute_path: String,
+    bytes: u64,
+    size_human: String,
+    modified_utc: String,
+    sort_ts: i64,
+    entry_count: Option<usize>,
+    preview: String,
+    search_blob: String,
+    detail_text: String,
 }
 
 #[derive(Debug, Clone)]
@@ -114,114 +114,6 @@ pub fn build_dashboard(config: &DashboardConfig) -> Result<DashboardArtifact> {
         stats: scan.payload.stats.clone(),
         assumptions: scan.payload.assumptions.clone(),
     })
-}
-
-/// Scan the store and return the raw payload (for server mode).
-pub fn scan_store_payload(store_root: &Path, preview_chars: usize) -> Result<DashboardPayload> {
-    let scan = scan_store(store_root, preview_chars)?;
-    Ok(scan.payload)
-}
-
-/// Build a static HTML artifact from an already-scanned payload.
-///
-/// Reuses `payload` instead of scanning the store again — designed for server
-/// mode where `scan_store_payload` has already run.
-pub fn build_dashboard_from_payload(
-    payload: &DashboardPayload,
-    title: &str,
-) -> Result<DashboardArtifact> {
-    let html = render_dashboard_html(payload, title)?;
-    Ok(DashboardArtifact {
-        html,
-        stats: payload.stats.clone(),
-        assumptions: payload.assumptions.clone(),
-    })
-}
-
-/// Render a lightweight HTML shell for server mode.
-///
-/// No data is embedded — the JavaScript fetches everything through API endpoints.
-pub fn render_server_shell_html(title: &str) -> String {
-    format!(
-        r#"<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>{}</title>
-  <style>{}
-.regen-btn {{ background: var(--panel); border: 1px solid var(--line); color: var(--accent); border-radius: 8px; padding: 4px 10px; font-size: 1.1rem; cursor: pointer; min-width: 36px; }}
-.regen-btn:hover {{ background: var(--panel-2); }}
-.regen-btn:disabled {{ opacity: 0.5; cursor: wait; }}
-  </style>
-</head>
-<body>
-  <div class="app-shell">
-    <header class="app-header">
-      <div>
-        <h1>AI Context Browser</h1>
-        <p class="meta">Search -> List -> Content | server mode</p>
-        <p class="meta" id="ctx-gen-info">Loading…</p>
-      </div>
-      <div class="header-stats">
-        <div class="stat"><strong id="ctx-stat-files">-</strong><span>files</span></div>
-        <div class="stat"><strong id="ctx-stat-projects">-</strong><span>projects</span></div>
-        <div class="stat"><strong id="ctx-stat-days">-</strong><span>days</span></div>
-      </div>
-    </header>
-
-    <section class="controls">
-      <div class="search-row">
-        <input id="ctx-search" type="search" placeholder="Fuzzy search… (Enter or pause to trigger)" autocomplete="off" />
-        <label class="live-toggle" title="Live search (search while typing)">
-          <input id="ctx-live" type="checkbox" /> <span>Live</span>
-        </label>
-        <button id="ctx-regenerate" type="button" class="regen-btn" title="Regenerate dashboard data">&#8635;</button>
-      </div>
-      <div class="filter-row">
-        <select id="ctx-project"><option value="">All projects</option></select>
-        <select id="ctx-agent"><option value="">All agents/sources</option></select>
-        <select id="ctx-kind"><option value="">All kinds</option></select>
-      </div>
-    </section>
-
-    <section class="layout" id="ctx-layout">
-      <aside class="list-pane">
-        <div id="ctx-summary" class="summary"></div>
-        <div id="ctx-list" class="result-list"></div>
-      </aside>
-
-      <div class="resize-handle" id="ctx-resize-handle" title="Drag to resize panels"></div>
-
-      <article class="detail-pane">
-        <div class="detail-head">
-          <div>
-            <h2 id="ctx-detail-title">Select a result</h2>
-            <p id="ctx-detail-meta" class="detail-meta"></p>
-          </div>
-          <button id="ctx-copy-path" type="button">Copy Path</button>
-        </div>
-
-        <p id="ctx-detail-path" class="detail-path"></p>
-        <p id="ctx-detail-preview" class="detail-preview"></p>
-        <pre id="ctx-detail-content" class="detail-content">Use search or filters to pick a note.</pre>
-
-        <details class="assumptions" open>
-          <summary>Assumptions</summary>
-          <ul id="ctx-assumptions"></ul>
-        </details>
-      </article>
-    </section>
-  </div>
-
-  <script>{}</script>
-</body>
-</html>
-"#,
-        html_escape(title),
-        DASHBOARD_CSS,
-        DASHBOARD_SERVER_SCRIPT
-    )
 }
 
 fn scan_store(store_root: &Path, preview_chars: usize) -> Result<ScanResult> {
@@ -607,26 +499,20 @@ fn render_dashboard_html(payload: &DashboardPayload, title: &str) -> Result<Stri
     </header>
 
     <section class="controls">
-      <div class="search-row">
-        <input id="ctx-search" type="search" placeholder="Fuzzy search… (Enter or pause to trigger)" autocomplete="off" />
-        <label class="live-toggle" title="Live search (search while typing)">
-          <input id="ctx-live" type="checkbox" /> <span>Live</span>
-        </label>
-      </div>
-      <div class="filter-row">
-        <select id="ctx-project"><option value="">All projects</option></select>
-        <select id="ctx-agent"><option value="">All agents/sources</option></select>
-        <select id="ctx-kind"><option value="">All kinds</option></select>
-      </div>
+      <input id="ctx-search" type="search" placeholder="Fuzzy search… (Enter or pause to trigger)" autocomplete="off" />
+      <label class="live-toggle" title="Live search (search while typing)">
+        <input id="ctx-live" type="checkbox" /> <span>Live</span>
+      </label>
+      <select id="ctx-project"><option value="">All projects</option></select>
+      <select id="ctx-agent"><option value="">All agents/sources</option></select>
+      <select id="ctx-kind"><option value="">All kinds</option></select>
     </section>
 
-    <section class="layout" id="ctx-layout">
+    <section class="layout">
       <aside class="list-pane">
         <div id="ctx-summary" class="summary"></div>
         <div id="ctx-list" class="result-list"></div>
       </aside>
-
-      <div class="resize-handle" id="ctx-resize-handle" title="Drag to resize panels"></div>
 
       <article class="detail-pane">
         <div class="detail-head">
@@ -842,44 +728,21 @@ body {
 }
 
 .controls {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  margin-bottom: 12px;
-}
-
-.search-row {
-  display: flex;
-  gap: 10px;
-  align-items: center;
-}
-
-.search-row input[type="search"] {
-  flex: 1;
-  min-width: 0;
-}
-
-.filter-row {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: minmax(280px, 2fr) auto repeat(3, minmax(140px, 1fr));
   gap: 10px;
+  margin-bottom: 12px;
 }
 
 .live-toggle {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 5px;
   cursor: pointer;
-  font-size: 0.82rem;
+  font-size: 0.8rem;
   color: var(--muted);
   white-space: nowrap;
   user-select: none;
-  min-width: 60px;
-  padding: 8px 12px;
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  background: var(--panel);
-  flex-shrink: 0;
 }
 
 .live-toggle input:checked + span {
@@ -887,7 +750,7 @@ body {
   font-weight: 600;
 }
 
-.controls input[type="search"],
+.controls input,
 .controls select {
   width: 100%;
   border: 1px solid var(--line);
@@ -896,54 +759,13 @@ body {
   color: var(--text);
   padding: 11px 12px;
   font-size: 0.98rem;
-  transition: border-color 0.15s;
-}
-
-.controls input[type="search"]:focus,
-.controls select:focus {
-  outline: none;
-  border-color: var(--accent);
-  box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.15);
 }
 
 .layout {
   display: grid;
-  grid-template-columns: minmax(250px, 0.95fr) 6px minmax(300px, 1.45fr);
-  gap: 0;
+  grid-template-columns: minmax(330px, 0.95fr) minmax(480px, 1.45fr);
+  gap: 12px;
   min-height: calc(100vh - 210px);
-}
-
-.resize-handle {
-  width: 6px;
-  cursor: col-resize;
-  position: relative;
-  z-index: 10;
-  background: transparent;
-  transition: background 0.15s;
-}
-
-.resize-handle::after {
-  content: '';
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
-  width: 2px;
-  height: 48px;
-  border-radius: 2px;
-  background: var(--line);
-  transition: background 0.15s, height 0.15s;
-}
-
-.resize-handle:hover,
-.resize-handle.dragging {
-  background: rgba(56, 189, 248, 0.06);
-}
-
-.resize-handle:hover::after,
-.resize-handle.dragging::after {
-  background: var(--accent);
-  height: 72px;
 }
 
 .list-pane,
@@ -952,16 +774,6 @@ body {
   border-radius: 12px;
   background: linear-gradient(180deg, var(--panel), var(--panel-2));
   overflow: hidden;
-  min-width: 0;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
-}
-
-.list-pane {
-  margin-right: 3px;
-}
-
-.detail-pane {
-  margin-left: 3px;
 }
 
 .summary {
@@ -984,7 +796,6 @@ body {
   color: inherit;
   padding: 11px 13px;
   cursor: pointer;
-  transition: background 0.12s;
 }
 
 .result-item:hover {
@@ -1012,14 +823,6 @@ body {
 .result-name {
   margin-top: 6px;
   font-size: 0.88rem;
-}
-
-.result-preview {
-  margin-top: 6px;
-  color: var(--muted);
-  font-size: 0.8rem;
-  line-height: 1.35;
-  white-space: pre-wrap;
 }
 
 .detail-pane {
@@ -1086,22 +889,6 @@ body {
   min-height: 280px;
 }
 
-mark.hl {
-  background: #facc15;
-  color: #0a0f19;
-  border-radius: 2px;
-  padding: 0 2px;
-  font-style: normal;
-}
-
-mark.hl-fuzzy {
-  background: #fb923c;
-  color: #0a0f19;
-  border-radius: 2px;
-  padding: 0 2px;
-  font-style: normal;
-}
-
 .assumptions {
   margin: 0 14px 14px;
   color: var(--muted);
@@ -1118,22 +905,13 @@ mark.hl-fuzzy {
 }
 
 @media (max-width: 1020px) {
-  .filter-row {
+  .controls {
     grid-template-columns: 1fr;
   }
 
   .layout {
-    grid-template-columns: 1fr !important;
+    grid-template-columns: 1fr;
     min-height: 0;
-  }
-
-  .resize-handle {
-    display: none;
-  }
-
-  .list-pane,
-  .detail-pane {
-    margin: 0;
   }
 
   .result-list {
@@ -1187,7 +965,6 @@ const DASHBOARD_SCRIPT: &str = r#"
 
   const state = {
     query: '',
-    queryRaw: '',
     project: '',
     agent: '',
     kind: '',
@@ -1197,23 +974,10 @@ const DASHBOARD_SCRIPT: &str = r#"
     selectedRecord: null,
   };
 
-  const normalizeText = (text) => {
-    const map = {
-      '\u0104':'A','\u0105':'a','\u0106':'C','\u0107':'c',
-      '\u0118':'E','\u0119':'e','\u0141':'L','\u0142':'l',
-      '\u0143':'N','\u0144':'n','\u00D3':'O','\u00F3':'o',
-      '\u015A':'S','\u015B':'s','\u0179':'Z','\u017A':'z',
-      '\u017B':'Z','\u017C':'z'
-    };
-    return (text || '')
-      .toString()
-      .replace(/[\u0104\u0105\u0106\u0107\u0118\u0119\u0141\u0142\u0143\u0144\u00D3\u00F3\u015A\u015B\u0179\u017A\u017B\u017C]/g,
-        function(c) { return map[c] || c; })
-      .toLowerCase();
-  };
-
   const normalize = (value) =>
-    normalizeText(value)
+    (value || '')
+      .toString()
+      .toLowerCase()
       .normalize('NFKD')
       .replace(/[\u0300-\u036f]/g, '')
       .replace(/\s+/g, ' ')
@@ -1324,62 +1088,6 @@ const DASHBOARD_SCRIPT: &str = r#"
     }, value);
   };
 
-  const escapeHtml = (text) => {
-    const div = document.createElement('div');
-    div.appendChild(document.createTextNode(text));
-    return div.innerHTML;
-  };
-
-  const escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-
-  const highlightQuery = () => state.queryRaw || state.query;
-
-  const highlightTerms = (text, query) => {
-    if (!query || !text) return escapeHtml(text || '');
-    const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
-    if (!terms.length) return escapeHtml(text);
-
-    const kinds = new Array(text.length).fill('');
-    const markRange = (start, len, cls, overwrite) => {
-      const end = Math.min(text.length, start + len);
-      for (let i = start; i < end; i += 1) {
-        if (overwrite || !kinds[i]) kinds[i] = cls;
-      }
-    };
-
-    terms.forEach((term) => {
-      const re = new RegExp(escapeRegex(term), 'gi');
-      let match;
-      while ((match = re.exec(text)) !== null) {
-        if (!match[0]) break;
-        markRange(match.index, match[0].length, 'hl', true);
-      }
-    });
-
-    const normalizedText = normalizeText(text);
-    terms.map(normalizeText).filter(Boolean).forEach((term) => {
-      let searchFrom = 0;
-      while (searchFrom < normalizedText.length) {
-        const idx = normalizedText.indexOf(term, searchFrom);
-        if (idx === -1) break;
-        markRange(idx, term.length, 'hl-fuzzy', false);
-        searchFrom = idx + Math.max(term.length, 1);
-      }
-    });
-
-    let html = '';
-    let start = 0;
-    while (start < text.length) {
-      const cls = kinds[start];
-      let end = start + 1;
-      while (end < text.length && kinds[end] === cls) end += 1;
-      const chunk = escapeHtml(text.slice(start, end));
-      html += cls ? '<mark class="' + cls + '">' + chunk + '</mark>' : chunk;
-      start = end;
-    }
-    return html;
-  };
-
   const renderDetail = (record, score) => {
     state.selectedRecord = record || null;
 
@@ -1392,22 +1100,11 @@ const DASHBOARD_SCRIPT: &str = r#"
       return;
     }
 
-    const detailTitle = record.file_name || '(unnamed file)';
-    const detailMeta = `${record.project || 'unknown'} | ${record.agent || 'unknown'} | ${record.kind || 'unknown'} | score ${Math.round(Number(score || 0) * 100)}/100`;
-    const detailPath = record.absolute_path || record.relative_path || '';
-    ui.detailTitle.innerHTML = highlightTerms(detailTitle, highlightQuery());
-    ui.detailMeta.innerHTML = highlightTerms(detailMeta, highlightQuery());
-    ui.detailPath.innerHTML = highlightTerms(detailPath, highlightQuery());
-    ui.detailPreview.innerHTML = highlightTerms(record.preview || '', highlightQuery());
-    ui.detailContent.innerHTML =
-      highlightTerms(record.detail_text || record.preview || '(no content)', highlightQuery());
-  };
-
-  const mkBadge = (txt) => {
-    const node = document.createElement('span');
-    node.className = 'badge';
-    node.innerHTML = highlightTerms(String(txt || ''), highlightQuery());
-    return node;
+    ui.detailTitle.textContent = record.file_name || '(unnamed file)';
+    ui.detailMeta.textContent = `${record.project || 'unknown'} | ${record.agent || 'unknown'} | ${record.kind || 'unknown'} | score ${Number(score || 0).toFixed(2)}`;
+    ui.detailPath.textContent = record.absolute_path || record.relative_path || '';
+    ui.detailPreview.textContent = record.preview || '';
+    ui.detailContent.textContent = record.detail_text || record.preview || '(no content)';
   };
 
   const renderList = (rows) => {
@@ -1436,25 +1133,25 @@ const DASHBOARD_SCRIPT: &str = r#"
       const top = document.createElement('div');
       top.className = 'result-top';
 
+      const mkBadge = (txt) => {
+        const node = document.createElement('span');
+        node.className = 'badge';
+        node.textContent = txt;
+        return node;
+      };
+
       top.appendChild(mkBadge(record.project || 'project'));
       top.appendChild(mkBadge(record.agent || 'agent'));
       top.appendChild(mkBadge(record.kind || 'kind'));
       top.appendChild(mkBadge(record.date || 'date'));
-      top.appendChild(mkBadge(`${Math.round(Number(score) * 100)}/100`));
+      top.appendChild(mkBadge(`score ${Number(score).toFixed(2)}`));
 
       const name = document.createElement('div');
       name.className = 'result-name';
-      const nameText = `${record.file_name || '(unnamed)'} • ${record.size_human || ''}`;
-      name.innerHTML = highlightTerms(nameText, highlightQuery());
+      name.textContent = `${record.file_name || '(unnamed)'} • ${record.size_human || ''}`;
 
       item.appendChild(top);
       item.appendChild(name);
-      if (state.query && record.preview) {
-        const preview = document.createElement('div');
-        preview.className = 'result-preview';
-        preview.innerHTML = highlightTerms(record.preview, highlightQuery());
-        item.appendChild(preview);
-      }
 
       item.addEventListener('click', () => {
         state.selectedId = record.id;
@@ -1473,7 +1170,6 @@ const DASHBOARD_SCRIPT: &str = r#"
   };
 
   const refresh = () => {
-    state.queryRaw = ui.search.value || '';
     state.query = normalize(ui.search.value);
     state.project = ui.project.value;
     state.agent = ui.agent.value;
@@ -1529,6 +1225,11 @@ const DASHBOARD_SCRIPT: &str = r#"
       clearTimeout(debounceTimer);
       refresh();
     }
+    if (e.key === ' ' && !liveCheckbox.checked) {
+      // first space in non-live mode triggers immediate refresh
+      clearTimeout(debounceTimer);
+      setTimeout(refresh, 0);         // after the space char is inserted
+    }
   });
 
   // dropdowns always refresh immediately
@@ -1552,53 +1253,6 @@ const DASHBOARD_SCRIPT: &str = r#"
     }
   });
 
-  /* --- resizable panels ------------------------------------------------ */
-  const resizeHandle = document.getElementById('ctx-resize-handle');
-  const layoutEl = document.getElementById('ctx-layout');
-
-  if (resizeHandle && layoutEl) {
-    const STORAGE_KEY = 'aicx-split-ratio';
-    const MIN_LIST = 250;
-    const MIN_DETAIL = 300;
-
-    const saved = localStorage.getItem(STORAGE_KEY);
-    if (saved) {
-      const ratio = parseFloat(saved);
-      if (ratio > 0 && ratio < 1) {
-        layoutEl.style.gridTemplateColumns = `${ratio}fr 6px ${1 - ratio}fr`;
-      }
-    }
-
-    let dragging = false;
-
-    resizeHandle.addEventListener('mousedown', (e) => {
-      e.preventDefault();
-      dragging = true;
-      resizeHandle.classList.add('dragging');
-      document.body.style.cursor = 'col-resize';
-      document.body.style.userSelect = 'none';
-    });
-
-    document.addEventListener('mousemove', (e) => {
-      if (!dragging) return;
-      const rect = layoutEl.getBoundingClientRect();
-      const x = e.clientX - rect.left;
-      const total = rect.width - 6;
-      const listW = Math.max(MIN_LIST, Math.min(x, total - MIN_DETAIL));
-      const ratio = listW / total;
-      layoutEl.style.gridTemplateColumns = `${ratio}fr 6px ${1 - ratio}fr`;
-      localStorage.setItem(STORAGE_KEY, ratio.toFixed(4));
-    });
-
-    document.addEventListener('mouseup', () => {
-      if (!dragging) return;
-      dragging = false;
-      resizeHandle.classList.remove('dragging');
-      document.body.style.cursor = '';
-      document.body.style.userSelect = '';
-    });
-  }
-
   window.AIContextersDashboard = {
     version: '4.0.0',
     payload,
@@ -1612,396 +1266,6 @@ const DASHBOARD_SCRIPT: &str = r#"
   };
 
   refresh();
-})();
-"#;
-
-/// JavaScript for the server-mode shell — all data fetched via API.
-const DASHBOARD_SERVER_SCRIPT: &str = r#"
-(() => {
-  const ui = {
-    search: document.getElementById('ctx-search'),
-    project: document.getElementById('ctx-project'),
-    agent: document.getElementById('ctx-agent'),
-    kind: document.getElementById('ctx-kind'),
-    summary: document.getElementById('ctx-summary'),
-    list: document.getElementById('ctx-list'),
-    detailTitle: document.getElementById('ctx-detail-title'),
-    detailMeta: document.getElementById('ctx-detail-meta'),
-    detailPath: document.getElementById('ctx-detail-path'),
-    detailPreview: document.getElementById('ctx-detail-preview'),
-    detailContent: document.getElementById('ctx-detail-content'),
-    assumptions: document.getElementById('ctx-assumptions'),
-    copyPath: document.getElementById('ctx-copy-path'),
-    genInfo: document.getElementById('ctx-gen-info'),
-    statFiles: document.getElementById('ctx-stat-files'),
-    statProjects: document.getElementById('ctx-stat-projects'),
-    statDays: document.getElementById('ctx-stat-days'),
-    regenerateBtn: document.getElementById('ctx-regenerate'),
-  };
-
-  const hooks = { beforeRender: [], afterRender: [], onSelect: [] };
-
-  const state = {
-    query: '',
-    project: '',
-    agent: '',
-    kind: '',
-    limit: 350,
-    selectedId: null,
-    rows: [],
-    selectedRecord: null,
-    browseRecords: [],
-    mode: 'browse',
-  };
-
-  const fillSelect = (node, values) => {
-    const current = node.value;
-    while (node.options.length > 1) node.remove(1);
-    values.forEach((v) => {
-      const o = document.createElement('option');
-      o.value = v; o.textContent = v;
-      node.appendChild(o);
-    });
-    if (current) node.value = current;
-  };
-
-  const runHooks = (name, value) => {
-    const list = hooks[name] || [];
-    return list.reduce((acc, fn) => {
-      try { const m = fn(acc, null, state); return m === undefined ? acc : m; }
-      catch (_) { return acc; }
-    }, value);
-  };
-
-  const escapeHtml = (text) => {
-    const div = document.createElement('div');
-    div.appendChild(document.createTextNode(text));
-    return div.innerHTML;
-  };
-
-  const normalizeText = (text) => {
-    const map = {
-      '\u0104':'A','\u0105':'a','\u0106':'C','\u0107':'c',
-      '\u0118':'E','\u0119':'e','\u0141':'L','\u0142':'l',
-      '\u0143':'N','\u0144':'n','\u00D3':'O','\u00F3':'o',
-      '\u015A':'S','\u015B':'s','\u0179':'Z','\u017A':'z',
-      '\u017B':'Z','\u017C':'z'
-    };
-    return text.replace(/[\u0104\u0105\u0106\u0107\u0118\u0119\u0141\u0142\u0143\u0144\u00D3\u00F3\u015A\u015B\u0179\u017A\u017B\u017C]/g,
-      function(c) { return map[c] || c; }).toLowerCase();
-  };
-
-  const escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-
-  const highlightTerms = (text, query) => {
-    if (!query || !text) return escapeHtml(text || '');
-    const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
-    if (!terms.length) return escapeHtml(text);
-
-    const kinds = new Array(text.length).fill('');
-    const markRange = (start, len, cls, overwrite) => {
-      const end = Math.min(text.length, start + len);
-      for (let i = start; i < end; i += 1) {
-        if (overwrite || !kinds[i]) kinds[i] = cls;
-      }
-    };
-
-    terms.forEach(function(term) {
-      const re = new RegExp(escapeRegex(term), 'gi');
-      let match;
-      while ((match = re.exec(text)) !== null) {
-        if (!match[0]) break;
-        markRange(match.index, match[0].length, 'hl', true);
-      }
-    });
-
-    const normalizedText = normalizeText(text);
-    terms.map(normalizeText).filter(Boolean).forEach(function(term) {
-      let searchFrom = 0;
-      while (searchFrom < normalizedText.length) {
-        const idx = normalizedText.indexOf(term, searchFrom);
-        if (idx === -1) break;
-        markRange(idx, term.length, 'hl-fuzzy', false);
-        searchFrom = idx + Math.max(term.length, 1);
-      }
-    });
-
-    let html = '';
-    let start = 0;
-    while (start < text.length) {
-      const cls = kinds[start];
-      let end = start + 1;
-      while (end < text.length && kinds[end] === cls) end += 1;
-      const chunk = escapeHtml(text.slice(start, end));
-      html += cls ? '<mark class="' + cls + '">' + chunk + '</mark>' : chunk;
-      start = end;
-    }
-    return html;
-  };
-
-  const renderDetail = (record, score) => {
-    state.selectedRecord = record || null;
-    if (!record) {
-      ui.detailTitle.textContent = 'No result selected';
-      ui.detailMeta.textContent = '';
-      ui.detailPath.textContent = '';
-      ui.detailPreview.textContent = '';
-      ui.detailContent.textContent = 'Use search or filters to pick a note.';
-      return;
-    }
-    const detailTitle = record.file_name || record.file || '(unnamed)';
-    const scoreTxt = typeof score === 'number' && score > 0 ? 'score ' + score + '/100' : '';
-    const detailMeta = [record.project, record.agent, record.kind, scoreTxt].filter(Boolean).join(' | ');
-    const detailPath = record.absolute_path || record.path || record.relative_path || '';
-    ui.detailTitle.innerHTML = highlightTerms(detailTitle, state.query);
-    ui.detailMeta.innerHTML = highlightTerms(detailMeta, state.query);
-    ui.detailPath.innerHTML = highlightTerms(detailPath, state.query);
-    ui.detailPreview.innerHTML = highlightTerms(record.preview || record.excerpt || '', state.query);
-    if (record._detail_loaded) {
-      ui.detailContent.innerHTML = highlightTerms(record._detail_text || record.preview || '(no content)', state.query);
-    } else if (record.id !== undefined) {
-      ui.detailContent.textContent = 'Loading\u2026';
-      fetch('/api/detail?id=' + record.id)
-        .then(function(r) { return r.json(); })
-        .then(function(data) {
-          if (data.ok) {
-            record._detail_loaded = true;
-            record._detail_text = data.detail_text;
-            if (state.selectedRecord === record) {
-              ui.detailContent.innerHTML = highlightTerms(data.detail_text || '(no content)', state.query);
-            }
-          } else {
-            ui.detailContent.innerHTML = highlightTerms(record.preview || '(no content)', state.query);
-          }
-        })
-        .catch(function() {
-          ui.detailContent.innerHTML = highlightTerms(record.preview || '(detail fetch failed)', state.query);
-        });
-    } else {
-      ui.detailContent.innerHTML = highlightTerms(
-        record.matched_lines ? record.matched_lines.join('\n---\n') : (record.excerpt || '(no content)'),
-        state.query
-      );
-    }
-  };
-
-  const mkBadge = (txt) => {
-    const n = document.createElement('span');
-    n.className = 'badge';
-    n.innerHTML = highlightTerms(String(txt || ''), state.query);
-    return n;
-  };
-
-  const renderList = (rows) => {
-    ui.list.innerHTML = '';
-    if (!rows.length) {
-      const e = document.createElement('div');
-      e.className = 'empty';
-      e.textContent = 'No records match current query/filters.';
-      ui.list.appendChild(e);
-      renderDetail(null, 0);
-      return;
-    }
-    const visible = rows.slice(0, state.limit);
-    const idKey = (r) => r.id !== undefined ? r.id : r.path;
-    if (!state.selectedId || !visible.some(function(r) { return idKey(r.record) === state.selectedId; })) {
-      state.selectedId = idKey(visible[0].record);
-    }
-    visible.forEach(function(entry) {
-      const record = entry.record;
-      const score = entry.score;
-      const item = document.createElement('button');
-      item.type = 'button';
-      const rid = idKey(record);
-      item.className = 'result-item' + (rid === state.selectedId ? ' active' : '');
-      const top = document.createElement('div');
-      top.className = 'result-top';
-      top.appendChild(mkBadge(record.project || 'project'));
-      top.appendChild(mkBadge(record.agent || 'agent'));
-      top.appendChild(mkBadge(record.kind || 'kind'));
-      top.appendChild(mkBadge(record.date || ''));
-      if (typeof score === 'number' && score > 0) top.appendChild(mkBadge(score + '/100'));
-      const name = document.createElement('div');
-      name.className = 'result-name';
-      const fname = (record.file_name || record.file || '(unnamed)') + (record.size_human ? ' \u2022 ' + record.size_human : '');
-      name.innerHTML = highlightTerms(fname, state.query);
-      item.appendChild(top);
-      item.appendChild(name);
-      const previewText = record.excerpt || record.preview || '';
-      if (state.query && previewText) {
-        const preview = document.createElement('div');
-        preview.className = 'result-preview';
-        preview.innerHTML = highlightTerms(previewText, state.query);
-        item.appendChild(preview);
-      }
-      item.addEventListener('click', function() {
-        state.selectedId = rid;
-        renderList(state.rows);
-        renderDetail(record, score);
-        runHooks('onSelect', record);
-      });
-      ui.list.appendChild(item);
-    });
-    const sel = visible.find(function(r) { return idKey(r.record) === state.selectedId; }) || visible[0];
-    if (sel) renderDetail(sel.record, sel.score);
-  };
-
-  const applyBrowseFilters = () => {
-    state.mode = 'browse';
-    let rows = state.browseRecords
-      .filter(function(r) {
-        if (state.project && r.project !== state.project) return false;
-        if (state.agent && r.agent !== state.agent) return false;
-        if (state.kind && r.kind !== state.kind) return false;
-        return true;
-      })
-      .map(function(r) { return { record: r, score: 0 }; })
-      .sort(function(a, b) { return (b.record.sort_ts || 0) - (a.record.sort_ts || 0); });
-    rows = runHooks('beforeRender', rows);
-    state.rows = rows;
-    ui.summary.textContent = rows.length + ' file(s) | browse mode | total: ' + state.browseRecords.length;
-    renderList(rows);
-    runHooks('afterRender', rows);
-  };
-
-  let searchAbort = null;
-
-  const runSearch = () => {
-    state.mode = 'search';
-    const q = state.query;
-    if (!q) { applyBrowseFilters(); return; }
-    if (searchAbort) searchAbort.abort();
-    searchAbort = new AbortController();
-    ui.summary.textContent = 'Searching\u2026';
-    const params = new URLSearchParams({ q: q, limit: '100' });
-    if (state.project) params.set('project', state.project);
-    fetch('/api/search/fuzzy?' + params.toString(), { signal: searchAbort.signal })
-      .then(function(r) { return r.json(); })
-      .then(function(data) {
-        if (!data.ok) { ui.summary.textContent = 'Search error: ' + (data.error || 'unknown'); return; }
-        let rows = data.results.map(function(r) { return { record: r, score: r.score || 0 }; });
-        rows = rows.filter(function(r) {
-          if (state.agent && r.record.agent !== state.agent) return false;
-          if (state.kind && r.record.kind !== state.kind) return false;
-          return true;
-        });
-        rows = runHooks('beforeRender', rows);
-        state.rows = rows;
-        ui.summary.textContent = rows.length + ' result(s) | fuzzy search | scanned: ' + (data.total_scanned || '?');
-        renderList(rows);
-        runHooks('afterRender', rows);
-      })
-      .catch(function(err) {
-        if (err.name === 'AbortError') return;
-        ui.summary.textContent = 'Search failed: ' + err.message;
-      });
-  };
-
-  const refresh = () => {
-    state.query = (ui.search.value || '').trim().toLowerCase();
-    state.project = ui.project.value;
-    state.agent = ui.agent.value;
-    state.kind = ui.kind.value;
-    if (state.query) { runSearch(); } else { applyBrowseFilters(); }
-  };
-
-  const DEBOUNCE_MS = 800;
-  let debounceTimer = null;
-  const liveCheckbox = document.getElementById('ctx-live');
-
-  const scheduleRefresh = () => { clearTimeout(debounceTimer); debounceTimer = setTimeout(refresh, DEBOUNCE_MS); };
-  ui.search.addEventListener('input', function() { if (liveCheckbox.checked) scheduleRefresh(); });
-  ui.search.addEventListener('keydown', function(e) { if (e.key === 'Enter') { clearTimeout(debounceTimer); refresh(); } });
-  ['input', 'change'].forEach(function(ev) {
-    ui.project.addEventListener(ev, refresh);
-    ui.agent.addEventListener(ev, refresh);
-    ui.kind.addEventListener(ev, refresh);
-  });
-  liveCheckbox.addEventListener('change', function() { if (liveCheckbox.checked) scheduleRefresh(); });
-
-  ui.copyPath.addEventListener('click', async function() {
-    const p = state.selectedRecord?.absolute_path || state.selectedRecord?.path || state.selectedRecord?.relative_path || '';
-    if (p && navigator.clipboard) { try { await navigator.clipboard.writeText(p); } catch (_) {} }
-  });
-
-  if (ui.regenerateBtn) {
-    ui.regenerateBtn.addEventListener('click', function() {
-      ui.regenerateBtn.disabled = true;
-      ui.regenerateBtn.textContent = '\u2026';
-      fetch('/api/regenerate', { method: 'POST', headers: { 'x-ai-contexters-action': 'regenerate' } })
-        .then(function(r) { return r.json(); })
-        .then(function(data) { if (data.ok) loadBrowseData(); else alert('Regenerate failed: ' + (data.error || 'unknown')); })
-        .catch(function(err) { alert('Regenerate error: ' + err.message); })
-        .finally(function() { ui.regenerateBtn.disabled = false; ui.regenerateBtn.textContent = '\u21BB'; });
-    });
-  }
-
-  const resizeHandle = document.getElementById('ctx-resize-handle');
-  const layoutEl = document.getElementById('ctx-layout');
-  if (resizeHandle && layoutEl) {
-    const STORAGE_KEY = 'aicx-split-ratio';
-    const saved = localStorage.getItem(STORAGE_KEY);
-    if (saved) { const r = parseFloat(saved); if (r > 0 && r < 1) layoutEl.style.gridTemplateColumns = r + 'fr 6px ' + (1 - r) + 'fr'; }
-    let dragging = false;
-    resizeHandle.addEventListener('mousedown', function(e) {
-      e.preventDefault(); dragging = true;
-      resizeHandle.classList.add('dragging');
-      document.body.style.cursor = 'col-resize';
-      document.body.style.userSelect = 'none';
-    });
-    document.addEventListener('mousemove', function(e) {
-      if (!dragging) return;
-      const rect = layoutEl.getBoundingClientRect();
-      const x = e.clientX - rect.left;
-      const total = rect.width - 6;
-      const listW = Math.max(250, Math.min(x, total - 300));
-      const ratio = listW / total;
-      layoutEl.style.gridTemplateColumns = ratio + 'fr 6px ' + (1 - ratio) + 'fr';
-      localStorage.setItem(STORAGE_KEY, ratio.toFixed(4));
-    });
-    document.addEventListener('mouseup', function() {
-      if (!dragging) return; dragging = false;
-      resizeHandle.classList.remove('dragging');
-      document.body.style.cursor = '';
-      document.body.style.userSelect = '';
-    });
-  }
-
-  const loadBrowseData = () => {
-    ui.summary.textContent = 'Loading\u2026';
-    fetch('/api/browse')
-      .then(function(r) { return r.json(); })
-      .then(function(data) {
-        if (!data.ok) { ui.summary.textContent = 'Failed: ' + (data.error || 'unknown'); return; }
-        state.browseRecords = data.records || [];
-        fillSelect(ui.project, data.projects || []);
-        fillSelect(ui.agent, data.agents || []);
-        fillSelect(ui.kind, data.kinds || []);
-        const s = data.stats || {};
-        ui.statFiles.textContent = s.total_files || 0;
-        ui.statProjects.textContent = s.total_projects || 0;
-        ui.statDays.textContent = s.total_days || 0;
-        ui.genInfo.textContent = 'Generated ' + (data.generated_at || '?');
-        ui.assumptions.innerHTML = '';
-        (data.assumptions || []).forEach(function(a) {
-          const li = document.createElement('li');
-          li.textContent = a;
-          ui.assumptions.appendChild(li);
-        });
-        refresh();
-      })
-      .catch(function(err) { ui.summary.textContent = 'Load failed: ' + err.message; });
-  };
-
-  window.AIContextersDashboard = {
-    version: '5.0.0-server',
-    state: state,
-    registerHook: function(name, fn) { if (!hooks[name] || typeof fn !== 'function') return false; hooks[name].push(fn); return true; },
-    refresh: refresh,
-    reload: loadBrowseData,
-  };
-
-  loadBrowseData();
 })();
 "#;
 
@@ -2119,112 +1383,6 @@ mod tests {
         assert!(artifact.html.contains("AIContextersDashboard"));
 
         let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn server_shell_includes_highlight_styles_and_wiring() {
-        let html = render_server_shell_html("AI Context Browser");
-
-        assert!(html.contains("mark.hl"));
-        assert!(html.contains("mark.hl-fuzzy"));
-        assert!(html.contains("const escapeRegex = (s) =>"));
-        assert!(html.contains("const highlightTerms = (text, query) => {"));
-        assert!(
-            html.contains("ui.detailTitle.innerHTML = highlightTerms(detailTitle, state.query);")
-        );
-        assert!(
-            html.contains("ui.detailMeta.innerHTML = highlightTerms(detailMeta, state.query);")
-        );
-        assert!(
-            html.contains("ui.detailPath.innerHTML = highlightTerms(detailPath, state.query);")
-        );
-        assert!(html.contains("n.innerHTML = highlightTerms(String(txt || ''), state.query);"));
-        assert!(html.contains("name.innerHTML = highlightTerms(fname, state.query);"));
-        assert!(html.contains(".result-preview {"));
-        assert!(html.contains("preview.className = 'result-preview';"));
-        assert!(html.contains("preview.innerHTML = highlightTerms(previewText, state.query);"));
-    }
-
-    #[test]
-    fn static_dashboard_includes_highlight_styles_and_wiring() {
-        let payload = DashboardPayload {
-            generated_at: "2026-04-02T17:43:00Z".to_string(),
-            store_root: "/tmp/aicx".to_string(),
-            records: Vec::new(),
-            stats: DashboardStats::default(),
-            assumptions: Vec::new(),
-            projects: Vec::new(),
-            agents: Vec::new(),
-            kinds: Vec::new(),
-        };
-
-        let html = render_dashboard_html(&payload, "AI Context Browser").expect("static html");
-
-        assert!(html.contains("mark.hl"));
-        assert!(html.contains("mark.hl-fuzzy"));
-        assert!(html.contains("const escapeRegex = (s) =>"));
-        assert!(html.contains("const highlightTerms = (text, query) => {"));
-        assert!(html.contains("queryRaw: ''"));
-        assert!(html.contains("const highlightQuery = () => state.queryRaw || state.query;"));
-        assert!(
-            html.contains(
-                "ui.detailTitle.innerHTML = highlightTerms(detailTitle, highlightQuery());"
-            )
-        );
-        assert!(
-            html.contains(
-                "ui.detailMeta.innerHTML = highlightTerms(detailMeta, highlightQuery());"
-            )
-        );
-        assert!(
-            html.contains(
-                "ui.detailPath.innerHTML = highlightTerms(detailPath, highlightQuery());"
-            )
-        );
-        assert!(
-            html.contains("node.innerHTML = highlightTerms(String(txt || ''), highlightQuery());")
-        );
-        assert!(html.contains("name.innerHTML = highlightTerms(nameText, highlightQuery());"));
-        assert!(html.contains(".result-preview {"));
-        assert!(html.contains("preview.className = 'result-preview';"));
-        assert!(
-            html.contains("preview.innerHTML = highlightTerms(record.preview, highlightQuery());")
-        );
-        assert!(html.contains("state.queryRaw = ui.search.value || '';"));
-    }
-
-    #[test]
-    fn static_dashboard_includes_polish_normalization_map_for_l_stroke() {
-        let payload = DashboardPayload {
-            generated_at: "2026-04-02T17:43:00Z".to_string(),
-            store_root: "/tmp/aicx".to_string(),
-            records: Vec::new(),
-            stats: DashboardStats::default(),
-            assumptions: Vec::new(),
-            projects: Vec::new(),
-            agents: Vec::new(),
-            kinds: Vec::new(),
-        };
-
-        let html = render_dashboard_html(&payload, "AI Context Browser").expect("static html");
-
-        assert!(html.contains("const normalizeText = (text) => {"));
-        assert!(html.contains("'\\u0141':'L','\\u0142':'l'"));
-        assert!(html.contains("normalizeText(value)"));
-        assert!(html.contains("const normalizedText = normalizeText(text);"));
-        assert!(html.contains("terms.map(normalizeText).filter(Boolean).forEach((term) => {"));
-        assert!(!html.contains("const normalizedText = normalize(text);"));
-    }
-
-    #[test]
-    fn server_shell_includes_polish_normalization_map_for_l_stroke() {
-        let html = render_server_shell_html("AI Context Browser");
-
-        assert!(html.contains("const normalizeText = (text) => {"));
-        assert!(html.contains("'\\u0141':'L','\\u0142':'l'"));
-        assert!(html.contains("const normalizedText = normalizeText(text);"));
-        assert!(html.contains("terms.map(normalizeText).filter(Boolean).forEach(function(term) {"));
-        assert!(!html.contains("const normalizedText = normalize(text);"));
     }
 
     #[test]
