@@ -272,11 +272,22 @@ pub fn fuzzy_search_store(
             continue;
         };
 
-        let content_normalized = normalize_query(&content);
+        // Split content into signal lines: strip aicx read blocks + boilerplate
+        let all_lines: Vec<&str> = content.lines().collect();
+        let without_aicx = strip_aicx_read_blocks(all_lines);
+        let signal_lines: Vec<&str> = without_aicx
+            .into_iter()
+            .filter(|line| !is_search_boilerplate(line))
+            .collect();
+        let signal_text = signal_lines
+            .iter()
+            .map(|l| normalize_query(l))
+            .collect::<Vec<_>>()
+            .join(" ");
 
         let matched_terms = query_terms
             .iter()
-            .filter(|&term| content_normalized.contains(term))
+            .filter(|&term| signal_text.contains(term))
             .count();
 
         // Must match at least one term to be considered.
@@ -285,8 +296,8 @@ pub fn fuzzy_search_store(
             continue;
         }
 
-        let matched_lines = content
-            .lines()
+        let matched_lines = signal_lines
+            .iter()
             .filter(|line| {
                 let normalized_line = normalize_query(line);
                 query_terms
@@ -357,6 +368,27 @@ pub fn fuzzy_search_store(
             deduped.push(r);
         }
     }
+    // 3. Frequency-based boilerplate filter: lines appearing in >15% of results
+    //    are corpus-generic regardless of content. Strip them from matched_lines.
+    if deduped.len() >= 5 {
+        let threshold = (deduped.len() as f32 * 0.15).ceil() as usize;
+        let mut line_freq: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for r in &deduped {
+            let mut seen_in_result = std::collections::HashSet::new();
+            for line in &r.matched_lines {
+                let key = normalize_query(line);
+                if seen_in_result.insert(key.clone()) {
+                    *line_freq.entry(key).or_insert(0) += 1;
+                }
+            }
+        }
+        for r in &mut deduped {
+            r.matched_lines
+                .retain(|line| line_freq.get(&normalize_query(line)).copied().unwrap_or(0) < threshold);
+        }
+    }
+
     deduped.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| b.date.cmp(&a.date)));
     deduped.truncate(limit);
 
@@ -597,6 +629,51 @@ fn is_signal_line(lower: &str) -> bool {
         }
     }
     false
+}
+
+/// Lines that are generic preamble/boilerplate — should not contribute to search matching.
+const SEARCH_BOILERPLATE: &[&str] = &[
+    "created by m&k",
+    "vibecrafted with ai agents",
+];
+
+/// Sentinel brackets for aicx read blocks. Content between these markers
+/// is injected context from aicx tools — not original session signal.
+const AICX_READ_BEGIN: &str = "【aicx:read】";
+const AICX_READ_END: &str = "【/aicx:read】";
+
+fn is_search_boilerplate(line: &str) -> bool {
+    let lower = line.trim().to_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    for pat in SEARCH_BOILERPLATE {
+        if lower.contains(pat) {
+            return true;
+        }
+    }
+    // Skill boilerplate headers
+    is_skill_boilerplate_header(&lower)
+}
+
+/// Filter out lines inside 【aicx:read】...【/aicx:read】 blocks.
+fn strip_aicx_read_blocks(lines: Vec<&str>) -> Vec<&str> {
+    let mut out = Vec::with_capacity(lines.len());
+    let mut inside = false;
+    for line in lines {
+        if line.contains(AICX_READ_BEGIN) {
+            inside = true;
+            continue;
+        }
+        if line.contains(AICX_READ_END) {
+            inside = false;
+            continue;
+        }
+        if !inside {
+            out.push(line);
+        }
+    }
+    out
 }
 
 fn is_skill_boilerplate_header(lower: &str) -> bool {

@@ -29,6 +29,8 @@ pub struct Chunk {
     pub date: String,
     /// Session ID from first message in chunk
     pub session_id: String,
+    /// Working directory from the first message in the chunk window
+    pub cwd: Option<String>,
     /// Classified kind for this chunk's content
     pub kind: crate::store::Kind,
     /// Optional correlation ID for the originating run
@@ -63,6 +65,8 @@ pub struct ChunkMetadataSidecar {
     pub agent: String,
     pub date: String,
     pub session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
     pub kind: crate::store::Kind,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
@@ -88,6 +92,7 @@ impl From<&Chunk> for ChunkMetadataSidecar {
             agent: chunk.agent.clone(),
             date: chunk.date.clone(),
             session_id: chunk.session_id.clone(),
+            cwd: chunk.cwd.clone(),
             kind: chunk.kind,
             run_id: chunk.run_id.clone(),
             prompt_id: chunk.prompt_id.clone(),
@@ -264,6 +269,7 @@ fn chunk_day_entries(
             .first()
             .map(|e| e.session_id.clone())
             .unwrap_or_default();
+        let cwd = window.first().and_then(|entry| entry.cwd.clone());
 
         let global_start = entries[start].0;
         let global_end = entries[end - 1].0 + 1;
@@ -278,6 +284,7 @@ fn chunk_day_entries(
             agent: agent.to_string(),
             date: date.to_string(),
             session_id,
+            cwd,
             kind,
             run_id: None,
             prompt_id: None,
@@ -1105,6 +1112,7 @@ mod tests {
                 agent: "claude".to_string(),
                 date: "2026-01-22".to_string(),
                 session_id: "s1".to_string(),
+                cwd: Some("/Users/tester/workspaces/proj".to_string()),
                 kind: crate::store::Kind::Conversations,
                 run_id: None,
                 prompt_id: None,
@@ -1124,6 +1132,7 @@ mod tests {
                 agent: "claude".to_string(),
                 date: "2026-01-22".to_string(),
                 session_id: "s1".to_string(),
+                cwd: None,
                 kind: crate::store::Kind::Conversations,
                 run_id: None,
                 prompt_id: None,
@@ -1152,7 +1161,22 @@ mod tests {
         assert_eq!(metadata.project, "proj");
         assert_eq!(metadata.agent, "claude");
         assert_eq!(metadata.date, "2026-01-22");
+        assert_eq!(
+            metadata.cwd.as_deref(),
+            Some("/Users/tester/workspaces/proj")
+        );
         assert_eq!(metadata.kind, crate::store::Kind::Conversations);
+
+        let legacy: ChunkMetadataSidecar = serde_json::from_value(serde_json::json!({
+            "id": "legacy",
+            "project": "proj",
+            "agent": "claude",
+            "date": "2026-01-22",
+            "session_id": "s1",
+            "kind": "conversations",
+        }))
+        .unwrap();
+        assert_eq!(legacy.cwd, None);
 
         let _ = fs::remove_dir_all(&tmp);
     }
@@ -1206,6 +1230,7 @@ mod tests {
                 agent: "c".to_string(),
                 date: "2026-01-20".to_string(),
                 session_id: "s".to_string(),
+                cwd: None,
                 kind: crate::store::Kind::Conversations,
                 run_id: None,
                 prompt_id: None,
@@ -1225,6 +1250,7 @@ mod tests {
                 agent: "c".to_string(),
                 date: "2026-01-21".to_string(),
                 session_id: "s".to_string(),
+                cwd: None,
                 kind: crate::store::Kind::Conversations,
                 run_id: None,
                 prompt_id: None,
