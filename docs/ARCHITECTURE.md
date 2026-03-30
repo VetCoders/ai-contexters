@@ -1,10 +1,11 @@
 # Architecture
 
-`aicx` is a single Rust CLI that:
+`aicx` is the ledger and control surface for AI agent session history. It:
 - reads local agent session logs,
 - normalizes them into a single timeline schema,
 - deduplicates and chunks the timeline into “agent-readable” context files,
-- optionally syncs those chunks into a vector store (memex),
+- attaches steering metadata (frontmatter) for selective re-entry by orchestration,
+- optionally syncs those chunks into a semantic index (memex) for vector-based retrieval,
 - optionally bootstraps a repo-local `.ai-context/` workspace for multi-agent workflows.
 
 ```mermaid
@@ -24,7 +25,7 @@ Library modules (see `src/lib.rs`):
 
 - `src/sources.rs`: source discovery + extraction
 - `src/state.rs`: dedup hashes + incremental watermarks
-- `src/store.rs`: central store layout under `~/.ai-contexters/` + `index.json`
+- `src/store.rs`: central store layout under `~/.aicx/` + `index.json`
 - `src/chunker.rs`: semantic windowing chunker (token heuristic + overlap + highlight extraction)
 - `src/output.rs`: local report writer (`-o`) + optional loctree snapshot inclusion
 - `src/memex.rs`: memex sync (`rmcp-memex index/upsert`) + sync state
@@ -62,8 +63,30 @@ High-level sequence (see `src/main.rs::run_extraction`):
 9. Optional memex sync (`--memex`): chunk again and push into memex (see note below).
 
 Note on memex sync:
-- `--memex` in extractors currently creates chunk files in `~/.ai-contexters/memex/chunks/` and then calls memex sync.
-- These are separate from the “store-first” chunks. This is intentional separation: store chunks are for humans/agents to read; memex chunks are for vector indexing.
+- `--memex` in extractors creates chunk files in the memex chunks directory and then calls memex sync.
+- These are separate from the “store-first” chunks. This is intentional separation: store chunks are the source of truth for humans/agents to read; memex chunks feed the semantic index for vector-based retrieval.
+- Memex is an add-on semantic index layered on top of the file store — not primary storage.
+
+## Frontmatter Steering Contract
+
+Report files and chunk sidecars can include frontmatter metadata used for **steering** — targeted retrieval and selective re-entry by orchestration frameworks:
+
+```yaml
+---
+agent: codex
+run_id: mrbl-001
+prompt_id: api-redesign_20260327
+model: claude-3-5-sonnet
+started_at: “2026-03-24T10:00:00Z”
+completed_at: “2026-03-24T10:30:00Z”
+token_usage: 125000
+findings_count: 3
+---
+```
+
+These fields are parsed by `src/frontmatter.rs`, applied during chunking, and persisted as `.meta.json` sidecars alongside each chunk file. The `steer` command (CLI), `aicx_steer` tool (MCP), and `/api/search/steer` endpoint (dashboard) allow retrieval by these fields without filesystem grep.
+
+Frontmatter is not just telemetry — it is part of the steering and selective re-entry contract. Orchestration can use `run_id` to retrieve all chunks from a specific agent run, `prompt_id` to find outputs from a specific prompt, or combine filters to narrow scope precisely.
 
 ## Data Flow: `store`
 
@@ -89,6 +112,18 @@ Note on memex sync:
    - `prompts/` (task prompts in “Emil Kurier” format)
 4. Optionally dispatch an agent run:
    - Terminal mode (macOS) or subprocess mode, depending on environment.
+
+## MCP Surface (`src/mcp.rs`)
+
+The MCP server exposes five tools via stdio and streamable HTTP transports:
+
+- `aicx_search` — fuzzy text search across stored chunks with quality scoring
+- `aicx_rank` — rank chunks by signal density for a project
+- `aicx_refs` — list stored context file paths filtered by recency
+- `aicx_steer` — retrieve chunks by steering metadata (run_id, prompt_id, agent, kind, project, date) using sidecar data; the primary metadata-aware retrieval path for orchestration
+- `aicx_store` — trigger incremental rescan and centralize new chunks
+
+Recency in `aicx_steer` and `aicx_refs` uses canonical chunk dates from the store layout, not filesystem `mtime` accidents.
 
 ## Security Model (Pragmatic)
 
