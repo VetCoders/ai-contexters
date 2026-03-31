@@ -53,7 +53,7 @@ dependencies = [
 
 [[package]]
 name = "ai-contexters"
-version = "0.5.4"
+version = "0.5.5"
 dependencies = [
  "anyhow",
  "axum",
@@ -1036,7 +1036,7 @@ version = "3.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "519bd3116aeeb42d5372c29d982d16d0170d3d4a5ed85fc7dd91642ffff3c67c"
 dependencies = [
- "darling 0.23.0",
+ "darling 0.21.3",
  "ident_case",
  "prettyplease",
  "proc-macro2",
@@ -5457,6 +5457,8 @@ dependencies = [
 [[package]]
 name = "rmcp-memex"
 version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cdbc9672b78a74b8a563394d53a269a8474e0a058a217ca7dc0a1e8ce521f039"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -5467,6 +5469,7 @@ dependencies = [
  "futures",
  "glob",
  "lancedb",
+ "lazy_static",
  "pdf-extract",
  "protoc-bin-vendored",
  "regex",
