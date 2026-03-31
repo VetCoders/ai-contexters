@@ -1,6 +1,6 @@
 //! AI Contexters dashboard HTTP server runtime.
 //!
-//! Serves the generated dashboard artifact and supports on-demand regeneration.
+//! Serves the dashboard server-shell UI and supports on-demand data regeneration.
 
 use anyhow::{Context, Result, anyhow};
 use axum::{
@@ -13,8 +13,6 @@ use axum::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::{
-    fs,
-    io::Write,
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     process::Command,
@@ -25,7 +23,10 @@ use std::{
 };
 use tokio::sync::RwLock;
 
-use crate::dashboard::{self, DashboardConfig, DashboardStats};
+#[cfg(test)]
+use std::{fs, io::Write};
+
+use crate::dashboard::{self, DashboardPayload, DashboardRecord, DashboardStats};
 use crate::rank;
 
 /// Guard that prevents concurrent `aicx store` child-process spawns from dashboard search.
@@ -33,6 +34,7 @@ static DASHBOARD_RESCAN_RUNNING: AtomicBool = AtomicBool::new(false);
 
 const REGENERATE_HEADER_NAME: &str = "x-ai-contexters-action";
 const REGENERATE_HEADER_VALUE: &str = "regenerate";
+const MAX_SCORE_FILTER: u8 = 100;
 
 /// Runtime configuration for dashboard server mode.
 #[derive(Debug, Clone)]
@@ -40,6 +42,7 @@ pub struct DashboardServerConfig {
     pub store_root: PathBuf,
     pub title: String,
     pub preview_chars: usize,
+    /// Legacy compatibility path surfaced in status; server mode does not write it.
     pub artifact_path: PathBuf,
     pub host: IpAddr,
     pub port: u16,
@@ -47,7 +50,8 @@ pub struct DashboardServerConfig {
 
 #[derive(Debug, Clone)]
 struct DashboardSnapshot {
-    html: String,
+    /// Scanned payload (records, projects, agents, kinds, stats).
+    payload: DashboardPayload,
     generated_at: DateTime<Utc>,
     stats: DashboardStats,
     assumptions: Vec<String>,
@@ -58,10 +62,10 @@ struct DashboardSnapshot {
 impl DashboardSnapshot {
     fn from_build(build: BuildOutput) -> Self {
         Self {
-            html: build.artifact.html,
+            stats: build.payload.stats.clone(),
+            assumptions: build.payload.assumptions.clone(),
+            payload: build.payload,
             generated_at: build.generated_at,
-            stats: build.artifact.stats,
-            assumptions: build.artifact.assumptions,
             build_count: 1,
             last_error: None,
         }
@@ -71,24 +75,28 @@ impl DashboardSnapshot {
 #[derive(Debug)]
 struct DashboardServerState {
     config: DashboardServerConfig,
+    /// Lightweight server-mode HTML shell (no embedded data).
+    shell_html: String,
     snapshot: RwLock<DashboardSnapshot>,
     rebuilding: AtomicBool,
 }
 
 #[derive(Debug)]
 struct BuildOutput {
-    artifact: dashboard::DashboardArtifact,
+    payload: DashboardPayload,
     generated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Serialize)]
 struct DashboardStatusResponse {
     ok: bool,
+    mode: &'static str,
     rebuilding: bool,
     generated_at: String,
     build_count: u64,
     store_root: String,
     artifact_path: String,
+    artifact_written: bool,
     title: String,
     preview_chars: usize,
     stats: DashboardStats,
@@ -99,9 +107,11 @@ struct DashboardStatusResponse {
 #[derive(Debug, Serialize)]
 struct DashboardRegenerateResponse {
     ok: bool,
+    mode: &'static str,
     regenerated_at: String,
     build_count: u64,
     artifact_path: String,
+    artifact_written: bool,
     stats: DashboardStats,
 }
 
@@ -122,6 +132,8 @@ struct FuzzySearchParams {
     limit: usize,
     /// Optional project filter (case-insensitive substring match)
     project: Option<String>,
+    /// Optional minimum score threshold (0-100)
+    score: Option<u8>,
 }
 
 fn default_search_limit() -> usize {
@@ -251,8 +263,10 @@ pub async fn run_dashboard_server(config: DashboardServerConfig) -> Result<()> {
     ensure_loopback_host(config.host)?;
 
     let initial = rebuild_dashboard(&config).context("Initial dashboard build failed")?;
+    let shell_html = dashboard::render_server_shell_html(&config.title);
     let state = Arc::new(DashboardServerState {
         config: config.clone(),
+        shell_html,
         snapshot: RwLock::new(DashboardSnapshot::from_build(initial)),
         rebuilding: AtomicBool::new(false),
     });
@@ -262,6 +276,8 @@ pub async fn run_dashboard_server(config: DashboardServerConfig) -> Result<()> {
         .route("/api/health", get(get_health))
         .route("/health", get(get_health))
         .route("/api/status", get(get_status))
+        .route("/api/browse", get(get_browse))
+        .route("/api/detail", get(get_detail))
         .route("/api/regenerate", post(regenerate_dashboard))
         .route("/api/search/fuzzy", get(fuzzy_search))
         .route("/api/search/semantic", get(semantic_search))
@@ -274,11 +290,13 @@ pub async fn run_dashboard_server(config: DashboardServerConfig) -> Result<()> {
         .await
         .with_context(|| format!("Failed to bind dashboard server on http://{addr}"))?;
 
-    eprintln!("✓ Dashboard server started");
+    eprintln!("✓ Dashboard server started (server-mode shell)");
     eprintln!("  URL: http://{addr}");
+    eprintln!("  Browse:    GET  http://{addr}/api/browse");
+    eprintln!("  Detail:    GET  http://{addr}/api/detail?id=<n>");
     eprintln!("  Status:    GET  http://{addr}/api/status");
     eprintln!("  Regenerate: POST http://{addr}/api/regenerate");
-    eprintln!("  Fuzzy:     GET  http://{addr}/api/search/fuzzy?q=<query>");
+    eprintln!("  Fuzzy:     GET  http://{addr}/api/search/fuzzy?q=<query>&score=<min>");
     eprintln!("  Semantic:  GET  http://{addr}/api/search/semantic?q=<query>&ns=<namespace>");
     eprintln!("  Cross:     GET  http://{addr}/api/search/cross?q=<query>");
     eprintln!("  Steer:     GET  http://{addr}/api/search/steer?run_id=<id>&project=<p>");
@@ -286,7 +304,10 @@ pub async fn run_dashboard_server(config: DashboardServerConfig) -> Result<()> {
         "  Required header: {}: {}",
         REGENERATE_HEADER_NAME, REGENERATE_HEADER_VALUE
     );
-    eprintln!("  Artifact: {}", config.artifact_path.display());
+    eprintln!(
+        "  Artifact arg (unused in server mode): {}",
+        config.artifact_path.display()
+    );
     eprintln!("  Store: {}", config.store_root.display());
 
     axum::serve(listener, app)
@@ -306,10 +327,9 @@ fn ensure_loopback_host(host: IpAddr) -> Result<()> {
 }
 
 async fn get_dashboard_html(State(state): State<Arc<DashboardServerState>>) -> impl IntoResponse {
-    let snapshot = state.snapshot.read().await;
     let mut headers = HeaderMap::new();
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    (headers, Html(snapshot.html.clone()))
+    (headers, Html(state.shell_html.clone()))
 }
 
 async fn get_health() -> Json<serde_json::Value> {
@@ -326,11 +346,13 @@ async fn get_status(
     let snapshot = state.snapshot.read().await;
     Json(DashboardStatusResponse {
         ok: true,
+        mode: "server-shell",
         rebuilding: state.rebuilding.load(Ordering::SeqCst),
         generated_at: snapshot.generated_at.to_rfc3339(),
         build_count: snapshot.build_count,
         store_root: state.config.store_root.display().to_string(),
         artifact_path: state.config.artifact_path.display().to_string(),
+        artifact_written: false,
         title: state.config.title.clone(),
         preview_chars: state.config.preview_chars,
         stats: snapshot.stats.clone(),
@@ -380,18 +402,20 @@ async fn regenerate_dashboard(
     match rebuilt {
         Ok(Ok(build)) => {
             let mut snapshot = state.snapshot.write().await;
-            snapshot.html = build.artifact.html;
+            snapshot.stats = build.payload.stats.clone();
+            snapshot.assumptions = build.payload.assumptions.clone();
+            snapshot.payload = build.payload;
             snapshot.generated_at = build.generated_at;
-            snapshot.stats = build.artifact.stats.clone();
-            snapshot.assumptions = build.artifact.assumptions;
             snapshot.build_count = snapshot.build_count.saturating_add(1);
             snapshot.last_error = None;
 
             let response = DashboardRegenerateResponse {
                 ok: true,
+                mode: "server-shell",
                 regenerated_at: snapshot.generated_at.to_rfc3339(),
                 build_count: snapshot.build_count,
                 artifact_path: state.config.artifact_path.display().to_string(),
+                artifact_written: false,
                 stats: snapshot.stats.clone(),
             };
 
@@ -425,6 +449,141 @@ async fn regenerate_dashboard(
             )
                 .into_response()
         }
+    }
+}
+
+// ============================================================================
+// Browse & Detail handlers (server-mode API)
+// ============================================================================
+
+/// Lightweight record for browse listing (no search_blob, no detail_text).
+#[derive(Debug, Serialize)]
+struct BrowseRecord {
+    id: usize,
+    project: String,
+    agent: String,
+    date: String,
+    time: String,
+    kind: String,
+    file_name: String,
+    relative_path: String,
+    absolute_path: String,
+    bytes: u64,
+    size_human: String,
+    modified_utc: String,
+    sort_ts: i64,
+    entry_count: Option<usize>,
+    preview: String,
+}
+
+impl From<&DashboardRecord> for BrowseRecord {
+    fn from(r: &DashboardRecord) -> Self {
+        Self {
+            id: r.id,
+            project: r.project.clone(),
+            agent: r.agent.clone(),
+            date: r.date.clone(),
+            time: r.time.clone(),
+            kind: r.kind.clone(),
+            file_name: r.file_name.clone(),
+            relative_path: r.relative_path.clone(),
+            absolute_path: r.absolute_path.clone(),
+            bytes: r.bytes,
+            size_human: r.size_human.clone(),
+            modified_utc: r.modified_utc.clone(),
+            sort_ts: r.sort_ts,
+            entry_count: r.entry_count,
+            preview: r.preview.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct BrowseResponse {
+    ok: bool,
+    generated_at: String,
+    stats: DashboardStats,
+    assumptions: Vec<String>,
+    projects: Vec<String>,
+    agents: Vec<String>,
+    kinds: Vec<String>,
+    records: Vec<BrowseRecord>,
+}
+
+/// Browse all records (lightweight, no search_blob/detail_text).
+async fn get_browse(State(state): State<Arc<DashboardServerState>>) -> Json<BrowseResponse> {
+    let snapshot = state.snapshot.read().await;
+    let records: Vec<BrowseRecord> = snapshot
+        .payload
+        .records
+        .iter()
+        .map(BrowseRecord::from)
+        .collect();
+    Json(BrowseResponse {
+        ok: true,
+        generated_at: snapshot.payload.generated_at.clone(),
+        stats: snapshot.stats.clone(),
+        assumptions: snapshot.assumptions.clone(),
+        projects: snapshot.payload.projects.clone(),
+        agents: snapshot.payload.agents.clone(),
+        kinds: snapshot.payload.kinds.clone(),
+        records,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct DetailParams {
+    id: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct DetailResponse {
+    ok: bool,
+    id: usize,
+    detail_text: String,
+}
+
+/// Fetch detail_text for a single record by id.
+async fn get_detail(
+    State(state): State<Arc<DashboardServerState>>,
+    params: Result<Query<DetailParams>, QueryRejection>,
+) -> Response {
+    let Query(params) = match params {
+        Ok(q) => q,
+        Err(rejection) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    ok: false,
+                    error: format!("Invalid query parameters: {rejection}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let snapshot = state.snapshot.read().await;
+    // Record IDs are 1-based (assigned as idx+1 in scan_store), so look up by
+    // matching the id field rather than using it as a raw array index.
+    if let Some(record) = snapshot.payload.records.iter().find(|r| r.id == params.id) {
+        (
+            StatusCode::OK,
+            Json(DetailResponse {
+                ok: true,
+                id: params.id,
+                detail_text: record.detail_text.clone(),
+            }),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                ok: false,
+                error: format!("Record id {} not found", params.id),
+            }),
+        )
+            .into_response()
     }
 }
 
@@ -469,10 +628,26 @@ async fn fuzzy_search(
     let limit = params.limit.min(100);
     let store_root = state.config.store_root.clone();
     let project_filter = params.project;
+    let score = match validate_score_filter(params.score) {
+        Ok(score) => score,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse { ok: false, error }),
+            )
+                .into_response();
+        }
+    };
     let query_clone = query.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        run_fuzzy_search(&store_root, &query_clone, limit, project_filter.as_deref())
+        run_fuzzy_search(
+            &store_root,
+            &query_clone,
+            limit,
+            project_filter.as_deref(),
+            score,
+        )
     })
     .await;
 
@@ -511,6 +686,7 @@ fn run_fuzzy_search(
     query: &str,
     limit: usize,
     project_filter: Option<&str>,
+    score: Option<u8>,
 ) -> Result<(Vec<FuzzySearchResult>, usize)> {
     // Non-blocking auto-rescan with rate-limit guard.
     if !DASHBOARD_RESCAN_RUNNING.swap(true, Ordering::SeqCst) {
@@ -532,10 +708,34 @@ fn run_fuzzy_search(
         }
     }
 
-    let (results, total_scanned) =
-        rank::fuzzy_search_store(store_root, query, limit, project_filter)?;
+    // Try fast search with rmcp_memex first (instant), fallback to brute-force if it fails or returns nothing
+    let fetch_limit = if score.is_some() {
+        limit.saturating_mul(5).max(50)
+    } else {
+        limit
+    };
+
+    let (results, total_scanned) = if let Ok(rt) = tokio::runtime::Runtime::new() {
+        match rt.block_on(crate::memex::fast_memex_search(
+            query,
+            fetch_limit,
+            project_filter,
+        )) {
+            Ok((res, scan)) if !res.is_empty() => (res, scan),
+            _ => rank::fuzzy_search_store(store_root, query, fetch_limit, project_filter)?,
+        }
+    } else {
+        rank::fuzzy_search_store(store_root, query, fetch_limit, project_filter)?
+    };
+
+    let mut results = results;
+    if let Some(min_score) = score {
+        results.retain(|result| result.score >= min_score);
+    }
+
     let results = results
         .into_iter()
+        .take(limit)
         .map(|result| {
             let excerpt = result.matched_lines.join(" ... ");
             FuzzySearchResult {
@@ -555,6 +755,15 @@ fn run_fuzzy_search(
         .collect();
 
     Ok((results, total_scanned))
+}
+
+fn validate_score_filter(score: Option<u8>) -> Result<Option<u8>, String> {
+    match score {
+        Some(score) if score > MAX_SCORE_FILTER => {
+            Err(format!("score must be between 0 and {MAX_SCORE_FILTER}"))
+        }
+        _ => Ok(score),
+    }
 }
 
 /// Semantic search via rmcp-memex vector DB.
@@ -905,19 +1114,18 @@ fn run_steer_search(params: SteerSearchParams, limit: usize) -> Result<SteerSear
 }
 
 fn rebuild_dashboard(config: &DashboardServerConfig) -> Result<BuildOutput> {
-    let artifact = dashboard::build_dashboard(&DashboardConfig {
-        store_root: config.store_root.clone(),
-        title: config.title.clone(),
-        preview_chars: config.preview_chars,
-    })?;
-    write_dashboard_artifact(&config.artifact_path, &artifact.html)?;
+    // Server mode: scan only — no static HTML rendering, no artifact write.
+    // The server shell HTML is pre-built once at startup; all data reaches
+    // clients through the /api/* endpoints.
+    let payload = dashboard::scan_store_payload(&config.store_root, config.preview_chars)?;
 
     Ok(BuildOutput {
-        artifact,
+        payload,
         generated_at: Utc::now(),
     })
 }
 
+#[cfg(test)]
 fn write_dashboard_artifact(path: &Path, html: &str) -> Result<()> {
     let mut output_path = crate::sanitize::validate_write_path(path)?;
     if let Some(parent) = output_path.parent() {
@@ -1027,8 +1235,18 @@ mod tests {
                 host: "127.0.0.1".parse().expect("host"),
                 port: 8033,
             },
+            shell_html: "<html>shell</html>".to_string(),
             snapshot: RwLock::new(DashboardSnapshot {
-                html: "<html></html>".to_string(),
+                payload: DashboardPayload {
+                    generated_at: String::new(),
+                    store_root: String::new(),
+                    stats: DashboardStats::default(),
+                    assumptions: Vec::new(),
+                    projects: Vec::new(),
+                    agents: Vec::new(),
+                    kinds: Vec::new(),
+                    records: Vec::new(),
+                },
                 generated_at: Utc::now(),
                 stats: DashboardStats::default(),
                 assumptions: Vec::new(),
@@ -1130,8 +1348,15 @@ mod tests {
         );
         let response = runtime.block_on(regenerate_dashboard(State(state), headers));
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(artifact_path.exists());
+        // Server mode no longer writes a static HTML artifact — data is served via API.
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn score_filter_rejects_values_above_max() {
+        let err = validate_score_filter(Some(MAX_SCORE_FILTER + 1))
+            .expect_err("score above 100 should be rejected");
+        assert_eq!(err, "score must be between 0 and 100");
     }
 }
