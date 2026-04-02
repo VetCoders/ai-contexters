@@ -1,6 +1,6 @@
 use anyhow::Result;
 use rmcp_memex::storage::{ChromaDocument, StorageManager};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 const STEER_NAMESPACE: &str = "steer";
@@ -11,7 +11,7 @@ fn chunk_id_for_path(file: &Path) -> String {
         .unwrap_or_default()
 }
 
-fn build_steer_doc(file: &Path) -> ChromaDocument {
+fn build_steer_metadata(file: &Path) -> serde_json::Value {
     let sidecar = crate::store::load_sidecar(file);
 
     let mut meta = serde_json::Map::new();
@@ -29,11 +29,15 @@ fn build_steer_doc(file: &Path) -> ChromaDocument {
         }
     }
 
+    serde_json::Value::Object(meta)
+}
+
+fn build_steer_doc(file: &Path) -> ChromaDocument {
     ChromaDocument::new_flat(
         chunk_id_for_path(file),
         STEER_NAMESPACE.to_string(),
         vec![0.0], // Dummy vector since we only care about metadata filtering
-        serde_json::Value::Object(meta),
+        build_steer_metadata(file),
         "".to_string(),
     )
 }
@@ -49,8 +53,28 @@ fn file_ids(files: &[crate::store::StoredContextFile]) -> HashSet<String> {
         .collect()
 }
 
-fn steer_index_needs_rebuild(existing_ids: &HashSet<String>, store_ids: &HashSet<String>) -> bool {
-    existing_ids != store_ids
+fn steer_index_needs_rebuild(
+    existing_docs: &[ChromaDocument],
+    store_files: &[crate::store::StoredContextFile],
+) -> bool {
+    let existing_ids = doc_ids(existing_docs);
+    let store_ids = file_ids(store_files);
+    if existing_ids != store_ids {
+        return true;
+    }
+
+    let existing_by_id: HashMap<&str, &serde_json::Value> = existing_docs
+        .iter()
+        .map(|doc| (doc.id.as_str(), &doc.metadata))
+        .collect();
+
+    store_files.iter().any(|file| {
+        let chunk_id = chunk_id_for_path(&file.path);
+        let expected_metadata = build_steer_metadata(&file.path);
+        existing_by_id
+            .get(chunk_id.as_str())
+            .is_none_or(|indexed_metadata| **indexed_metadata != expected_metadata)
+    })
 }
 
 async fn sync_steer_index_at(base: &Path, new_files: &[&PathBuf]) -> Result<()> {
@@ -90,14 +114,14 @@ async fn rebuild_steer_index_if_needed_at(base: &Path) -> Result<()> {
     }
 
     let existing_docs = query_steer_index_at(base).await.unwrap_or_default();
-    let existing_ids = doc_ids(&existing_docs);
-    let store_ids = file_ids(&all_files);
+    let indexed_docs = existing_docs.len();
+    let store_files_count = all_files.len();
 
-    if steer_index_needs_rebuild(&existing_ids, &store_ids) {
+    if steer_index_needs_rebuild(&existing_docs, &all_files) {
         tracing::info!(
-            "Rebuilding steer index ({} docs vs {} files)",
-            existing_ids.len(),
-            store_ids.len()
+            "Rebuilding steer index ({} docs vs {} files or stale metadata)",
+            indexed_docs,
+            store_files_count
         );
 
         let db_path = base.join("steer_db");
@@ -133,8 +157,15 @@ pub async fn rebuild_steer_index_if_needed() -> Result<()> {
     rebuild_steer_index_if_needed_at(&base).await
 }
 
+fn metadata_equals_case_insensitive(meta: &serde_json::Value, key: &str, wanted: &str) -> bool {
+    meta.get(key)
+        .and_then(|v| v.as_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case(wanted))
+}
+
 #[allow(clippy::too_many_arguments)]
-pub async fn search_steer_index(
+async fn search_steer_index_at(
+    base: &Path,
     run_id: Option<&str>,
     prompt_id: Option<&str>,
     agent: Option<&str>,
@@ -142,15 +173,18 @@ pub async fn search_steer_index(
     project: Option<&str>,
     date_lo: Option<&str>,
     date_hi: Option<&str>,
+    workflow_phase: Option<&str>,
+    mode: Option<&str>,
+    skill_code: Option<&str>,
+    framework_version: Option<&str>,
     limit: usize,
-) -> Result<Vec<serde_json::Value>> {
-    rebuild_steer_index_if_needed().await?;
+) -> Result<(Vec<serde_json::Value>, usize)> {
+    rebuild_steer_index_if_needed_at(base).await?;
 
-    let docs = query_steer_index().await?;
+    let docs = query_steer_index_at(base).await?;
+    let scanned = docs.len();
 
     let project_lower = project.map(str::to_ascii_lowercase);
-    let agent_lower = agent.map(str::to_ascii_lowercase);
-    let kind_lower = kind.map(str::to_ascii_lowercase);
 
     let mut results = Vec::new();
 
@@ -170,21 +204,13 @@ pub async fn search_steer_index(
                 continue;
             }
         }
-        if let Some(ref needle) = agent_lower {
-            if let Some(a) = meta.get("agent").and_then(|v| v.as_str()) {
-                if a.to_ascii_lowercase() != *needle {
-                    continue;
-                }
-            } else {
+        if let Some(wanted) = agent {
+            if !metadata_equals_case_insensitive(meta, "agent", wanted) {
                 continue;
             }
         }
-        if let Some(ref needle) = kind_lower {
-            if let Some(k) = meta.get("kind").and_then(|v| v.as_str()) {
-                if k.to_ascii_lowercase() != *needle {
-                    continue;
-                }
-            } else {
+        if let Some(wanted) = kind {
+            if !metadata_equals_case_insensitive(meta, "kind", wanted) {
                 continue;
             }
         }
@@ -217,10 +243,97 @@ pub async fn search_steer_index(
                 continue;
             }
         }
+        if let Some(wanted) = workflow_phase {
+            if !metadata_equals_case_insensitive(meta, "workflow_phase", wanted) {
+                continue;
+            }
+        }
+        if let Some(wanted) = mode {
+            if !metadata_equals_case_insensitive(meta, "mode", wanted) {
+                continue;
+            }
+        }
+        if let Some(wanted) = skill_code {
+            if !metadata_equals_case_insensitive(meta, "skill_code", wanted) {
+                continue;
+            }
+        }
+        if let Some(wanted) = framework_version {
+            if !metadata_equals_case_insensitive(meta, "framework_version", wanted) {
+                continue;
+            }
+        }
 
         results.push(doc.metadata.clone());
     }
 
+    Ok((results, scanned))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn search_steer_index_with_stats(
+    run_id: Option<&str>,
+    prompt_id: Option<&str>,
+    agent: Option<&str>,
+    kind: Option<&str>,
+    project: Option<&str>,
+    date_lo: Option<&str>,
+    date_hi: Option<&str>,
+    workflow_phase: Option<&str>,
+    mode: Option<&str>,
+    skill_code: Option<&str>,
+    framework_version: Option<&str>,
+    limit: usize,
+) -> Result<(Vec<serde_json::Value>, usize)> {
+    let base = crate::store::store_base_dir()?;
+    search_steer_index_at(
+        &base,
+        run_id,
+        prompt_id,
+        agent,
+        kind,
+        project,
+        date_lo,
+        date_hi,
+        workflow_phase,
+        mode,
+        skill_code,
+        framework_version,
+        limit,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn search_steer_index(
+    run_id: Option<&str>,
+    prompt_id: Option<&str>,
+    agent: Option<&str>,
+    kind: Option<&str>,
+    project: Option<&str>,
+    date_lo: Option<&str>,
+    date_hi: Option<&str>,
+    workflow_phase: Option<&str>,
+    mode: Option<&str>,
+    skill_code: Option<&str>,
+    framework_version: Option<&str>,
+    limit: usize,
+) -> Result<Vec<serde_json::Value>> {
+    let (results, _) = search_steer_index_with_stats(
+        run_id,
+        prompt_id,
+        agent,
+        kind,
+        project,
+        date_lo,
+        date_hi,
+        workflow_phase,
+        mode,
+        skill_code,
+        framework_version,
+        limit,
+    )
+    .await?;
     Ok(results)
 }
 
@@ -280,16 +393,49 @@ mod tests {
 
     #[test]
     fn rebuild_detects_small_id_drift() {
-        let existing_ids = HashSet::from([
-            "2026_0331_codex_sess1_001".to_string(),
-            "2026_0331_codex_sess1_002".to_string(),
-        ]);
-        let store_ids = HashSet::from([
-            "2026_0331_codex_sess1_001".to_string(),
-            "2026_0331_codex_sess2_001".to_string(),
-        ]);
+        let existing_docs = vec![
+            ChromaDocument::new_flat(
+                "2026_0331_codex_sess1_001".to_string(),
+                STEER_NAMESPACE.to_string(),
+                vec![0.0],
+                serde_json::json!({ "path": "/tmp/one.md" }),
+                "".to_string(),
+            ),
+            ChromaDocument::new_flat(
+                "2026_0331_codex_sess1_002".to_string(),
+                STEER_NAMESPACE.to_string(),
+                vec![0.0],
+                serde_json::json!({ "path": "/tmp/two.md" }),
+                "".to_string(),
+            ),
+        ];
 
-        assert!(steer_index_needs_rebuild(&existing_ids, &store_ids));
+        let store_files = vec![
+            crate::store::StoredContextFile {
+                path: PathBuf::from("/tmp/one.md"),
+                project: "VetCoders/ai-contexters".to_string(),
+                repo: None,
+                date_compact: "2026_0331".to_string(),
+                date_iso: "2026-03-31".to_string(),
+                agent: "codex".to_string(),
+                kind: Kind::Reports,
+                session_id: "sess1".to_string(),
+                chunk: 1,
+            },
+            crate::store::StoredContextFile {
+                path: PathBuf::from("/tmp/three.md"),
+                project: "VetCoders/ai-contexters".to_string(),
+                repo: None,
+                date_compact: "2026_0331".to_string(),
+                date_iso: "2026-03-31".to_string(),
+                agent: "codex".to_string(),
+                kind: Kind::Reports,
+                session_id: "sess2".to_string(),
+                chunk: 1,
+            },
+        ];
+
+        assert!(steer_index_needs_rebuild(&existing_docs, &store_files));
     }
 
     #[test]
@@ -330,6 +476,134 @@ mod tests {
         assert_eq!(
             docs[0].metadata.get("prompt_id").and_then(|v| v.as_str()),
             Some("p2")
+        );
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn search_filters_on_steering_fields_and_reports_scanned_count() {
+        let temp = std::env::temp_dir().join(format!(
+            "ai-ctx-steer-filter-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&temp).unwrap();
+
+        let chunk_one =
+            write_chunk_with_sidecar(&temp, "2026_0331_codex_sess1_001.md", "mrbl-001", "p1");
+        let chunk_two =
+            write_chunk_with_sidecar(&temp, "2026_0331_codex_sess2_001.md", "mrbl-002", "p2");
+
+        let mut second_sidecar = crate::store::load_sidecar(&chunk_two).unwrap();
+        second_sidecar.workflow_phase = Some("implement".to_string());
+        second_sidecar.mode = Some("artifact-first".to_string());
+        second_sidecar.skill_code = Some("vc-workflow".to_string());
+        second_sidecar.framework_version = Some("2026-04".to_string());
+        fs::write(
+            chunk_two.with_extension("meta.json"),
+            serde_json::to_string(&second_sidecar).unwrap(),
+        )
+        .unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let refs = vec![&chunk_one, &chunk_two];
+        rt.block_on(sync_steer_index_at(&temp, &refs)).unwrap();
+
+        let (results, scanned) = rt
+            .block_on(search_steer_index_at(
+                &temp,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("MARBLES"),
+                Some("SESSION-FIRST"),
+                Some("VC-MARBLES"),
+                Some("2026-03"),
+                10,
+            ))
+            .unwrap();
+
+        assert_eq!(scanned, 2);
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].get("run_id").and_then(|v| v.as_str()),
+            Some("mrbl-001")
+        );
+        assert_eq!(
+            results[0].get("skill_code").and_then(|v| v.as_str()),
+            Some("vc-marbles")
+        );
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn search_rebuilds_when_sidecar_metadata_drifted_without_id_changes() {
+        let temp = std::env::temp_dir().join(format!(
+            "ai-ctx-steer-drift-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&temp).unwrap();
+
+        let chunk_path =
+            write_chunk_with_sidecar(&temp, "2026_0331_codex_sess1_001.md", "mrbl-001", "p1");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let refs = vec![&chunk_path];
+        rt.block_on(sync_steer_index_at(&temp, &refs)).unwrap();
+
+        let mut updated_sidecar = crate::store::load_sidecar(&chunk_path).unwrap();
+        updated_sidecar.workflow_phase = Some("implement".to_string());
+        updated_sidecar.mode = Some("artifact-first".to_string());
+        updated_sidecar.skill_code = Some("vc-workflow".to_string());
+        updated_sidecar.framework_version = Some("2026-04".to_string());
+        fs::write(
+            chunk_path.with_extension("meta.json"),
+            serde_json::to_string(&updated_sidecar).unwrap(),
+        )
+        .unwrap();
+
+        let (results, scanned) = rt
+            .block_on(search_steer_index_at(
+                &temp,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("implement"),
+                Some("artifact-first"),
+                Some("vc-workflow"),
+                Some("2026-04"),
+                10,
+            ))
+            .unwrap();
+
+        assert_eq!(scanned, 1);
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].get("workflow_phase").and_then(|v| v.as_str()),
+            Some("implement")
+        );
+        assert_eq!(
+            results[0].get("skill_code").and_then(|v| v.as_str()),
+            Some("vc-workflow")
+        );
+
+        let indexed_docs = rt.block_on(query_steer_index_at(&temp)).unwrap();
+        assert_eq!(
+            indexed_docs[0]
+                .metadata
+                .get("framework_version")
+                .and_then(|v| v.as_str()),
+            Some("2026-04")
         );
 
         let _ = fs::remove_dir_all(&temp);

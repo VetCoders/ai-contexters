@@ -16,6 +16,43 @@ use crate::sanitize;
 use crate::sanitize::normalize_query;
 use crate::store;
 
+/// Search backend selection for chunk retrieval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchBackend {
+    /// Fast semantic/BM25 retrieval from rmcp-memex.
+    FastMemex,
+    /// Exact scan of the canonical AICX store.
+    CanonicalStore,
+}
+
+/// Scoped filters must use canonical store truth so higher-ranked out-of-scope
+/// memex hits cannot crowd out the in-scope results before filtering.
+pub fn choose_search_backend(
+    project_filter: Option<&str>,
+    date_filter: Option<&str>,
+    hours: u64,
+    score_filter: Option<u8>,
+) -> SearchBackend {
+    if project_filter.is_some() || date_filter.is_some() || hours > 0 || score_filter.is_some() {
+        SearchBackend::CanonicalStore
+    } else {
+        SearchBackend::FastMemex
+    }
+}
+
+pub fn expanded_search_limit(
+    limit: usize,
+    date_filter: Option<&str>,
+    hours: u64,
+    score: Option<u8>,
+) -> usize {
+    if date_filter.is_some() || score.is_some() || hours > 0 {
+        limit.saturating_mul(5).max(50)
+    } else {
+        limit
+    }
+}
+
 // ============================================================================
 // Noise patterns — lines that inflate chunk size without adding value
 // ============================================================================
@@ -364,6 +401,7 @@ pub fn fuzzy_search_store(
 ) -> std::io::Result<(Vec<FuzzyResult>, usize)> {
     let normalized_query = normalize_query(query);
     let query_terms: Vec<&str> = normalized_query.split_whitespace().collect();
+    let match_all = query.trim() == "*" || query_terms.is_empty();
     let project_filter_lower = project_filter.map(|filter| filter.to_lowercase());
 
     let mut results = Vec::new();
@@ -400,10 +438,14 @@ pub fn fuzzy_search_store(
             .collect::<Vec<_>>()
             .join(" ");
 
-        let matched_terms = query_terms
-            .iter()
-            .filter(|&term| signal_text.contains(term))
-            .count();
+        let matched_terms = if match_all {
+            query_terms.len().max(1)
+        } else {
+            query_terms
+                .iter()
+                .filter(|&term| signal_text.contains(term))
+                .count()
+        };
 
         // Must match at least one term to be considered.
         // If query is multi-term, we don't strictly require ALL, but at least partial intersection
@@ -414,6 +456,9 @@ pub fn fuzzy_search_store(
         let matched_lines = signal_lines
             .iter()
             .filter(|line| {
+                if match_all {
+                    return !line.trim().is_empty();
+                }
                 let normalized_line = normalize_query(line);
                 query_terms
                     .iter()
@@ -425,7 +470,11 @@ pub fn fuzzy_search_store(
 
         let chunk_score = score_chunk_content(&content);
 
-        let match_ratio = matched_terms as f32 / query_terms.len() as f32;
+        let match_ratio = if match_all {
+            1.0
+        } else {
+            matched_terms as f32 / query_terms.len() as f32
+        };
         let final_score = ((chunk_score.score as f32 * 5.0 + 50.0 * match_ratio) as u8).min(100);
 
         // Read sidecar for session_id and cwd (best-effort)
@@ -1148,6 +1197,70 @@ Some boilerplate text.
             .expect("filtered search");
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].project, "VetCoders/ai-contexters");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn choose_search_backend_prefers_canonical_for_scoped_filters() {
+        assert_eq!(
+            choose_search_backend(None, None, 0, None),
+            SearchBackend::FastMemex
+        );
+        assert_eq!(
+            choose_search_backend(Some("ai-contexters"), None, 0, None),
+            SearchBackend::CanonicalStore
+        );
+        assert_eq!(
+            choose_search_backend(None, Some("2026-03-31"), 0, None),
+            SearchBackend::CanonicalStore
+        );
+        assert_eq!(
+            choose_search_backend(None, None, 24, None),
+            SearchBackend::CanonicalStore
+        );
+        assert_eq!(
+            choose_search_backend(None, None, 0, Some(60)),
+            SearchBackend::CanonicalStore
+        );
+    }
+
+    #[test]
+    fn expanded_search_limit_widens_post_filter_queries() {
+        assert_eq!(expanded_search_limit(10, None, 0, None), 10);
+        assert_eq!(expanded_search_limit(10, Some("2026-03-31"), 0, None), 50);
+        assert_eq!(expanded_search_limit(10, None, 24, None), 50);
+        assert_eq!(expanded_search_limit(10, None, 0, Some(60)), 50);
+    }
+
+    #[test]
+    fn fuzzy_search_wildcard_matches_store_without_query_terms() {
+        let root = search_test_root("fuzzy-wildcard");
+        let _ = fs::remove_dir_all(&root);
+
+        let chunk_path = root
+            .join("store")
+            .join("VetCoders")
+            .join("ai-contexters")
+            .join("2026_0321")
+            .join("reports")
+            .join("codex")
+            .join("2026_0321_codex_sess-wild_001.md");
+        write_chunk(
+            &chunk_path,
+            "Decision: wildcard search should still return scoped chunks",
+        );
+
+        let (results, scanned) =
+            fuzzy_search_store(&root, "*", 10, None).expect("wildcard search should work");
+
+        assert_eq!(scanned, 1);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].project, "VetCoders/ai-contexters");
+        assert!(
+            !results[0].matched_lines.is_empty(),
+            "wildcard search should still surface representative lines"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }

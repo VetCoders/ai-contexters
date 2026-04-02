@@ -46,14 +46,6 @@ struct Cli {
     )]
     redact_secrets: bool,
 
-    /// Project filter (used if no subcommand is provided)
-    #[arg(short, long, global = true)]
-    project: Option<String>,
-
-    /// Hours to look back (used if no subcommand is provided)
-    #[arg(short = 'H', long, default_value = "48", global = true)]
-    hours: u64,
-
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -562,12 +554,12 @@ enum Commands {
 
     /// Retrieve chunks by steering metadata (frontmatter fields).
     ///
-    /// Filters by run_id, prompt_id, agent, kind, project, and/or date range
-    /// using sidecar metadata — no filesystem grep needed.
-    ///
-    /// Example:
-    ///   aicx steer --run-id mrbl-001
-    ///   aicx steer --project ai-contexters --kind reports --date 2026-03-28
+    /// Filters by run_id, prompt_id, agent, kind, project, date range, and
+    /// steering fields such as workflow_phase, mode, skill_code, and
+    /// framework_version using sidecar metadata — no filesystem grep needed.
+    #[command(
+        after_help = "Examples:\n  aicx steer --run-id mrbl-001\n  aicx steer --project ai-contexters --kind reports --date 2026-03-28\n  aicx steer --workflow-phase marbles --skill-code vc-marbles --mode session-first"
+    )]
     Steer {
         /// Filter by run_id (exact match)
         #[arg(long)]
@@ -593,6 +585,22 @@ enum Commands {
         /// or open-ended (2026-03-20.. or ..2026-03-28)
         #[arg(short, long)]
         date: Option<String>,
+
+        /// Filter by workflow phase (exact match, case-insensitive)
+        #[arg(long = "workflow-phase", alias = "phase")]
+        workflow_phase: Option<String>,
+
+        /// Filter by steering mode (exact match, case-insensitive)
+        #[arg(long)]
+        mode: Option<String>,
+
+        /// Filter by framework skill code (exact match, case-insensitive)
+        #[arg(long = "skill-code")]
+        skill_code: Option<String>,
+
+        /// Filter by framework version (exact match, case-insensitive)
+        #[arg(long = "framework-version")]
+        framework_version: Option<String>,
 
         /// Maximum results
         #[arg(short, long, default_value = "20")]
@@ -898,17 +906,25 @@ fn main() -> Result<()> {
             kind,
             project,
             date,
+            workflow_phase,
+            mode,
+            skill_code,
+            framework_version,
             limit,
         }) => {
-            run_steer(
-                run_id.as_deref(),
-                prompt_id.as_deref(),
-                agent.as_deref(),
-                kind.as_deref(),
-                project.as_deref(),
-                date.as_deref(),
+            run_steer(SteerCliQuery {
+                run_id: run_id.as_deref(),
+                prompt_id: prompt_id.as_deref(),
+                agent: agent.as_deref(),
+                kind: kind.as_deref(),
+                project: project.as_deref(),
+                date: date.as_deref(),
+                workflow_phase: workflow_phase.as_deref(),
+                mode: mode.as_deref(),
+                skill_code: skill_code.as_deref(),
+                framework_version: framework_version.as_deref(),
                 limit,
-            )?;
+            })?;
         }
         Some(Commands::Migrate {
             dry_run,
@@ -1817,26 +1833,30 @@ fn run_search(
     };
 
     let root = store::store_base_dir()?;
-    // Fetch more results pre-filter so score/date/hours filtering has material to work with.
-    let fetch_limit = if effective_date.is_some() || score.is_some() || hours > 0 {
-        limit.saturating_mul(5).max(50)
-    } else {
-        limit
-    };
+    let fetch_limit = rank::expanded_search_limit(limit, effective_date.as_deref(), hours, score);
 
-    // Try fast search with rmcp_memex first (instant), fallback to brute-force if it fails or returns nothing
-    let (results, scanned) = if let Ok(rt) = tokio::runtime::Runtime::new() {
-        match rt.block_on(memex::fast_memex_search(
-            &search_query,
-            fetch_limit,
-            project,
-        )) {
-            Ok((res, scan)) if !res.is_empty() => (res, scan),
-            _ => rank::fuzzy_search_store(&root, &search_query, fetch_limit, project)?,
-        }
-    } else {
-        rank::fuzzy_search_store(&root, &search_query, fetch_limit, project)?
-    };
+    let (results, scanned) =
+        match rank::choose_search_backend(project, effective_date.as_deref(), hours, score) {
+            rank::SearchBackend::CanonicalStore => {
+                rank::fuzzy_search_store(&root, &search_query, fetch_limit, project)?
+            }
+            rank::SearchBackend::FastMemex => {
+                // Unscoped search can stay on the fast memex path because there is
+                // no canonical filter that could be undermined by top-N truncation.
+                if let Ok(rt) = tokio::runtime::Runtime::new() {
+                    match rt.block_on(memex::fast_memex_search(
+                        &search_query,
+                        fetch_limit,
+                        project,
+                    )) {
+                        Ok((res, scan)) if !res.is_empty() => (res, scan),
+                        _ => rank::fuzzy_search_store(&root, &search_query, fetch_limit, project)?,
+                    }
+                } else {
+                    rank::fuzzy_search_store(&root, &search_query, fetch_limit, project)?
+                }
+            }
+        };
 
     let mut results = results;
 
@@ -1893,19 +1913,25 @@ fn run_search(
     Ok(())
 }
 
-/// Retrieve chunks by steering metadata (frontmatter sidecar fields).
-fn run_steer(
-    run_id: Option<&str>,
-    prompt_id: Option<&str>,
-    agent: Option<&str>,
-    kind: Option<&str>,
-    project: Option<&str>,
-    date: Option<&str>,
+struct SteerCliQuery<'a> {
+    run_id: Option<&'a str>,
+    prompt_id: Option<&'a str>,
+    agent: Option<&'a str>,
+    kind: Option<&'a str>,
+    project: Option<&'a str>,
+    date: Option<&'a str>,
+    workflow_phase: Option<&'a str>,
+    mode: Option<&'a str>,
+    skill_code: Option<&'a str>,
+    framework_version: Option<&'a str>,
     limit: usize,
-) -> Result<()> {
+}
+
+/// Retrieve chunks by steering metadata (frontmatter sidecar fields).
+fn run_steer(query: SteerCliQuery<'_>) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
 
-    let (date_lo, date_hi) = if let Some(d) = date {
+    let (date_lo, date_hi) = if let Some(d) = query.date {
         let bounds = parse_date_filter(d)?;
         (bounds.0, bounds.1)
     } else {
@@ -1913,14 +1939,18 @@ fn run_steer(
     };
 
     let metadatas = rt.block_on(ai_contexters::steer_index::search_steer_index(
-        run_id,
-        prompt_id,
-        agent,
-        kind,
-        project,
+        query.run_id,
+        query.prompt_id,
+        query.agent,
+        query.kind,
+        query.project,
         date_lo.as_deref(),
         date_hi.as_deref(),
-        limit,
+        query.workflow_phase,
+        query.mode,
+        query.skill_code,
+        query.framework_version,
+        query.limit,
     ))?;
 
     let stdout = io::stdout();
@@ -1943,6 +1973,22 @@ fn run_steer(
             .get("agent_model")
             .and_then(|v| v.as_str())
             .unwrap_or("-");
+        let phase_str = meta
+            .get("workflow_phase")
+            .and_then(|v| v.as_str())
+            .unwrap_or("-");
+        let mode_str = meta.get("mode").and_then(|v| v.as_str()).unwrap_or("-");
+        let skill_str = meta
+            .get("skill_code")
+            .and_then(|v| v.as_str())
+            .unwrap_or("-");
+        let framework_str = meta
+            .get("framework_version")
+            .and_then(|v| v.as_str())
+            .unwrap_or("-");
+        let show_steering = [phase_str, mode_str, skill_str, framework_str]
+            .iter()
+            .any(|value| *value != "-");
 
         if color {
             let _ = writeln!(
@@ -1954,6 +2000,12 @@ fn run_steer(
                 out,
                 "  run_id: \x1b[33m{run_str}\x1b[0m  prompt_id: \x1b[33m{prompt_str}\x1b[0m  model: \x1b[90m{model_str}\x1b[0m"
             );
+            if show_steering {
+                let _ = writeln!(
+                    out,
+                    "  phase: \x1b[36m{phase_str}\x1b[0m  mode: \x1b[36m{mode_str}\x1b[0m  skill: \x1b[36m{skill_str}\x1b[0m  fw: \x1b[36m{framework_str}\x1b[0m"
+                );
+            }
             let _ = writeln!(out, "  \x1b[90;4m{}\x1b[0m", path);
             let _ = writeln!(out);
         } else {
@@ -1962,6 +2014,12 @@ fn run_steer(
                 out,
                 "  run_id: {run_str}  prompt_id: {prompt_str}  model: {model_str}"
             );
+            if show_steering {
+                let _ = writeln!(
+                    out,
+                    "  phase: {phase_str}  mode: {mode_str}  skill: {skill_str}  fw: {framework_str}"
+                );
+            }
             let _ = writeln!(out, "  {}", path);
             let _ = writeln!(out);
         }
@@ -2437,6 +2495,39 @@ mod tests {
     }
 
     #[test]
+    fn steer_accepts_new_steering_filters() {
+        let cli = Cli::try_parse_from([
+            "aicx",
+            "steer",
+            "--workflow-phase",
+            "marbles",
+            "--mode",
+            "session-first",
+            "--skill-code",
+            "vc-marbles",
+            "--framework-version",
+            "2026-03",
+        ])
+        .expect("steer command with steering filters should parse");
+
+        match cli.command {
+            Some(Commands::Steer {
+                workflow_phase,
+                mode,
+                skill_code,
+                framework_version,
+                ..
+            }) => {
+                assert_eq!(workflow_phase.as_deref(), Some("marbles"));
+                assert_eq!(mode.as_deref(), Some("session-first"));
+                assert_eq!(skill_code.as_deref(), Some("vc-marbles"));
+                assert_eq!(framework_version.as_deref(), Some("2026-03"));
+            }
+            _ => panic!("expected steer command"),
+        }
+    }
+
+    #[test]
     fn rank_subcommand_is_rejected() {
         let err = Cli::try_parse_from(["aicx", "rank", "-p", "foo"])
             .expect_err("rank subcommand should be rejected");
@@ -2453,6 +2544,9 @@ mod tests {
         assert!(rendered.contains("init"));
         assert!(rendered.contains("Retired compatibility shim"));
         assert!(!rendered.contains("Initialize repo context and run an agent"));
+        assert!(!rendered.contains("used if no subcommand is provided"));
+        assert!(!rendered.contains("--project <PROJECT>"));
+        assert!(!rendered.contains("--hours <HOURS>"));
     }
 
     #[test]
@@ -2481,6 +2575,54 @@ mod tests {
 
         assert!(rendered.contains("server-shell UI"));
         assert!(!rendered.contains("--artifact"));
+    }
+
+    #[test]
+    fn dashboard_serve_help_omits_dead_global_filters() {
+        let mut cmd = Cli::command();
+        let dashboard_serve = cmd
+            .find_subcommand_mut("dashboard-serve")
+            .expect("dashboard-serve subcommand should exist");
+        let rendered = dashboard_serve.render_long_help().to_string();
+
+        assert!(!rendered.contains("--project <PROJECT>"));
+        assert!(!rendered.contains("--hours <HOURS>"));
+        assert!(!rendered.contains("used if no subcommand is provided"));
+    }
+
+    #[test]
+    fn steer_help_keeps_examples_multiline_and_mentions_steering_filters() {
+        let mut cmd = Cli::command();
+        let steer = cmd
+            .find_subcommand_mut("steer")
+            .expect("steer subcommand should exist");
+        let rendered = steer.render_long_help().to_string();
+
+        assert!(rendered.contains("Examples:"));
+        assert!(rendered.contains("aicx steer --run-id mrbl-001"));
+        assert!(
+            rendered
+                .contains("aicx steer --project ai-contexters --kind reports --date 2026-03-28")
+        );
+        assert!(rendered.contains(
+            "aicx steer --workflow-phase marbles --skill-code vc-marbles --mode session-first"
+        ));
+        assert!(rendered.contains("--workflow-phase <WORKFLOW_PHASE>"));
+        assert!(rendered.contains("--skill-code <SKILL_CODE>"));
+        assert!(!rendered.contains("--hours <HOURS>"));
+    }
+
+    #[test]
+    fn migrate_help_omits_dead_global_filters() {
+        let mut cmd = Cli::command();
+        let migrate = cmd
+            .find_subcommand_mut("migrate")
+            .expect("migrate subcommand should exist");
+        let rendered = migrate.render_long_help().to_string();
+
+        assert!(!rendered.contains("--project <PROJECT>"));
+        assert!(!rendered.contains("--hours <HOURS>"));
+        assert!(!rendered.contains("used if no subcommand is provided"));
     }
 
     #[test]

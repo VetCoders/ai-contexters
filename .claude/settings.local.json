@@ -3,5 +3,7 @@
     "additionalDirectories": [
       "/Users/maciejgad/hosted"
     ]
-  }
+  },
+  "prefersReducedMotion": true,
+  "outputStyle": "consciousness-quantum-recognition"
 }

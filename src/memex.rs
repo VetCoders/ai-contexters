@@ -7,7 +7,7 @@
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use dirs;
 use rmcp_memex::compute_content_hash;
@@ -176,6 +176,45 @@ pub fn check_memex_available() -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
+fn ensure_memex_available() -> Result<()> {
+    if check_memex_available() {
+        Ok(())
+    } else {
+        bail!(missing_memex_binary_message());
+    }
+}
+
+fn missing_memex_binary_message() -> &'static str {
+    "External dependency `rmcp-memex` not found in PATH. Install with: cargo install rmcp-memex"
+}
+
+fn memex_command_context(command: &str) -> String {
+    format!("Failed to run external dependency `rmcp-memex {command}`")
+}
+
+fn memex_command_failure(command: &str, stderr: &[u8]) -> anyhow::Error {
+    anyhow!(
+        "External dependency `rmcp-memex {command}` failed: {}",
+        String::from_utf8_lossy(stderr).trim()
+    )
+}
+
+pub(crate) fn run_memex_command(command: &str, args: &[&str]) -> Result<std::process::Output> {
+    ensure_memex_available()?;
+
+    let output = Command::new("rmcp-memex")
+        .arg(command)
+        .args(args)
+        .output()
+        .context(memex_command_context(command))?;
+
+    if !output.status.success() {
+        return Err(memex_command_failure(command, &output.stderr));
+    }
+
+    Ok(output)
+}
+
 // ============================================================================
 // Batch sync (primary method)
 // ============================================================================
@@ -189,9 +228,7 @@ pub fn check_memex_available() -> bool {
 /// This is the fastest method — rmcp-memex handles deduplication internally
 /// via content hashing.
 pub fn sync_chunks_batch(chunks_dir: &Path, config: &MemexConfig) -> Result<SyncResult> {
-    if !check_memex_available() {
-        bail!("rmcp-memex not found in PATH. Install with: cargo install rmcp-memex");
-    }
+    ensure_memex_available()?;
 
     if !chunks_dir.exists() || !chunks_dir.is_dir() {
         return Ok(SyncResult::default());
@@ -215,7 +252,7 @@ pub fn sync_chunks_batch(chunks_dir: &Path, config: &MemexConfig) -> Result<Sync
 
     let mut cmd = Command::new("rmcp-memex");
     cmd.arg("index")
-        .arg(chunks_dir)
+        .arg(&validated_dir)
         .arg("-n")
         .arg(&config.namespace)
         .arg("-s")
@@ -232,11 +269,10 @@ pub fn sync_chunks_batch(chunks_dir: &Path, config: &MemexConfig) -> Result<Sync
         cmd.arg("--db-path").arg(db_path);
     }
 
-    let output = cmd.output().context("Failed to run rmcp-memex index")?;
+    let output = cmd.output().context(memex_command_context("index"))?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("rmcp-memex index failed: {}", stderr.trim());
+        return Err(memex_command_failure("index", &output.stderr));
     }
 
     // Parse output for stats
@@ -256,9 +292,7 @@ pub fn sync_chunks_batch(chunks_dir: &Path, config: &MemexConfig) -> Result<Sync
 /// Sync a specific list of chunk files to memex using a temporary JSONL import.
 /// This ensures metadata parity between batch and per-chunk sync.
 pub fn sync_chunks_import(chunk_paths: &[PathBuf], config: &MemexConfig) -> Result<SyncResult> {
-    if !check_memex_available() {
-        bail!("rmcp-memex not found in PATH. Install with: cargo install rmcp-memex");
-    }
+    ensure_memex_available()?;
 
     if chunk_paths.is_empty() {
         return Ok(SyncResult::default());
@@ -275,7 +309,7 @@ pub fn sync_chunks_import(chunk_paths: &[PathBuf], config: &MemexConfig) -> Resu
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
         let text = sanitize::read_to_string_validated(&validated_path)?;
-        let line = chunk_import_record(&validated_path, &id, &text);
+        let line = chunk_import_record(&validated_path, &id, &text)?;
         serde_json::to_writer(&file, &line)?;
         writeln!(&mut file)?;
         count += 1;
@@ -293,14 +327,11 @@ pub fn sync_chunks_import(chunk_paths: &[PathBuf], config: &MemexConfig) -> Resu
         cmd.arg("--db-path").arg(db_path);
     }
 
-    let output = cmd
-        .output()
-        .context("Failed to run rmcp-memex import via external dependency 'rmcp-memex'")?;
+    let output = cmd.output().context(memex_command_context("import"))?;
     let _ = fs::remove_file(&tmp_jsonl);
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("rmcp-memex import failed: {}", stderr.trim());
+        return Err(memex_command_failure("import", &output.stderr));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -385,10 +416,8 @@ fn build_sync_candidate(path: &Path) -> Result<SyncCandidate> {
 }
 
 fn chunk_payload_hash(chunk_path: &Path, chunk_id: &str, text: &str) -> Result<String> {
-    let record = chunk_import_record(chunk_path, chunk_id, text);
-    let serialized =
-        serde_json::to_string(&record).context("Failed to serialize memex import payload")?;
-    Ok(compute_content_hash(&serialized))
+    let (_, payload_hash) = chunk_metadata_with_hash(chunk_path, chunk_id, text)?;
+    Ok(payload_hash)
 }
 
 #[cfg(test)]
@@ -455,8 +484,11 @@ fn chunk_metadata_from_header(text: &str) -> serde_json::Map<String, serde_json:
     metadata
 }
 
-fn chunk_metadata_for_upsert(chunk_path: &Path, chunk_id: &str, text: &str) -> serde_json::Value {
-    let content_hash = compute_content_hash(text);
+fn chunk_metadata_base(
+    chunk_path: &Path,
+    chunk_id: &str,
+    text: &str,
+) -> serde_json::Map<String, serde_json::Value> {
     let mut metadata = serde_json::Map::from_iter([
         (
             "source".to_string(),
@@ -469,10 +501,6 @@ fn chunk_metadata_for_upsert(chunk_path: &Path, chunk_id: &str, text: &str) -> s
         (
             "path".to_string(),
             serde_json::Value::String(chunk_path.to_string_lossy().to_string()),
-        ),
-        (
-            "content_hash".to_string(),
-            serde_json::Value::String(content_hash),
         ),
     ]);
 
@@ -516,16 +544,52 @@ fn chunk_metadata_for_upsert(chunk_path: &Path, chunk_id: &str, text: &str) -> s
         metadata.extend(chunk_metadata_from_header(text));
     }
 
-    serde_json::Value::Object(metadata)
+    metadata
 }
 
-fn chunk_import_record(chunk_path: &Path, chunk_id: &str, text: &str) -> ImportRecord {
-    ImportRecord {
+fn chunk_metadata_with_hash(
+    chunk_path: &Path,
+    chunk_id: &str,
+    text: &str,
+) -> Result<(serde_json::Value, String)> {
+    let mut metadata = chunk_metadata_base(chunk_path, chunk_id, text);
+    let hash_input = serde_json::json!({
+        "id": chunk_id,
+        "text": text,
+        "metadata": metadata,
+    });
+    let serialized = serde_json::to_string(&hash_input)
+        .context("Failed to serialize canonical memex payload")?;
+
+    // rmcp-memex import deduplicates by content_hash, so AICX treats that
+    // field as the canonical chunk payload identity rather than raw text.
+    let content_hash = compute_content_hash(&serialized);
+    metadata.insert(
+        "content_hash".to_string(),
+        serde_json::Value::String(content_hash.clone()),
+    );
+
+    Ok((serde_json::Value::Object(metadata), content_hash))
+}
+
+fn chunk_metadata_for_upsert(
+    chunk_path: &Path,
+    chunk_id: &str,
+    text: &str,
+) -> Result<serde_json::Value> {
+    let (metadata, _) = chunk_metadata_with_hash(chunk_path, chunk_id, text)?;
+    Ok(metadata)
+}
+
+fn chunk_import_record(chunk_path: &Path, chunk_id: &str, text: &str) -> Result<ImportRecord> {
+    let (metadata, content_hash) = chunk_metadata_with_hash(chunk_path, chunk_id, text)?;
+
+    Ok(ImportRecord {
         id: chunk_id.to_string(),
         text: text.to_string(),
-        metadata: chunk_metadata_for_upsert(chunk_path, chunk_id, text),
-        content_hash: compute_content_hash(text),
-    }
+        metadata,
+        content_hash,
+    })
 }
 
 // ============================================================================
@@ -541,9 +605,7 @@ pub fn sync_chunk_single(
     metadata: &serde_json::Value,
     config: &MemexConfig,
 ) -> Result<()> {
-    if !check_memex_available() {
-        bail!("rmcp-memex not found in PATH");
-    }
+    ensure_memex_available()?;
 
     let meta_str = serde_json::to_string(metadata)?;
 
@@ -564,15 +626,14 @@ pub fn sync_chunk_single(
 
     let output = cmd
         .output()
-        .with_context(|| format!("Failed to upsert chunk: {}", chunk_id))?;
+        .with_context(|| format!("{} for chunk {}", memex_command_context("upsert"), chunk_id))?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!(
-            "rmcp-memex upsert failed for {}: {}",
-            chunk_id,
-            stderr.trim()
-        );
+        return Err(anyhow!(
+            "{} for chunk {}",
+            memex_command_failure("upsert", &output.stderr),
+            chunk_id
+        ));
     }
 
     Ok(())
@@ -680,7 +741,13 @@ pub fn sync_new_chunk_paths(chunk_paths: &[PathBuf], config: &MemexConfig) -> Re
             }
         };
 
-        let metadata = chunk_metadata_for_upsert(&validated_file, &candidate.id, &text);
+        let metadata = match chunk_metadata_for_upsert(&validated_file, &candidate.id, &text) {
+            Ok(metadata) => metadata,
+            Err(e) => {
+                result.errors.push(format!("{}: {}", candidate.id, e));
+                continue;
+            }
+        };
 
         match sync_chunk_single(&candidate.id, &text, &metadata, config) {
             Ok(()) => {
@@ -913,23 +980,7 @@ pub async fn fast_memex_search(
 ///
 /// Runs: `rmcp-memex search -n <namespace> -q <query>`
 pub fn search_memex(query: &str, namespace: &str) -> Result<String> {
-    if !check_memex_available() {
-        bail!("rmcp-memex not found in PATH");
-    }
-
-    let output = Command::new("rmcp-memex")
-        .arg("search")
-        .arg("-n")
-        .arg(namespace)
-        .arg("-q")
-        .arg(query)
-        .output()
-        .context("Failed to run rmcp-memex search")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("rmcp-memex search failed: {}", stderr.trim());
-    }
+    let output = run_memex_command("search", &["-n", namespace, "-q", query])?;
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
@@ -1044,6 +1095,21 @@ mod tests {
     }
 
     #[test]
+    fn test_memex_boundary_messages_are_actionable() {
+        assert!(missing_memex_binary_message().contains("External dependency `rmcp-memex`"));
+        assert!(missing_memex_binary_message().contains("cargo install rmcp-memex"));
+        assert!(
+            memex_command_context("search")
+                .contains("Failed to run external dependency `rmcp-memex search`")
+        );
+        assert!(
+            memex_command_failure("upsert", b"boom")
+                .to_string()
+                .contains("External dependency `rmcp-memex upsert` failed: boom")
+        );
+    }
+
+    #[test]
     fn test_chunk_metadata_from_header() {
         let text = "[project: prview-rs | agent: claude | date: 2026-03-24]\n\nhello";
         let metadata = chunk_metadata_from_header(text);
@@ -1091,8 +1157,9 @@ mod tests {
         )
         .unwrap();
 
-        let metadata = chunk_metadata_for_upsert(&chunk_path, "chunk", "body");
+        let metadata = chunk_metadata_for_upsert(&chunk_path, "chunk", "body").unwrap();
         let object = metadata.as_object().unwrap();
+        let expected_hash = chunk_payload_hash(&chunk_path, "chunk", "body").unwrap();
 
         assert_eq!(object.get("project").unwrap(), "prview-rs");
         assert_eq!(object.get("agent").unwrap(), "claude");
@@ -1120,8 +1187,9 @@ mod tests {
         );
         assert_eq!(
             object.get("content_hash").unwrap(),
-            &serde_json::Value::String(compute_content_hash("body"))
+            &serde_json::Value::String(expected_hash.clone())
         );
+        assert_ne!(expected_hash, compute_content_hash("body"));
 
         let _ = fs::remove_dir_all(&tmp);
     }
@@ -1129,10 +1197,21 @@ mod tests {
     #[test]
     fn test_chunk_import_record_includes_content_hash() {
         let chunk_path = PathBuf::from("/tmp/ctx/chunk.md");
-        let record = chunk_import_record(&chunk_path, "chunk", "body");
+        let record = chunk_import_record(&chunk_path, "chunk", "body").unwrap();
 
         assert_eq!(record.id, "chunk");
-        assert_eq!(record.content_hash, compute_content_hash("body"));
+        assert_eq!(
+            record.content_hash,
+            chunk_payload_hash(&chunk_path, "chunk", "body").unwrap()
+        );
+        assert_eq!(
+            record
+                .metadata
+                .get("content_hash")
+                .and_then(|value| value.as_str()),
+            Some(record.content_hash.as_str())
+        );
+        assert_ne!(record.content_hash, compute_content_hash("body"));
     }
 
     #[test]
@@ -1170,7 +1249,7 @@ mod tests {
         )
         .unwrap();
 
-        let first = chunk_payload_hash(&chunk_path, "chunk", "body").unwrap();
+        let first = chunk_import_record(&chunk_path, "chunk", "body").unwrap();
 
         let mut updated_sidecar = crate::store::load_sidecar(&chunk_path).unwrap();
         updated_sidecar.prompt_id = Some("api-redesign_20260328".to_string());
@@ -1180,9 +1259,23 @@ mod tests {
         )
         .unwrap();
 
-        let second = chunk_payload_hash(&chunk_path, "chunk", "body").unwrap();
+        let second = chunk_import_record(&chunk_path, "chunk", "body").unwrap();
 
-        assert_ne!(first, second);
+        assert_ne!(first.content_hash, second.content_hash);
+        assert_eq!(
+            first
+                .metadata
+                .get("content_hash")
+                .and_then(|value| value.as_str()),
+            Some(first.content_hash.as_str())
+        );
+        assert_eq!(
+            second
+                .metadata
+                .get("content_hash")
+                .and_then(|value| value.as_str()),
+            Some(second.content_hash.as_str())
+        );
 
         let _ = fs::remove_dir_all(&tmp);
     }

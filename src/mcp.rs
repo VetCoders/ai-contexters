@@ -80,6 +80,14 @@ pub struct SteerParams {
     pub project: Option<String>,
     /// Filter by date (YYYY-MM-DD, or range like 2026-03-20..2026-03-28)
     pub date: Option<String>,
+    /// Filter by workflow_phase (exact match, case-insensitive)
+    pub workflow_phase: Option<String>,
+    /// Filter by mode (exact match, case-insensitive)
+    pub mode: Option<String>,
+    /// Filter by skill_code (exact match, case-insensitive)
+    pub skill_code: Option<String>,
+    /// Filter by framework_version (exact match, case-insensitive)
+    pub framework_version: Option<String>,
     /// Max results (default: 20)
     #[serde(default = "default_steer_limit")]
     pub limit: usize,
@@ -174,11 +182,7 @@ impl AicxMcpServer {
         let score = validate_score_filter(params.score)?;
         let hours = params.hours.unwrap_or(0);
         let date = params.date;
-        let fetch_limit = if score.is_some() || date.is_some() || hours > 0 {
-            limit.saturating_mul(5).max(50)
-        } else {
-            limit
-        };
+        let fetch_limit = rank::expanded_search_limit(limit, date.as_deref(), hours, score);
 
         // Non-blocking auto-rescan with rate-limit guard.
         if !RESCAN_RUNNING.swap(true, Ordering::SeqCst) {
@@ -202,16 +206,28 @@ impl AicxMcpServer {
             }
         }
 
-        // Try fast search with rmcp_memex first (instant), fallback to brute-force if it fails
+        let store_root = store::store_base_dir()
+            .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
+
         let (results, scanned) =
-            match crate::memex::fast_memex_search(&query, fetch_limit, project.as_deref()).await {
-                Ok((res, scan)) if !res.is_empty() => (res, scan),
-                _ => {
-                    // Fallback to reading all markdown files sequentially (slow)
-                    let store_root = store::store_base_dir()
-                        .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
+            match rank::choose_search_backend(project.as_deref(), date.as_deref(), hours, score) {
+                rank::SearchBackend::CanonicalStore => {
                     rank::fuzzy_search_store(&store_root, &query, fetch_limit, project.as_deref())
                         .map_err(|e| McpError::internal_error(format!("Read store: {e}"), None))?
+                }
+                rank::SearchBackend::FastMemex => {
+                    match crate::memex::fast_memex_search(&query, fetch_limit, project.as_deref())
+                        .await
+                    {
+                        Ok((res, scan)) if !res.is_empty() => (res, scan),
+                        _ => rank::fuzzy_search_store(
+                            &store_root,
+                            &query,
+                            fetch_limit,
+                            project.as_deref(),
+                        )
+                        .map_err(|e| McpError::internal_error(format!("Read store: {e}"), None))?,
+                    }
                 }
             };
 
@@ -318,7 +334,7 @@ impl AicxMcpServer {
 
     #[tool(
         name = "aicx_steer",
-        description = "Retrieve stored chunks by steering metadata (frontmatter fields). Filters by run_id, prompt_id, agent, kind, project, and/or date range using sidecar metadata — no filesystem grep needed. Returns chunk paths with their sidecar metadata for selective re-entry."
+        description = "Retrieve stored chunks by steering metadata (frontmatter fields). Filters by run_id, prompt_id, agent, kind, project, date range, workflow_phase, mode, skill_code, and framework_version using sidecar metadata — no filesystem grep needed. Returns chunk paths with their sidecar metadata for selective re-entry."
     )]
     async fn steer(
         &self,
@@ -340,6 +356,10 @@ impl AicxMcpServer {
             params.project.as_deref(),
             date_lo.as_deref(),
             date_hi.as_deref(),
+            params.workflow_phase.as_deref(),
+            params.mode.as_deref(),
+            params.skill_code.as_deref(),
+            params.framework_version.as_deref(),
             limit,
         )
         .await
@@ -470,7 +490,7 @@ fn validate_score_filter(score: Option<u8>) -> Result<Option<u8>, McpError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_SCORE_FILTER, RankItem, RankResponse, SearchParams, SteerResponse,
+        MAX_SCORE_FILTER, RankItem, RankResponse, SearchParams, SteerParams, SteerResponse,
         incremental_rescan_args, parse_date_filter_mcp, validate_score_filter,
     };
 
@@ -594,6 +614,25 @@ mod tests {
         assert!(params.score.is_none());
         assert!(params.hours.is_none());
         assert!(params.date.is_none());
+    }
+
+    #[test]
+    fn steer_params_roundtrip_include_steering_filters() {
+        let params: SteerParams = serde_json::from_str(
+            r#"{
+                "workflow_phase":"marbles",
+                "mode":"session-first",
+                "skill_code":"vc-marbles",
+                "framework_version":"2026-03"
+            }"#,
+        )
+        .expect("steer params should parse");
+
+        assert_eq!(params.limit, 20);
+        assert_eq!(params.workflow_phase.as_deref(), Some("marbles"));
+        assert_eq!(params.mode.as_deref(), Some("session-first"));
+        assert_eq!(params.skill_code.as_deref(), Some("vc-marbles"));
+        assert_eq!(params.framework_version.as_deref(), Some("2026-03"));
     }
 
     #[test]

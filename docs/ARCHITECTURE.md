@@ -79,17 +79,23 @@ Report files and chunk sidecars can include frontmatter metadata used for **stee
 agent: codex
 run_id: mrbl-001
 prompt_id: api-redesign_20260327
-model: claude-3-5-sonnet
-started_at: “2026-03-24T10:00:00Z”
-completed_at: “2026-03-24T10:30:00Z”
+model: gpt-5.4
+started_at: "2026-03-24T10:00:00Z"
+completed_at: "2026-03-24T10:30:00Z"
 token_usage: 125000
 findings_count: 3
+phase: marbles
+mode: session-first
+skill_code: vc-marbles
+framework_version: 2026-03
 ---
 ```
 
-These fields are parsed by `src/frontmatter.rs`, applied during chunking, and persisted as `.meta.json` sidecars alongside each chunk file. The `steer` command (CLI), `aicx_steer` tool (MCP), and `/api/search/steer` endpoint (dashboard) allow retrieval by these fields without filesystem grep.
+These fields are parsed by `src/frontmatter.rs`, applied during chunking, and persisted as `.meta.json` sidecars alongside each chunk file. Telemetry fields such as `run_id`, `prompt_id`, `started_at`, and `findings_count` survive as sidecar truth, while steering fields such as `phase` (`workflow_phase` in sidecars), `mode`, `skill_code`, and `framework_version` become first-class retrieval filters.
 
-Frontmatter is not just telemetry — it is part of the steering and selective re-entry contract. Orchestration can use `run_id` to retrieve all chunks from a specific agent run, `prompt_id` to find outputs from a specific prompt, or combine filters to narrow scope precisely.
+The `steer` command (CLI), `aicx_steer` tool (MCP), and `/api/search/steer` endpoint (dashboard) allow retrieval by these fields without filesystem grep.
+
+Frontmatter is not just telemetry — it is part of the steering and selective re-entry contract. Orchestration can use `run_id` to retrieve all chunks from a specific agent run, `prompt_id` to find outputs from a specific prompt, or combine them with `workflow_phase`, `mode`, `skill_code`, or `framework_version` to narrow scope precisely.
 
 ## Data Flow: `store`
 
@@ -106,7 +112,7 @@ The MCP server exposes three tools via stdio and streamable HTTP transports:
 
 - `aicx_search` — fuzzy text search across stored chunks with quality scoring; returns compact JSON using the same rich fields as CLI `aicx search --json`
 - `aicx_rank` — rank chunks by signal density for a project as compact JSON
-- `aicx_steer` — retrieve chunks by steering metadata (run_id, prompt_id, agent, kind, project, date) using sidecar data; the primary metadata-aware retrieval path for orchestration
+- `aicx_steer` — retrieve chunks by steering metadata (`run_id`, `prompt_id`, `agent`, `kind`, `project`, `date`, `workflow_phase`, `mode`, `skill_code`, `framework_version`) using sidecar data; the primary metadata-aware retrieval path for orchestration
 
 Recency filtering in `aicx_search` and `aicx_steer` uses canonical chunk dates from the store layout, not filesystem `mtime` accidents.
 

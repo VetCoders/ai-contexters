@@ -202,7 +202,7 @@ aicx search "decisions march 2026"
 
 ## `aicx steer`
 
-Retrieve chunks by steering metadata (frontmatter sidecar fields). Filters by `run_id`, `prompt_id`, agent, kind, project, and/or date range using sidecar metadata — no filesystem grep needed.
+Retrieve chunks by steering metadata (frontmatter sidecar fields). Filters by `run_id`, `prompt_id`, agent, kind, project, date range, and steering fields like `workflow_phase`, `mode`, `skill_code`, and `framework_version` using sidecar metadata — no filesystem grep needed.
 
 ```bash
 aicx steer [OPTIONS]
@@ -215,6 +215,10 @@ Options:
 - `-k, --kind <KIND>` filter by kind: conversations, plans, reports, other
 - `-p, --project <PROJECT>` filter by project (case-insensitive substring)
 - `-d, --date <DATE>` filter by date: single day, range, or open-ended
+- `--workflow-phase <PHASE>` filter by workflow phase (exact match, case-insensitive)
+- `--mode <MODE>` filter by steering mode (exact match, case-insensitive)
+- `--skill-code <SKILL_CODE>` filter by framework skill code (exact match, case-insensitive)
+- `--framework-version <VERSION>` filter by framework version (exact match, case-insensitive)
 - `-l, --limit <N>` max results (default: `20`)
 
 Examples:
@@ -231,6 +235,9 @@ aicx steer --agent claude --date 2026-03-20..2026-03-28
 
 # Chunks from a specific prompt
 aicx steer --prompt-id api-redesign_20260327
+
+# Steering-aware retrieval using workflow metadata
+aicx steer --workflow-phase marbles --skill-code vc-marbles --mode session-first
 ```
 
 ## `aicx migrate`

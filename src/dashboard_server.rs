@@ -15,7 +15,6 @@ use serde::{Deserialize, Serialize};
 use std::{
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
-    process::Command,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -207,6 +206,14 @@ struct SteerSearchParams {
     project: Option<String>,
     /// Filter by date (YYYY-MM-DD or range)
     date: Option<String>,
+    /// Filter by workflow_phase (exact, case-insensitive)
+    workflow_phase: Option<String>,
+    /// Filter by mode (exact, case-insensitive)
+    mode: Option<String>,
+    /// Filter by skill_code (exact, case-insensitive)
+    skill_code: Option<String>,
+    /// Filter by framework_version (exact, case-insensitive)
+    framework_version: Option<String>,
     #[serde(default = "default_search_limit")]
     limit: usize,
 }
@@ -226,6 +233,10 @@ struct SteerSearchResult {
     completed_at: Option<String>,
     token_usage: Option<u64>,
     findings_count: Option<u32>,
+    workflow_phase: Option<String>,
+    mode: Option<String>,
+    skill_code: Option<String>,
+    framework_version: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -677,7 +688,7 @@ fn run_fuzzy_search(
     // Non-blocking auto-rescan with rate-limit guard.
     if !DASHBOARD_RESCAN_RUNNING.swap(true, Ordering::SeqCst) {
         match std::process::Command::new("aicx")
-            .args(["store", "-H", "24", "--incremental"])
+            .args(dashboard_incremental_rescan_args(project_filter))
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
@@ -694,24 +705,27 @@ fn run_fuzzy_search(
         }
     }
 
-    // Try fast search with rmcp_memex first (instant), fallback to brute-force if it fails or returns nothing
-    let fetch_limit = if score.is_some() {
-        limit.saturating_mul(5).max(50)
-    } else {
-        limit
-    };
+    let fetch_limit = rank::expanded_search_limit(limit, None, 0, score);
 
-    let (results, total_scanned) = if let Ok(rt) = tokio::runtime::Runtime::new() {
-        match rt.block_on(crate::memex::fast_memex_search(
-            query,
-            fetch_limit,
-            project_filter,
-        )) {
-            Ok((res, scan)) if !res.is_empty() => (res, scan),
-            _ => rank::fuzzy_search_store(store_root, query, fetch_limit, project_filter)?,
+    let (results, total_scanned) = match rank::choose_search_backend(project_filter, None, 0, score)
+    {
+        rank::SearchBackend::CanonicalStore => {
+            rank::fuzzy_search_store(store_root, query, fetch_limit, project_filter)?
         }
-    } else {
-        rank::fuzzy_search_store(store_root, query, fetch_limit, project_filter)?
+        rank::SearchBackend::FastMemex => {
+            if let Ok(rt) = tokio::runtime::Runtime::new() {
+                match rt.block_on(crate::memex::fast_memex_search(
+                    query,
+                    fetch_limit,
+                    project_filter,
+                )) {
+                    Ok((res, scan)) if !res.is_empty() => (res, scan),
+                    _ => rank::fuzzy_search_store(store_root, query, fetch_limit, project_filter)?,
+                }
+            } else {
+                rank::fuzzy_search_store(store_root, query, fetch_limit, project_filter)?
+            }
+        }
     };
 
     let mut results = results;
@@ -743,6 +757,24 @@ fn run_fuzzy_search(
     Ok((results, total_scanned))
 }
 
+fn dashboard_incremental_rescan_args(project_filter: Option<&str>) -> Vec<String> {
+    let mut args = vec![
+        "all".to_string(),
+        "-H".to_string(),
+        "24".to_string(),
+        "--incremental".to_string(),
+        "--emit".to_string(),
+        "none".to_string(),
+    ];
+
+    if let Some(project_filter) = project_filter {
+        args.push("-p".to_string());
+        args.push(project_filter.to_string());
+    }
+
+    args
+}
+
 fn validate_score_filter(score: Option<u8>) -> Result<Option<u8>, String> {
     match score {
         Some(score) if score > MAX_SCORE_FILTER => {
@@ -752,9 +784,7 @@ fn validate_score_filter(score: Option<u8>) -> Result<Option<u8>, String> {
     }
 }
 
-/// Semantic search via rmcp-memex vector DB.
-///
-/// Shells out to `rmcp-memex search --json` for vector similarity.
+/// Semantic search via the rmcp-memex semantic index.
 async fn semantic_search(params: Result<Query<SemanticSearchParams>, QueryRejection>) -> Response {
     let Query(params) = match params {
         Ok(q) => q,
@@ -816,24 +846,21 @@ fn run_memex_search(
     limit: usize,
     mode: &str,
 ) -> Result<MemexSearchResponse> {
-    let output = Command::new("rmcp-memex")
-        .arg("search")
-        .arg("-n")
-        .arg(namespace)
-        .arg("-q")
-        .arg(query)
-        .arg("-l")
-        .arg(limit.to_string())
-        .arg("-m")
-        .arg(mode)
-        .arg("--json")
-        .output()
-        .context("Failed to run rmcp-memex search. Is rmcp-memex installed?")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("rmcp-memex search failed: {}", stderr.trim());
-    }
+    let limit_str = limit.to_string();
+    let output = crate::memex::run_memex_command(
+        "search",
+        &[
+            "-n",
+            namespace,
+            "-q",
+            query,
+            "-l",
+            limit_str.as_str(),
+            "-m",
+            mode,
+            "--json",
+        ],
+    )?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let results: serde_json::Value =
@@ -847,7 +874,7 @@ fn run_memex_search(
     })
 }
 
-/// Cross-namespace semantic search via rmcp-memex.
+/// Cross-namespace semantic search via the rmcp-memex semantic index.
 ///
 /// Searches all namespaces at once, merging and ranking results.
 async fn cross_search(params: Result<Query<CrossSearchParams>, QueryRejection>) -> Response {
@@ -904,21 +931,18 @@ async fn cross_search(params: Result<Query<CrossSearchParams>, QueryRejection>) 
 }
 
 fn run_memex_cross_search(query: &str, limit: usize, mode: &str) -> Result<MemexSearchResponse> {
-    let output = Command::new("rmcp-memex")
-        .arg("cross-search")
-        .arg(query)
-        .arg("--limit")
-        .arg(limit.to_string())
-        .arg("--mode")
-        .arg(mode)
-        .arg("--json")
-        .output()
-        .context("Failed to run rmcp-memex cross-search. Is rmcp-memex installed?")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("rmcp-memex cross-search failed: {}", stderr.trim());
-    }
+    let limit_str = limit.to_string();
+    let output = crate::memex::run_memex_command(
+        "cross-search",
+        &[
+            query,
+            "--limit",
+            limit_str.as_str(),
+            "--mode",
+            mode,
+            "--json",
+        ],
+    )?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let results: serde_json::Value =
@@ -994,6 +1018,89 @@ fn parse_date_bounds(date: &str) -> (Option<String>, Option<String>) {
     }
 }
 
+fn steer_result_from_metadata(meta: &serde_json::Value) -> SteerSearchResult {
+    let path = meta
+        .get("path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let project = meta
+        .get("project")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let agent = meta
+        .get("agent")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let kind = meta
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let date = meta
+        .get("date")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let session_id = meta
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    SteerSearchResult {
+        path,
+        project,
+        agent,
+        kind,
+        date,
+        session_id,
+        run_id: meta
+            .get("run_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        prompt_id: meta
+            .get("prompt_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        agent_model: meta
+            .get("agent_model")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        started_at: meta
+            .get("started_at")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        completed_at: meta
+            .get("completed_at")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        token_usage: meta.get("token_usage").and_then(|v| v.as_u64()),
+        findings_count: meta
+            .get("findings_count")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32),
+        workflow_phase: meta
+            .get("workflow_phase")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        mode: meta
+            .get("mode")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        skill_code: meta
+            .get("skill_code")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        framework_version: meta
+            .get("framework_version")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+    }
+}
+
 fn run_steer_search(params: SteerSearchParams, limit: usize) -> Result<SteerSearchResponse> {
     let rt = tokio::runtime::Runtime::new()?;
 
@@ -1003,7 +1110,7 @@ fn run_steer_search(params: SteerSearchParams, limit: usize) -> Result<SteerSear
         (None, None)
     };
 
-    let metadatas = rt.block_on(crate::steer_index::search_steer_index(
+    let (metadatas, scanned) = rt.block_on(crate::steer_index::search_steer_index_with_stats(
         params.run_id.as_deref(),
         params.prompt_id.as_deref(),
         params.agent.as_deref(),
@@ -1011,89 +1118,22 @@ fn run_steer_search(params: SteerSearchParams, limit: usize) -> Result<SteerSear
         params.project.as_deref(),
         date_lo.as_deref(),
         date_hi.as_deref(),
+        params.workflow_phase.as_deref(),
+        params.mode.as_deref(),
+        params.skill_code.as_deref(),
+        params.framework_version.as_deref(),
         limit,
     ))?;
 
     let mut items = Vec::new();
 
     for meta in metadatas {
-        let path = meta
-            .get("path")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let project = meta
-            .get("project")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let agent = meta
-            .get("agent")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let kind = meta
-            .get("kind")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let date = meta
-            .get("date")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let session_id = meta
-            .get("session_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        let run_id = meta
-            .get("run_id")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let prompt_id = meta
-            .get("prompt_id")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let agent_model = meta
-            .get("agent_model")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let started_at = meta
-            .get("started_at")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let completed_at = meta
-            .get("completed_at")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let token_usage = meta.get("token_usage").and_then(|v| v.as_u64());
-        let findings_count = meta
-            .get("findings_count")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32);
-
-        items.push(SteerSearchResult {
-            path,
-            project,
-            agent,
-            kind,
-            date,
-            session_id,
-            run_id,
-            prompt_id,
-            agent_model,
-            started_at,
-            completed_at,
-            token_usage,
-            findings_count,
-        });
+        items.push(steer_result_from_metadata(&meta));
     }
 
     Ok(SteerSearchResponse {
         ok: true,
-        scanned: 0,
+        scanned,
         matched: items.len(),
         items,
     })
@@ -1336,9 +1376,58 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_incremental_rescan_args_use_real_incremental_surface() {
+        assert_eq!(
+            dashboard_incremental_rescan_args(None),
+            vec![
+                "all".to_string(),
+                "-H".to_string(),
+                "24".to_string(),
+                "--incremental".to_string(),
+                "--emit".to_string(),
+                "none".to_string(),
+            ]
+        );
+        assert_eq!(
+            dashboard_incremental_rescan_args(Some("ai-contexters")),
+            vec![
+                "all".to_string(),
+                "-H".to_string(),
+                "24".to_string(),
+                "--incremental".to_string(),
+                "--emit".to_string(),
+                "none".to_string(),
+                "-p".to_string(),
+                "ai-contexters".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn score_filter_rejects_values_above_max() {
         let err = validate_score_filter(Some(MAX_SCORE_FILTER + 1))
             .expect_err("score above 100 should be rejected");
         assert_eq!(err, "score must be between 0 and 100");
+    }
+
+    #[test]
+    fn steer_result_from_metadata_preserves_new_steering_fields() {
+        let result = steer_result_from_metadata(&serde_json::json!({
+            "path": "/tmp/chunk.md",
+            "project": "VetCoders/ai-contexters",
+            "agent": "codex",
+            "kind": "reports",
+            "date": "2026-03-31",
+            "session_id": "sess-1",
+            "workflow_phase": "marbles",
+            "mode": "session-first",
+            "skill_code": "vc-marbles",
+            "framework_version": "2026-03"
+        }));
+
+        assert_eq!(result.workflow_phase.as_deref(), Some("marbles"));
+        assert_eq!(result.mode.as_deref(), Some("session-first"));
+        assert_eq!(result.skill_code.as_deref(), Some("vc-marbles"));
+        assert_eq!(result.framework_version.as_deref(), Some("2026-03"));
     }
 }

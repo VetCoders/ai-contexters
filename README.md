@@ -112,6 +112,7 @@ Steering retrieval (filter chunks by frontmatter metadata):
 aicx steer --run-id mrbl-001
 aicx steer --project ai-contexters --kind reports --date 2026-03-28
 aicx steer --agent claude --date 2026-03-20..2026-03-28
+aicx steer --workflow-phase marbles --skill-code vc-marbles --mode session-first
 ```
 
 Memex sync (semantic index):
