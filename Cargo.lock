@@ -53,7 +53,7 @@ dependencies = [
 
 [[package]]
 name = "ai-contexters"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "anyhow",
  "axum",
@@ -5457,7 +5457,7 @@ dependencies = [
 
 [[package]]
 name = "rmcp-memex"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "arrow-array",
