@@ -1,6 +1,6 @@
 [package]
 name = "ai-contexters"
-version = "0.5.5"
+version = "0.5.6"
 edition = "2024"
 rust-version = "1.85"
 description = "CLI + MCP server for extracting, searching, and browsing AI agent session context (Claude Code, Codex, Gemini)"
@@ -32,9 +32,8 @@ axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "signal"] }
 rmcp = { version = "1.2", features = ["server", "schemars", "transport-io", "transport-streamable-http-server", "transport-streamable-http-server-session"] }
 libc = "0.2.183"
-# Temporary workspace integration boundary until the next rmcp-memex release is published.
-# This stays relative on purpose; do not replace it with a machine-specific absolute path.
-rmcp-memex = { version = "0.4.0", path = "../rmcp-memex", default-features = false }
+# Remote integration boundary: consume the published crate instead of the local workspace checkout.
+rmcp-memex = { version = "0.4.1", default-features = false }
 
 [dev-dependencies]
 filetime = "0.2"
