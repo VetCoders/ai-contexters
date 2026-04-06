@@ -113,6 +113,15 @@ Framework-owned repo-local context artifacts (not written by the `aicx` CLI itse
 - `.ai-context/share/artifacts/TIMELINE.md`
 - `.ai-context/share/artifacts/TRIAGE.md`
 
+Store ignore contract:
+- Optional `~/.aicx/.aicxignore` excludes matching canonical chunk paths from memex materialization and steer indexing.
+- Patterns are matched relative to `~/.aicx/` using glob syntax, for example:
+
+```gitignore
+store/VetCoders/ai-contexters/**/reports/**
+!store/VetCoders/ai-contexters/**/reports/2026_0406_codex_important_001.md
+```
+
 ## Common Workflows
 
 Daily “what changed?” with incremental refresh plus compact summary:
@@ -186,6 +195,7 @@ aicx extract --format gemini-antigravity \
 
 - Secrets are redacted by default. Disable only if you know what you’re doing: `--no-redact-secrets`.
 - Framework integration expects `aicx` or `aicx-mcp` in `PATH`.
+- `aicx memex-sync` now emits live scan/embed/index progress on TTY stderr instead of going silent after preflight.
 
 ---
 

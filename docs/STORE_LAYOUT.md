@@ -2,6 +2,9 @@
 
 `aicx` writes artifacts to the central store under `~/.aicx/` (cross-repo, global, machine-local).
 
+Optional store control file:
+- `~/.aicx/.aicxignore` — glob patterns relative to `~/.aicx/`; matching chunk paths are excluded from memex materialization and steer indexing.
+
 ## Central Store: `~/.aicx/`
 
 Created and managed by `src/store.rs`.
@@ -48,6 +51,7 @@ It is updated on every store write.
 
 The `aicx memex-sync` command (and `--memex` flag) syncs stored chunks to `rmcp-memex`:
 - It maintains sync state in `~/.aicx/memex/sync_state.json`.
+- It honors `~/.aicx/.aicxignore` before queueing chunks for embed/index work.
 - It performs metadata-rich imports, ensuring `project`, `agent`, `date`, `session_id`, and `kind` are preserved in the semantic index.
 
 ## Identity Model & Compatibility Rules (v0.5.0+)

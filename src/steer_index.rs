@@ -320,7 +320,9 @@ async fn sync_steer_index_at(base: &Path, new_files: &[&PathBuf]) -> Result<()> 
     let storage = StorageManager::new_lance_only(&db_path.to_string_lossy()).await?;
     storage.ensure_collection().await?;
 
-    let docs = build_steer_docs(new_files);
+    let (filtered_paths, _) = crate::store::filter_ignored_paths_at(base, new_files)?;
+    let filtered_refs: Vec<&PathBuf> = filtered_paths.iter().collect();
+    let docs = build_steer_docs(&filtered_refs);
 
     if docs.is_empty() {
         return Ok(());

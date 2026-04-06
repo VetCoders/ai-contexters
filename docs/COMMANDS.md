@@ -274,6 +274,8 @@ aicx memex-sync --namespace ai-contexts
 Notes:
 - Default batch sync now uses a metadata-rich import via JSONL, ensuring `project`, `agent`, `date`, and `session_id` are preserved for semantic filtering without the overhead of per-file CLI calls.
 - Recursive indexing is enabled by default to handle the nested canonical store structure.
+- If `~/.aicx/.aicxignore` exists, matching chunk paths are excluded before memex materialization and the final summary reports how many were ignored.
+- On interactive terminals, `memex-sync` emits live scan/embed/index progress to stderr so large reindexes do not look hung.
 
 ## `aicx refs`
 
