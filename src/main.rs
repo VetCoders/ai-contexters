@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use ai_contexters::dashboard::{self, DashboardConfig};
 use ai_contexters::dashboard_server::{self, DashboardServerConfig};
 use ai_contexters::intents;
-use ai_contexters::memex::{self, MemexConfig};
+use ai_contexters::memex::{self, MemexConfig, SyncProgress, SyncProgressPhase};
 use ai_contexters::output::{self, OutputConfig, OutputFormat, OutputMode, ReportMetadata};
 use ai_contexters::rank;
 use ai_contexters::sources::{self, ExtractionConfig};
@@ -1191,17 +1191,92 @@ struct ExtractionParams<'a> {
     emit: StdoutEmit,
 }
 
+struct MemexProgressPrinter {
+    enabled: bool,
+    width: usize,
+}
+
+impl MemexProgressPrinter {
+    fn new() -> Self {
+        Self {
+            enabled: io::stderr().is_terminal(),
+            width: 0,
+        }
+    }
+
+    fn update(&mut self, progress: &SyncProgress) {
+        if !self.enabled {
+            return;
+        }
+
+        let message = render_memex_progress(progress);
+        let width = self.width.max(message.len());
+        self.width = width;
+        eprint!("\r{message:<width$}");
+        let _ = io::stderr().flush();
+    }
+
+    fn finish(&mut self) {
+        if self.enabled && self.width > 0 {
+            eprint!("\r{:<width$}\r", "", width = self.width);
+            let _ = io::stderr().flush();
+            self.width = 0;
+        }
+    }
+}
+
+fn render_memex_progress(progress: &SyncProgress) -> String {
+    match progress.phase {
+        SyncProgressPhase::Discovering => {
+            format!(
+                "  Memex scan... {}/{}",
+                progress.done.max(1),
+                progress.total.max(1)
+            )
+        }
+        SyncProgressPhase::Embedding => {
+            format!(
+                "  Memex embed... {}/{}",
+                progress.done.max(1),
+                progress.total.max(1)
+            )
+        }
+        SyncProgressPhase::Writing => {
+            format!(
+                "  Memex index... {}/{}",
+                progress.done.max(1),
+                progress.total.max(1)
+            )
+        }
+        SyncProgressPhase::Completed => format!("  {}", progress.detail),
+    }
+}
+
+fn sync_memex_paths(config: &MemexConfig, chunk_paths: &[PathBuf]) -> Result<memex::SyncResult> {
+    let mut printer = MemexProgressPrinter::new();
+    let enabled = printer.enabled;
+    let result = if enabled {
+        memex::sync_new_chunk_paths_with_progress(chunk_paths, config, |progress| {
+            printer.update(&progress);
+        })
+    } else {
+        memex::sync_new_chunk_paths(chunk_paths, config)
+    };
+    printer.finish();
+    result
+}
+
 fn sync_memex_if_requested(sync_memex: bool, all_written_paths: &[PathBuf]) -> Result<()> {
     if sync_memex && !all_written_paths.is_empty() {
         let memex_config = MemexConfig::default();
         // Keep extractor/store `--memex` on the same stateful transport seam as
         // the dedicated `memex-sync` command so sync state and observability do
         // not drift between code paths.
-        let result = memex::sync_new_chunk_paths(all_written_paths, &memex_config)
+        let result = sync_memex_paths(&memex_config, all_written_paths)
             .context("Failed to sync canonical chunks to external dependency rmcp-memex")?;
         eprintln!(
-            "  Memex: {} pushed, {} skipped",
-            result.chunks_pushed, result.chunks_skipped
+            "  Memex: {} pushed, {} skipped, {} ignored",
+            result.chunks_pushed, result.chunks_skipped, result.chunks_ignored
         );
         for err in &result.errors {
             eprintln!("  Memex error: {}", err);
@@ -2245,9 +2320,10 @@ fn run_memex_sync(
     reindex: bool,
 ) -> Result<()> {
     let truth = memex::resolve_runtime_truth(db_path.as_deref())?;
+    let store_root = store::store_base_dir()?;
 
     let canonical_root = store::canonical_store_dir()?;
-    let chunk_paths: Vec<PathBuf> = store::scan_context_files()?
+    let chunk_paths: Vec<PathBuf> = store::scan_context_files_raw()?
         .into_iter()
         .map(|file| file.path)
         .collect();
@@ -2280,6 +2356,10 @@ fn run_memex_sync(
     if let Some(path) = truth.config_path.as_ref() {
         eprintln!("  Config: {}", path.display());
     }
+    let ignore_path = store_root.join(store::AICX_IGNORE_FILENAME);
+    if ignore_path.is_file() {
+        eprintln!("  Ignore file: {}", ignore_path.display());
+    }
     eprintln!(
         "  Mode: {}",
         if config.batch_mode {
@@ -2298,11 +2378,11 @@ fn run_memex_sync(
         memex::reset_semantic_index(namespace, db_path.as_deref())?;
     }
 
-    let result = memex::sync_new_chunk_paths(&chunk_paths, &config)?;
+    let result = sync_memex_paths(&config, &chunk_paths)?;
 
     eprintln!(
-        "✓ Memex sync: {} pushed, {} skipped",
-        result.chunks_pushed, result.chunks_skipped,
+        "✓ Memex sync: {} pushed, {} skipped, {} ignored",
+        result.chunks_pushed, result.chunks_skipped, result.chunks_ignored,
     );
 
     for err in &result.errors {
@@ -2442,6 +2522,50 @@ mod tests {
 
     fn set_mtime(path: &Path, unix_seconds: i64) {
         set_file_mtime(path, FileTime::from_unix_time(unix_seconds, 0)).unwrap();
+    }
+
+    #[test]
+    fn render_memex_progress_formats_live_stages() {
+        assert_eq!(
+            render_memex_progress(&SyncProgress {
+                phase: SyncProgressPhase::Discovering,
+                done: 12,
+                total: 48,
+                detail: String::new(),
+            }),
+            "  Memex scan... 12/48"
+        );
+        assert_eq!(
+            render_memex_progress(&SyncProgress {
+                phase: SyncProgressPhase::Embedding,
+                done: 64,
+                total: 256,
+                detail: String::new(),
+            }),
+            "  Memex embed... 64/256"
+        );
+        assert_eq!(
+            render_memex_progress(&SyncProgress {
+                phase: SyncProgressPhase::Writing,
+                done: 128,
+                total: 256,
+                detail: String::new(),
+            }),
+            "  Memex index... 128/256"
+        );
+    }
+
+    #[test]
+    fn render_memex_progress_passes_completed_detail_through() {
+        assert_eq!(
+            render_memex_progress(&SyncProgress {
+                phase: SyncProgressPhase::Completed,
+                done: 0,
+                total: 0,
+                detail: "Completed: 10 pushed, 2 skipped, 3 ignored".to_string(),
+            }),
+            "  Completed: 10 pushed, 2 skipped, 3 ignored"
+        );
     }
 
     #[test]

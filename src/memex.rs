@@ -593,9 +593,29 @@ pub struct SyncResult {
     pub chunks_pushed: usize,
     /// Number of chunks skipped (already synced or dedup).
     pub chunks_skipped: usize,
+    /// Number of chunks excluded by `.aicxignore`.
+    pub chunks_ignored: usize,
     /// Errors encountered during sync.
     pub errors: Vec<String>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncProgressPhase {
+    Discovering,
+    Embedding,
+    Writing,
+    Completed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncProgress {
+    pub phase: SyncProgressPhase,
+    pub done: usize,
+    pub total: usize,
+    pub detail: String,
+}
+
+const EMBEDDING_BATCH_SIZE: usize = 64;
 
 #[derive(Debug, Serialize)]
 struct ImportRecord {
@@ -700,13 +720,17 @@ async fn sync_chunk_library(
     Ok(())
 }
 
-async fn sync_chunks_library(
+async fn sync_chunks_library<F>(
     chunk_paths: &[PathBuf],
     namespace: &str,
     truth: &MemexRuntimeTruth,
     embedding_config: &RmcpEmbeddingConfig,
     batch_mode: bool,
-) -> Result<(SyncResult, Vec<PathBuf>)> {
+    mut progress: F,
+) -> Result<(SyncResult, Vec<PathBuf>)>
+where
+    F: FnMut(SyncProgress),
+{
     if chunk_paths.is_empty() {
         return Ok((SyncResult::default(), Vec::new()));
     }
@@ -766,43 +790,98 @@ async fn sync_chunks_library(
     }
 
     if batch_mode {
-        let texts: Vec<String> = pending.iter().map(|record| record.text.clone()).collect();
-        let embeddings = embedding_client.embed_batch(&texts).await?;
-        let mut bm25_docs = Vec::with_capacity(pending.len());
-        let mut docs = Vec::with_capacity(pending.len());
+        let pending_total = pending.len();
 
-        for (record, embedding) in pending.iter().zip(embeddings.into_iter()) {
-            bm25_docs.push((
-                record.id.clone(),
-                namespace.to_string(),
-                record.text.clone(),
-            ));
-            docs.push(ChromaDocument::new_flat_with_hash(
-                record.id.clone(),
-                namespace.to_string(),
-                embedding,
-                record.metadata.clone(),
-                record.text.clone(),
-                record.content_hash.clone(),
-            ));
+        for (batch_index, chunk_batch) in pending.chunks(EMBEDDING_BATCH_SIZE).enumerate() {
+            let batch_start = batch_index * EMBEDDING_BATCH_SIZE;
+            let batch_end = batch_start + chunk_batch.len();
+
+            emit_sync_progress(
+                &mut progress,
+                SyncProgressPhase::Embedding,
+                batch_end,
+                pending_total,
+                format!(
+                    "Embedding batch {} ({}-{} of {})",
+                    batch_index + 1,
+                    batch_start + 1,
+                    batch_end,
+                    pending_total
+                ),
+            );
+
+            let texts: Vec<String> = chunk_batch
+                .iter()
+                .map(|record| record.text.clone())
+                .collect();
+            let embeddings = embedding_client.embed_batch(&texts).await?;
+            let mut bm25_docs = Vec::with_capacity(chunk_batch.len());
+            let mut docs = Vec::with_capacity(chunk_batch.len());
+
+            for (record, embedding) in chunk_batch.iter().zip(embeddings.into_iter()) {
+                bm25_docs.push((
+                    record.id.clone(),
+                    namespace.to_string(),
+                    record.text.clone(),
+                ));
+                docs.push(ChromaDocument::new_flat_with_hash(
+                    record.id.clone(),
+                    namespace.to_string(),
+                    embedding,
+                    record.metadata.clone(),
+                    record.text.clone(),
+                    record.content_hash.clone(),
+                ));
+            }
+
+            storage.add_to_store(docs).await?;
+            bm25.add_documents(&bm25_docs).await?;
+
+            result.chunks_pushed += chunk_batch.len();
+            completed_paths.extend(chunk_batch.iter().map(|record| record.chunk_path.clone()));
+
+            emit_sync_progress(
+                &mut progress,
+                SyncProgressPhase::Writing,
+                result.chunks_pushed,
+                pending_total,
+                format!(
+                    "Indexed {} of {} chunks",
+                    result.chunks_pushed, pending_total
+                ),
+            );
         }
 
-        storage.add_to_store(docs).await?;
-        bm25.add_documents(&bm25_docs).await?;
-
-        result.chunks_pushed += pending.len();
-        completed_paths.extend(pending.into_iter().map(|record| record.chunk_path));
         return Ok((result, completed_paths));
     }
 
-    for record in pending {
+    let pending_total = pending.len();
+    for (idx, record) in pending.into_iter().enumerate() {
         let chunk_path = record.chunk_path.clone();
         let record_id = record.id.clone();
+
+        emit_sync_progress(
+            &mut progress,
+            SyncProgressPhase::Embedding,
+            idx + 1,
+            pending_total,
+            format!("Embedding {}", chunk_path.display()),
+        );
 
         match sync_chunk_library(&storage, &bm25, &mut embedding_client, namespace, record).await {
             Ok(()) => {
                 result.chunks_pushed += 1;
                 completed_paths.push(chunk_path);
+                emit_sync_progress(
+                    &mut progress,
+                    SyncProgressPhase::Writing,
+                    result.chunks_pushed,
+                    pending_total,
+                    format!(
+                        "Indexed {} of {} chunks",
+                        result.chunks_pushed, pending_total
+                    ),
+                );
             }
             Err(err) => result.errors.push(format!("{record_id}: {err}")),
         }
@@ -881,6 +960,7 @@ pub fn sync_chunks_batch(chunks_dir: &Path, config: &MemexConfig) -> Result<Sync
     Ok(SyncResult {
         chunks_pushed,
         chunks_skipped: file_count.saturating_sub(chunks_pushed),
+        chunks_ignored: 0,
         errors: vec![],
     })
 }
@@ -947,6 +1027,7 @@ pub fn sync_chunks_import(chunk_paths: &[PathBuf], config: &MemexConfig) -> Resu
             stats.imported
         },
         chunks_skipped: stats.skipped,
+        chunks_ignored: 0,
         errors: if stats.errors > 0 {
             vec![format!(
                 "rmcp-memex import reported {} record error(s); inspect rmcp-memex stderr for details",
@@ -1195,24 +1276,59 @@ pub fn sync_chunk_single(
 // High-level sync
 // ============================================================================
 
+fn emit_sync_progress<F>(
+    progress: &mut F,
+    phase: SyncProgressPhase,
+    done: usize,
+    total: usize,
+    detail: impl Into<String>,
+) where
+    F: FnMut(SyncProgress),
+{
+    progress(SyncProgress {
+        phase,
+        done,
+        total,
+        detail: detail.into(),
+    });
+}
+
 /// Sync only new chunks (not previously synced) to memex.
 ///
 /// Loads sync state, determines which chunk files are new,
 /// syncs them through the published rmcp-memex library boundary, and updates
 /// state plus semantic-index metadata.
 pub fn sync_new_chunk_paths(chunk_paths: &[PathBuf], config: &MemexConfig) -> Result<SyncResult> {
-    let rt =
-        tokio::runtime::Runtime::new().context("Failed to start Tokio runtime for memex sync")?;
-    rt.block_on(sync_new_chunk_paths_async(chunk_paths, config))
+    sync_new_chunk_paths_with_progress(chunk_paths, config, |_| {})
 }
 
-async fn sync_new_chunk_paths_async(
+pub fn sync_new_chunk_paths_with_progress<F>(
     chunk_paths: &[PathBuf],
     config: &MemexConfig,
-) -> Result<SyncResult> {
-    let mut state = load_sync_state();
+    progress: F,
+) -> Result<SyncResult>
+where
+    F: FnMut(SyncProgress),
+{
+    let rt =
+        tokio::runtime::Runtime::new().context("Failed to start Tokio runtime for memex sync")?;
+    rt.block_on(sync_new_chunk_paths_async(chunk_paths, config, progress))
+}
 
-    let all_files: Vec<PathBuf> = chunk_paths
+async fn sync_new_chunk_paths_async<F>(
+    chunk_paths: &[PathBuf],
+    config: &MemexConfig,
+    mut progress: F,
+) -> Result<SyncResult>
+where
+    F: FnMut(SyncProgress),
+{
+    let mut state = load_sync_state();
+    let store_base = crate::store::store_base_dir()?;
+    let (filtered_paths, ignored_count) =
+        crate::store::filter_ignored_paths_at(&store_base, chunk_paths)?;
+
+    let all_files: Vec<PathBuf> = filtered_paths
         .iter()
         .filter(|path| {
             path.extension()
@@ -1222,22 +1338,56 @@ async fn sync_new_chunk_paths_async(
         .cloned()
         .collect();
 
+    let total_candidates = all_files.len();
+    if total_candidates == 0 {
+        emit_sync_progress(
+            &mut progress,
+            SyncProgressPhase::Completed,
+            ignored_count,
+            ignored_count,
+            format!("Completed: 0 pushed, 0 skipped, {} ignored", ignored_count),
+        );
+        return Ok(SyncResult {
+            chunks_ignored: ignored_count,
+            ..SyncResult::default()
+        });
+    }
+
     let new_files: Vec<PathBuf> = all_files
         .iter()
-        .filter(|p| {
+        .enumerate()
+        .filter_map(|(idx, p)| {
             let id = p
                 .file_stem()
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_default();
-            !state.synced_chunks.contains(&id)
+            emit_sync_progress(
+                &mut progress,
+                SyncProgressPhase::Discovering,
+                idx + 1,
+                total_candidates,
+                format!("Scanning {}", p.display()),
+            );
+            (!state.synced_chunks.contains(&id)).then_some(p.clone())
         })
-        .cloned()
         .collect();
 
     if new_files.is_empty() {
+        emit_sync_progress(
+            &mut progress,
+            SyncProgressPhase::Completed,
+            all_files.len() + ignored_count,
+            all_files.len() + ignored_count,
+            format!(
+                "Completed: 0 pushed, {} skipped, {} ignored",
+                all_files.len(),
+                ignored_count
+            ),
+        );
         return Ok(SyncResult {
             chunks_pushed: 0,
             chunks_skipped: all_files.len(),
+            chunks_ignored: ignored_count,
             errors: vec![],
         });
     }
@@ -1247,14 +1397,18 @@ async fn sync_new_chunk_paths_async(
         resolve_runtime_boundary_from_config(config.db_path.as_deref(), config_path.as_deref())?;
     validate_semantic_index_compatibility_truth(&config.namespace, &truth).await?;
 
-    let (result, synced_files) = sync_chunks_library(
+    let (mut result, synced_files) = sync_chunks_library(
         &new_files,
         &config.namespace,
         &truth,
         &embedding_config,
         config.batch_mode,
+        &mut progress,
     )
     .await?;
+
+    result.chunks_skipped += all_files.len().saturating_sub(new_files.len());
+    result.chunks_ignored = ignored_count;
 
     if result.errors.is_empty() {
         save_semantic_index_metadata(&config.namespace, &truth)?;
@@ -1277,6 +1431,17 @@ async fn sync_new_chunk_paths_async(
     state.last_synced = Some(Utc::now());
     state.total_pushes += result.chunks_pushed;
     save_sync_state(&state)?;
+
+    emit_sync_progress(
+        &mut progress,
+        SyncProgressPhase::Completed,
+        result.chunks_pushed + result.chunks_skipped + result.chunks_ignored,
+        total_candidates + ignored_count,
+        format!(
+            "Completed: {} pushed, {} skipped, {} ignored",
+            result.chunks_pushed, result.chunks_skipped, result.chunks_ignored
+        ),
+    );
 
     Ok(result)
 }
@@ -1645,7 +1810,10 @@ model = "nomic-embed-text"
         let err = resolve_runtime_truth_from_config(None, Some(&config_path))
             .expect_err("partial provider config should be rejected");
 
-        assert!(err.to_string().contains("Failed to parse rmcp-memex config"));
+        assert!(
+            err.to_string()
+                .contains("Failed to parse rmcp-memex config")
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1788,6 +1956,7 @@ model = "qwen3-embedding:4b"
         let result = SyncResult::default();
         assert_eq!(result.chunks_pushed, 0);
         assert_eq!(result.chunks_skipped, 0);
+        assert_eq!(result.chunks_ignored, 0);
         assert!(result.errors.is_empty());
     }
 

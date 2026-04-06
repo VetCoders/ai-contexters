@@ -11,6 +11,7 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, TimeZone, Utc};
+use globset::{Glob, GlobMatcher};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -170,9 +171,22 @@ fn truncate_session_id(session_id: &str) -> String {
 pub const NON_REPOSITORY_CONTEXTS: &str = "non-repository-contexts";
 pub const CANONICAL_STORE_DIRNAME: &str = "store";
 pub const LEGACY_SALVAGE_DIRNAME: &str = "legacy-store";
+pub const AICX_IGNORE_FILENAME: &str = ".aicxignore";
 const MIGRATION_DIRNAME: &str = "migration";
 const MIGRATION_MANIFEST_FILENAME: &str = "manifest.json";
 const MIGRATION_REPORT_FILENAME: &str = "report.md";
+
+#[derive(Debug, Clone)]
+struct IgnoreRule {
+    negate: bool,
+    matcher: GlobMatcher,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct StoreIgnoreMatcher {
+    base: PathBuf,
+    rules: Vec<IgnoreRule>,
+}
 
 /// Returns the AICX base directory: `~/.aicx/`
 ///
@@ -219,6 +233,135 @@ fn migration_manifest_path(base: &Path) -> PathBuf {
 
 fn migration_report_path(base: &Path) -> PathBuf {
     migration_dir(base).join(MIGRATION_REPORT_FILENAME)
+}
+
+impl StoreIgnoreMatcher {
+    fn load(base: &Path) -> Result<Self> {
+        let path = base.join(AICX_IGNORE_FILENAME);
+        if !path.exists() {
+            return Ok(Self {
+                base: base.to_path_buf(),
+                rules: Vec::new(),
+            });
+        }
+
+        let raw = fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        let mut rules = Vec::new();
+
+        for (line_no, line) in raw.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+
+            let negate = trimmed.starts_with('!');
+            let pattern = trimmed.trim_start_matches('!').trim();
+            if pattern.is_empty() {
+                continue;
+            }
+
+            let normalized = normalize_aicx_ignore_pattern(pattern);
+            let matcher = Glob::new(&normalized)
+                .with_context(|| {
+                    format!(
+                        "Invalid {} pattern at line {}: {}",
+                        path.display(),
+                        line_no + 1,
+                        trimmed
+                    )
+                })?
+                .compile_matcher();
+
+            rules.push(IgnoreRule { negate, matcher });
+        }
+
+        Ok(Self {
+            base: base.to_path_buf(),
+            rules,
+        })
+    }
+
+    pub fn is_ignored(&self, path: &Path) -> bool {
+        if self.rules.is_empty() {
+            return false;
+        }
+
+        let Ok(relative) = path.strip_prefix(&self.base) else {
+            return false;
+        };
+        let relative = normalize_relative_store_path(relative);
+        if relative.is_empty() {
+            return false;
+        }
+
+        let mut ignored = false;
+        for rule in &self.rules {
+            if rule.matcher.is_match(&relative) {
+                ignored = !rule.negate;
+            }
+        }
+        ignored
+    }
+}
+
+fn normalize_relative_store_path(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn normalize_aicx_ignore_pattern(pattern: &str) -> String {
+    let mut normalized = pattern
+        .trim()
+        .trim_start_matches("./")
+        .trim_start_matches('/')
+        .replace('\\', "/");
+
+    while normalized.contains("//") {
+        normalized = normalized.replace("//", "/");
+    }
+
+    if normalized.ends_with('/') {
+        normalized.push_str("**");
+    }
+
+    normalized
+}
+
+pub fn load_ignore_matcher_at(base: &Path) -> Result<StoreIgnoreMatcher> {
+    StoreIgnoreMatcher::load(base)
+}
+
+pub fn filter_ignored_paths_at<P>(base: &Path, paths: &[P]) -> Result<(Vec<PathBuf>, usize)>
+where
+    P: AsRef<Path>,
+{
+    let matcher = load_ignore_matcher_at(base)?;
+    if matcher.rules.is_empty() {
+        return Ok((
+            paths
+                .iter()
+                .map(|path| path.as_ref().to_path_buf())
+                .collect(),
+            0,
+        ));
+    }
+
+    let mut kept = Vec::with_capacity(paths.len());
+    let mut ignored = 0usize;
+
+    for path in paths {
+        let path = path.as_ref();
+        if matcher.is_ignored(path) {
+            ignored += 1;
+        } else {
+            kept.push(path.to_path_buf());
+        }
+    }
+
+    Ok((kept, ignored))
 }
 
 /// Returns the project directory: `~/.aicx/store/<project>/`
@@ -657,18 +800,40 @@ pub fn scan_context_files() -> Result<Vec<StoredContextFile>> {
     scan_context_files_at(&base)
 }
 
+pub fn scan_context_files_raw() -> Result<Vec<StoredContextFile>> {
+    let base = store_base_dir()?;
+    scan_context_files_raw_at(&base)
+}
+
 pub fn scan_context_files_at(base: &Path) -> Result<Vec<StoredContextFile>> {
     let base = sanitize::validate_dir_path(base)?;
+    let ignore = load_ignore_matcher_at(&base)?;
+    scan_context_files_with_ignore(&base, &ignore)
+}
+
+pub fn scan_context_files_raw_at(base: &Path) -> Result<Vec<StoredContextFile>> {
+    let base = sanitize::validate_dir_path(base)?;
+    let ignore = StoreIgnoreMatcher {
+        base: base.clone(),
+        rules: Vec::new(),
+    };
+    scan_context_files_with_ignore(&base, &ignore)
+}
+
+fn scan_context_files_with_ignore(
+    base: &Path,
+    ignore: &StoreIgnoreMatcher,
+) -> Result<Vec<StoredContextFile>> {
     let mut files = Vec::new();
 
     let canonical_root = base.join(CANONICAL_STORE_DIRNAME);
     if canonical_root.is_dir() {
-        scan_repo_store(&canonical_root, &mut files)?;
+        scan_repo_store(&canonical_root, &ignore, &mut files)?;
     }
 
     let non_repo_root = base.join(NON_REPOSITORY_CONTEXTS);
     if non_repo_root.is_dir() {
-        scan_non_repository_store(&non_repo_root, &mut files)?;
+        scan_non_repository_store(&non_repo_root, &ignore, &mut files)?;
     }
 
     files.sort_by(|left, right| {
@@ -756,7 +921,11 @@ fn chunks_by_run_id_at(
     Ok(matched)
 }
 
-fn scan_repo_store(root: &Path, files: &mut Vec<StoredContextFile>) -> Result<()> {
+fn scan_repo_store(
+    root: &Path,
+    ignore: &StoreIgnoreMatcher,
+    files: &mut Vec<StoredContextFile>,
+) -> Result<()> {
     for organization_entry in sanitize::read_dir_validated(root)?.filter_map(|entry| entry.ok()) {
         let organization_path = organization_entry.path();
         if !organization_path.is_dir() {
@@ -812,6 +981,7 @@ fn scan_repo_store(root: &Path, files: &mut Vec<StoredContextFile>) -> Result<()
                             &date_compact,
                             kind,
                             &agent,
+                            ignore,
                             files,
                         )?;
                     }
@@ -823,7 +993,11 @@ fn scan_repo_store(root: &Path, files: &mut Vec<StoredContextFile>) -> Result<()
     Ok(())
 }
 
-fn scan_non_repository_store(root: &Path, files: &mut Vec<StoredContextFile>) -> Result<()> {
+fn scan_non_repository_store(
+    root: &Path,
+    ignore: &StoreIgnoreMatcher,
+    files: &mut Vec<StoredContextFile>,
+) -> Result<()> {
     for date_entry in sanitize::read_dir_validated(root)?.filter_map(|entry| entry.ok()) {
         let date_path = date_entry.path();
         if !date_path.is_dir() {
@@ -855,6 +1029,7 @@ fn scan_non_repository_store(root: &Path, files: &mut Vec<StoredContextFile>) ->
                     &date_compact,
                     kind,
                     &agent,
+                    ignore,
                     files,
                 )?;
             }
@@ -871,6 +1046,7 @@ fn collect_leaf_files(
     date_compact: &str,
     kind: Kind,
     agent: &str,
+    ignore: &StoreIgnoreMatcher,
     files: &mut Vec<StoredContextFile>,
 ) -> Result<()> {
     for file_entry in sanitize::read_dir_validated(dir)?.filter_map(|entry| entry.ok()) {
@@ -887,6 +1063,9 @@ fn collect_leaf_files(
             .and_then(|ext| ext.to_str())
             .is_none_or(|ext| ext != "md" && ext != "json")
         {
+            continue;
+        }
+        if ignore.is_ignored(&path) {
             continue;
         }
 
@@ -3043,6 +3222,59 @@ mod tests {
                 .unwrap(),
             "2026_0331_claude_sess-new_001.md"
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_context_files_respects_aicxignore_and_negation() {
+        let root = retrieval_test_root("context-files-ignore");
+        let _ = fs::remove_dir_all(&root);
+
+        let ignored = root
+            .join("store")
+            .join("VetCoders")
+            .join("ai-contexters")
+            .join("2026_0331")
+            .join("reports")
+            .join("codex")
+            .join("2026_0331_codex_sess-rpt_001.md");
+        let kept = root
+            .join("store")
+            .join("VetCoders")
+            .join("ai-contexters")
+            .join("2026_0331")
+            .join("conversations")
+            .join("codex")
+            .join("2026_0331_codex_sess-conv_001.md");
+
+        write_chunk_file(&ignored, "## Report\nIgnore this chunk");
+        write_chunk_file(&kept, "Conversation that should remain visible");
+        fs::write(
+            root.join(AICX_IGNORE_FILENAME),
+            "store/VetCoders/ai-contexters/**\n!store/VetCoders/ai-contexters/**/conversations/**\n",
+        )
+        .unwrap();
+
+        let scanned = scan_context_files_at(&root).expect("ignore-aware scan should succeed");
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(
+            scanned[0]
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap(),
+            "2026_0331_codex_sess-conv_001.md"
+        );
+
+        let raw = scan_context_files_raw_at(&root).expect("raw scan should succeed");
+        assert_eq!(raw.len(), 2);
+
+        let (filtered, ignored_count) =
+            filter_ignored_paths_at(&root, &[ignored.clone(), kept.clone()])
+                .expect("ignore filter should succeed");
+        assert_eq!(ignored_count, 1);
+        assert_eq!(filtered, vec![kept]);
 
         let _ = fs::remove_dir_all(&root);
     }
