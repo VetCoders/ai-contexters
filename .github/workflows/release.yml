@@ -21,7 +21,7 @@ env:
 jobs:
   verify:
     name: Verify release input
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, ops-linux]
     outputs:
       release_tag: ${{ steps.meta.outputs.release_tag }}
       version: ${{ steps.meta.outputs.version }}
@@ -30,6 +30,11 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Resolve release tag
         id: meta
@@ -118,32 +123,36 @@ jobs:
         run: cargo publish --locked --dry-run
 
   build:
-    name: Build ${{ matrix.target }}
+    name: Build ${{ matrix.target }} on ${{ matrix.runner_name }}
     needs: verify
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ fromJSON(matrix.runner) }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - runner_name: ops-linux
+            runner: '["self-hosted", "ops-linux"]'
             target: x86_64-unknown-linux-musl
             archive_ext: tar.gz
             binary_ext: ""
-          - os: macos-15-intel
+          - runner_name: dragon-macos
+            runner: '["self-hosted", "dragon-macos"]'
             target: x86_64-apple-darwin
             archive_ext: tar.gz
             binary_ext: ""
-          - os: macos-14
+          - runner_name: dragon-macos
+            runner: '["self-hosted", "dragon-macos"]'
             target: aarch64-apple-darwin
             archive_ext: tar.gz
             binary_ext: ""
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            archive_ext: zip
-            binary_ext: .exe
 
     steps:
       - uses: actions/checkout@v6
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -240,7 +249,7 @@ jobs:
   github-release:
     name: Publish GitHub Release
     needs: [verify, build]
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, ops-linux]
 
     steps:
       - uses: actions/download-artifact@v8

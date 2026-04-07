@@ -13,15 +13,24 @@ env:
 
 jobs:
   check:
-    name: ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.name }}
+    runs-on: ${{ fromJSON(matrix.runner) }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14]
+        include:
+          - name: linux-self-hosted
+            runner: '["self-hosted", "ops-linux"]'
+          - name: macos-self-hosted
+            runner: '["self-hosted", "dragon-macos"]'
 
     steps:
       - uses: actions/checkout@v6
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: actions/setup-python@v6
         if: runner.os == 'Linux'
