@@ -1,7 +1,7 @@
 # AICX Build System
 # Local developer flow + release/readiness helpers
 
-.PHONY: all build install install-bin install-config install-cargo
+.PHONY: all build install install-bin install-config install-cargo git-hooks
 .PHONY: precheck test check fmt fmt-check clippy semgrep ci clean help manifest-check
 .PHONY: version-show version-check release-plan release-check release-tag release-push package-check
 
@@ -16,6 +16,7 @@ build:
 
 install:
 	./install.sh
+	@$(MAKE) git-hooks
 
 install-bin:
 	cargo install --path . --locked --force --bin aicx --bin aicx-mcp
@@ -25,6 +26,11 @@ install-config:
 
 install-cargo:
 	cargo install $(PACKAGE_NAME) --locked
+
+git-hooks:
+	@echo "Installing git hooks..."
+	@bash ./tools/install-githooks.sh
+	@echo "✓ pre-commit + pre-push hooks installed"
 
 precheck:
 	cargo check --locked --all-targets
@@ -139,6 +145,7 @@ help:
 	@echo "  make install-bin     - Install only aicx + aicx-mcp from the current checkout"
 	@echo "  make install-config  - Configure local MCP clients without reinstalling binaries"
 	@echo "  make install-cargo   - Install published crate from crates.io"
+	@echo "  make git-hooks       - Install repo-local pre-commit + pre-push hooks"
 	@echo "  make precheck        - Quick cargo check"
 	@echo "  make manifest-check  - Fail if Cargo.toml uses local path dependencies"
 	@echo "  make check           - Full local gate (fmt, check, clippy, test, build, semgrep)"
