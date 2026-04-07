@@ -245,6 +245,8 @@ impl StoreIgnoreMatcher {
             });
         }
 
+        // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+        // Rationale: `base` is the hardcoded ~/.aicx store root, not user input.
         let raw = fs::read_to_string(&path)
             .with_context(|| format!("Failed to read {}", path.display()))?;
         let mut rules = Vec::new();
@@ -828,12 +830,12 @@ fn scan_context_files_with_ignore(
 
     let canonical_root = base.join(CANONICAL_STORE_DIRNAME);
     if canonical_root.is_dir() {
-        scan_repo_store(&canonical_root, &ignore, &mut files)?;
+        scan_repo_store(&canonical_root, ignore, &mut files)?;
     }
 
     let non_repo_root = base.join(NON_REPOSITORY_CONTEXTS);
     if non_repo_root.is_dir() {
-        scan_non_repository_store(&non_repo_root, &ignore, &mut files)?;
+        scan_non_repository_store(&non_repo_root, ignore, &mut files)?;
     }
 
     files.sort_by(|left, right| {
@@ -974,16 +976,15 @@ fn scan_repo_store(
                             continue;
                         }
                         let agent = agent_entry.file_name().to_string_lossy().to_string();
-                        collect_leaf_files(
-                            &agent_path,
-                            Some(repo.clone()),
-                            &repo.slug(),
-                            &date_compact,
+                        let repo_slug = repo.slug();
+                        let ctx = LeafScanContext {
+                            repo: Some(repo.clone()),
+                            project: &repo_slug,
+                            date_compact: &date_compact,
                             kind,
-                            &agent,
-                            ignore,
-                            files,
-                        )?;
+                            agent: &agent,
+                        };
+                        collect_leaf_files(&agent_path, &ctx, ignore, files)?;
                     }
                 }
             }
@@ -1022,16 +1023,14 @@ fn scan_non_repository_store(
                     continue;
                 }
                 let agent = agent_entry.file_name().to_string_lossy().to_string();
-                collect_leaf_files(
-                    &agent_path,
-                    None,
-                    NON_REPOSITORY_CONTEXTS,
-                    &date_compact,
+                let ctx = LeafScanContext {
+                    repo: None,
+                    project: NON_REPOSITORY_CONTEXTS,
+                    date_compact: &date_compact,
                     kind,
-                    &agent,
-                    ignore,
-                    files,
-                )?;
+                    agent: &agent,
+                };
+                collect_leaf_files(&agent_path, &ctx, ignore, files)?;
             }
         }
     }
@@ -1039,13 +1038,18 @@ fn scan_non_repository_store(
     Ok(())
 }
 
+#[derive(Clone)]
+struct LeafScanContext<'a> {
+    repo: Option<RepoIdentity>,
+    project: &'a str,
+    date_compact: &'a str,
+    kind: Kind,
+    agent: &'a str,
+}
+
 fn collect_leaf_files(
     dir: &Path,
-    repo: Option<RepoIdentity>,
-    project: &str,
-    date_compact: &str,
-    kind: Kind,
-    agent: &str,
+    ctx: &LeafScanContext<'_>,
     ignore: &StoreIgnoreMatcher,
     files: &mut Vec<StoredContextFile>,
 ) -> Result<()> {
@@ -1071,20 +1075,20 @@ fn collect_leaf_files(
 
         let Some((session_id, chunk)) = parse_session_basename(
             &file_entry.file_name().to_string_lossy(),
-            agent,
-            date_compact,
+            ctx.agent,
+            ctx.date_compact,
         ) else {
             continue;
         };
 
         files.push(StoredContextFile {
             path,
-            project: project.to_string(),
-            repo: repo.clone(),
-            date_compact: date_compact.to_string(),
-            date_iso: expand_compact_date(date_compact),
-            kind,
-            agent: agent.to_string(),
+            project: ctx.project.to_string(),
+            repo: ctx.repo.clone(),
+            date_compact: ctx.date_compact.to_string(),
+            date_iso: expand_compact_date(ctx.date_compact),
+            kind: ctx.kind,
+            agent: ctx.agent.to_string(),
             session_id,
             chunk,
         });
