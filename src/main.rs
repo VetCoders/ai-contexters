@@ -1273,10 +1273,10 @@ fn sync_memex_if_requested(sync_memex: bool, all_written_paths: &[PathBuf]) -> R
         // the dedicated `memex-sync` command so sync state and observability do
         // not drift between code paths.
         let result = sync_memex_paths(&memex_config, all_written_paths)
-            .context("Failed to sync canonical chunks to external dependency rmcp-memex")?;
+            .context("Failed to materialize canonical chunks into memex retrieval kernel")?;
         eprintln!(
             "  Memex: {} materialized, {} skipped, {} ignored",
-            result.chunks_pushed, result.chunks_skipped, result.chunks_ignored
+            result.chunks_materialized, result.chunks_skipped, result.chunks_ignored
         );
         for err in &result.errors {
             eprintln!("  Memex error: {}", err);
@@ -2382,7 +2382,7 @@ fn run_memex_sync(
 
     eprintln!(
         "✓ Memex sync: {} materialized, {} skipped, {} ignored",
-        result.chunks_pushed, result.chunks_skipped, result.chunks_ignored,
+        result.chunks_materialized, result.chunks_skipped, result.chunks_ignored,
     );
 
     for err in &result.errors {
