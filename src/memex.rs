@@ -9,9 +9,10 @@
 //! - Read-only BM25 search + LanceDB document lookups without subprocesses
 //! - Explicit embedding-dimension/reindex mismatch detection at the boundary
 //!
-//! The user-facing rebuild command is still `aicx memex-sync --reindex`, but it
-//! resolves runtime truth and rewrites storage in-process instead of shelling
-//! out to an `rmcp-memex` binary.
+//! This module does not shell out to an `rmcp-memex` binary. The only CLI-shaped
+//! behavior here is the human-facing rebuild command string embedded in
+//! compatibility errors so operators know which `aicx memex-sync --reindex`
+//! command to run.
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
@@ -214,7 +215,11 @@ fn semantic_index_metadata_path(namespace: &str) -> Result<PathBuf> {
     )))
 }
 
-fn shell_quote(value: &str) -> String {
+/// Quote an argument for display in user-facing CLI guidance.
+///
+/// This is only used to render the suggested `aicx memex-sync --reindex`
+/// command in compatibility errors. It is never executed from this module.
+fn cli_display_arg(value: &str) -> String {
     if value
         .chars()
         .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-' | ':'))
@@ -399,6 +404,7 @@ fn save_semantic_index_metadata(namespace: &str, truth: &MemexRuntimeTruth) -> R
     Ok(())
 }
 
+/// Build the human-facing rebuild command shown in compatibility errors.
 fn semantic_reindex_command(namespace: &str, truth: &MemexRuntimeTruth) -> String {
     let mut command = vec![
         "aicx".to_string(),
@@ -408,15 +414,28 @@ fn semantic_reindex_command(namespace: &str, truth: &MemexRuntimeTruth) -> Strin
 
     if namespace != DEFAULT_MEMEX_NAMESPACE {
         command.push("--namespace".to_string());
-        command.push(shell_quote(namespace));
+        command.push(cli_display_arg(namespace));
     }
 
     if truth.db_path != default_memex_db_path() {
         command.push("--db-path".to_string());
-        command.push(shell_quote(&truth.db_path.to_string_lossy()));
+        command.push(cli_display_arg(&truth.db_path.to_string_lossy()));
     }
 
     command.join(" ")
+}
+
+fn runtime_truth_source_message(truth: &MemexRuntimeTruth) -> String {
+    match truth.config_path.as_ref() {
+        Some(config_path) => format!(
+            " Embedding/runtime config was loaded from {}.",
+            config_path.display()
+        ),
+        None => {
+            " Embedding/runtime config fell back to published rmcp-memex defaults plus environment."
+                .to_string()
+        }
+    }
 }
 
 fn semantic_compatibility_error(
@@ -431,6 +450,7 @@ fn semantic_compatibility_error(
         truth.embedding_dimension,
         truth.db_path.display()
     );
+    message.push_str(&runtime_truth_source_message(truth));
 
     if let Some(actual_dimension) = actual_dimension {
         message.push_str(&format!(
@@ -724,7 +744,7 @@ pub fn save_sync_state(state: &MemexSyncState) -> Result<()> {
 }
 
 // ============================================================================
-// Library-backed sync methods (primary path)
+// Library-backed sync methods
 // ============================================================================
 
 async fn sync_chunk_library(
@@ -1206,11 +1226,9 @@ where
         save_semantic_index_metadata(&config.namespace, &truth)?;
     }
 
-    if let Ok(rt) = tokio::runtime::Runtime::new() {
-        let path_refs: Vec<&PathBuf> = new_files.iter().collect();
-        if let Err(e) = rt.block_on(crate::steer_index::sync_steer_index(&path_refs)) {
-            tracing::warn!("Failed to sync steer index: {}", e);
-        }
+    let path_refs: Vec<&PathBuf> = new_files.iter().collect();
+    if let Err(e) = crate::steer_index::sync_steer_index(&path_refs).await {
+        tracing::warn!("Failed to sync steer index: {}", e);
     }
 
     for file in &synced_files {
@@ -1616,6 +1634,24 @@ embedder_model = "nomic-embed-text"
     }
 
     #[test]
+    fn test_semantic_reindex_command_quotes_display_guidance() {
+        let truth = MemexRuntimeTruth {
+            db_path: PathBuf::from("/tmp/memex store/lancedb"),
+            bm25_path: PathBuf::from("/tmp/memex store/bm25"),
+            embedding_model: "qwen3-embedding:4b".to_string(),
+            embedding_dimension: 2560,
+            config_path: None,
+        };
+
+        let command = semantic_reindex_command("team docs", &truth);
+
+        assert_eq!(
+            command,
+            "aicx memex-sync --reindex --namespace 'team docs' --db-path '/tmp/memex store/lancedb'"
+        );
+    }
+
+    #[test]
     fn test_validate_semantic_index_compatibility_rejects_dimension_mismatch() {
         let root = unique_test_dir("dimension-mismatch");
         let _ = fs::remove_dir_all(&root);
@@ -1672,6 +1708,7 @@ model = "qwen3-embedding:4b"
         assert!(message.contains("qwen3-embedding:4b"));
         assert!(message.contains("2560 dims"));
         assert!(message.contains("4096 dims"));
+        assert!(message.contains(&config_path.to_string_lossy().to_string()));
         assert!(message.contains("aicx memex-sync --reindex"));
 
         let _ = fs::remove_dir_all(&root);
@@ -1736,6 +1773,7 @@ model = "qwen3-embedding:4b"
         assert!(message.contains("bm25_path"));
         assert!(message.contains("embedding_model"));
         assert!(message.contains("embedding_dimension"));
+        assert!(message.contains(&config_path.to_string_lossy().to_string()));
         assert!(message.contains("aicx memex-sync --reindex"));
 
         let _ = remove_path_if_exists(&metadata_path);
