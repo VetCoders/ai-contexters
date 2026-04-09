@@ -1,19 +1,21 @@
 //! Sources / Extractors module for AI Contexters
 //!
-//! Standalone extraction logic for Claude Code, Codex, and Gemini Code Assist.
+//! Standalone extraction logic for Claude Code, Codex, Gemini Code Assist,
+//! and Gemini Antigravity direct extracts.
 //! Improvements over the inline main.rs approach:
 //! - Session-based Codex filtering (not per-message)
 //! - Watermark support for incremental extraction
 //! - Optional assistant message inclusion
 //! - Gemini Code Assist support
+//! - Gemini Antigravity conversation/decision recovery
 //! - Proper deduplication
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, Duration, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -36,6 +38,55 @@ pub struct TimelineEntry {
     pub branch: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+}
+
+/// Denoised conversation message — the canonical projection of a TimelineEntry
+/// containing only user/assistant messages with repo-centric identity.
+///
+/// This is the primary unit for "recover the conversation" workflows.
+/// Tool calls, tool results, reasoning/thoughts, system noise, and artifact
+/// payloads are excluded. Artifact paths may appear as references only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationMessage {
+    pub timestamp: DateTime<Utc>,
+    pub agent: String,
+    pub session_id: String,
+    /// Only "user" or "assistant" — reasoning and system roles are excluded.
+    pub role: String,
+    /// Raw, untrimmed, untruncated message body.
+    pub message: String,
+    /// Canonical project/repo identity (derived from cwd + project filter).
+    pub repo_project: String,
+    /// Secondary provenance: source working directory path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+    /// Git branch at time of message (when available).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+}
+
+/// Project timeline entries into a denoised conversation stream.
+///
+/// Filters to only `user` and `assistant` roles, resolves repo/project identity
+/// from `cwd` + project filter, and preserves provenance fields.
+pub fn to_conversation(
+    entries: &[TimelineEntry],
+    project_filter: &[String],
+) -> Vec<ConversationMessage> {
+    entries
+        .iter()
+        .filter(|e| e.role == "user" || e.role == "assistant")
+        .map(|e| ConversationMessage {
+            timestamp: e.timestamp,
+            agent: e.agent.clone(),
+            session_id: e.session_id.clone(),
+            role: e.role.clone(),
+            message: e.message.clone(),
+            repo_project: repo_name_from_cwd(e.cwd.as_deref(), project_filter),
+            source_path: e.cwd.clone(),
+            branch: e.branch.clone(),
+        })
+        .collect()
 }
 
 /// Configuration for extraction.
@@ -97,6 +148,7 @@ struct CodexEntry {
 struct GeminiSession {
     #[serde(default)]
     session_id: Option<String>,
+    #[allow(dead_code)]
     #[serde(default)]
     project_hash: Option<String>,
     #[serde(default)]
@@ -112,7 +164,9 @@ struct GeminiMessage {
     #[serde(default, rename = "type")]
     msg_type: Option<String>,
     #[serde(default)]
-    content: Option<String>,
+    content: Option<serde_json::Value>,
+    #[serde(default, rename = "displayContent")]
+    display_content: Option<serde_json::Value>,
     #[serde(default)]
     timestamp: Option<String>,
     /// Agent reasoning/thinking steps.
@@ -129,6 +183,205 @@ struct GeminiThought {
     description: Option<String>,
     #[serde(default)]
     timestamp: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GeminiAntigravityRecoveryMode {
+    ConversationArtifacts,
+    StepOutputFallback,
+}
+
+impl GeminiAntigravityRecoveryMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ConversationArtifacts => "conversation-artifacts",
+            Self::StepOutputFallback => "step-output-fallback",
+        }
+    }
+
+    fn note(self) -> &'static str {
+        match self {
+            Self::ConversationArtifacts => {
+                "Recovered readable Antigravity conversation artifacts from brain state. Raw .pb was treated as opaque provenance, not parsed as plaintext."
+            }
+            Self::StepOutputFallback => {
+                "No readable conversation artifact was found. This is a fallback decision stream from .system_generated/steps/*/output.txt, not a full conversation transcript."
+            }
+        }
+    }
+}
+
+fn render_gemini_message_content(message: &GeminiMessage) -> Option<String> {
+    message
+        .content
+        .as_ref()
+        .and_then(render_gemini_content_value)
+        .or_else(|| {
+            message
+                .display_content
+                .as_ref()
+                .and_then(render_gemini_content_value)
+        })
+}
+
+fn truncate_gemini_large_data(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(inline_data) = map.get("inlineData") {
+                let placeholder = render_gemini_inline_data_placeholder(inline_data);
+                map.remove("inlineData");
+                map.insert(
+                    "inlineDataPlaceholder".to_string(),
+                    serde_json::Value::String(placeholder),
+                );
+            }
+            if let Some(file_data) = map.get("fileData") {
+                let placeholder = render_gemini_file_data_placeholder(file_data);
+                map.remove("fileData");
+                map.insert(
+                    "fileDataPlaceholder".to_string(),
+                    serde_json::Value::String(placeholder),
+                );
+            }
+            for v in map.values_mut() {
+                truncate_gemini_large_data(v);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                truncate_gemini_large_data(v);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn render_gemini_content_value(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(text) => {
+            if text.trim().is_empty() {
+                None
+            } else {
+                Some(text.clone())
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            let mut cleaned = serde_json::Value::Array(arr.clone());
+            truncate_gemini_large_data(&mut cleaned);
+            if let Ok(json) = serde_json::to_string_pretty(&cleaned) {
+                let trimmed = json.trim();
+                if trimmed.is_empty() || trimmed == "[]" {
+                    None
+                } else {
+                    Some(json)
+                }
+            } else {
+                None
+            }
+        }
+        serde_json::Value::Object(map) => {
+            let mut cleaned = serde_json::Value::Object(map.clone());
+            truncate_gemini_large_data(&mut cleaned);
+            if let Ok(json) = serde_json::to_string_pretty(&cleaned) {
+                let trimmed = json.trim();
+                if trimmed.is_empty() || trimmed == "{}" {
+                    None
+                } else {
+                    Some(json)
+                }
+            } else {
+                None
+            }
+        }
+        _ => Some(value.to_string()),
+    }
+}
+
+fn render_gemini_inline_data_placeholder(value: &serde_json::Value) -> String {
+    let mime_type = value
+        .as_object()
+        .and_then(|map| map.get("mimeType"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+    let data_chars = value
+        .as_object()
+        .and_then(|map| map.get("data"))
+        .and_then(|value| value.as_str())
+        .map(|data| data.len());
+
+    match data_chars {
+        Some(count) => {
+            format!("[inlineData omitted: mimeType={mime_type}, data_chars={count}]")
+        }
+        None => format!("[inlineData omitted: mimeType={mime_type}]"),
+    }
+}
+
+fn render_gemini_file_data_placeholder(value: &serde_json::Value) -> String {
+    let mime_type = value
+        .as_object()
+        .and_then(|map| map.get("mimeType"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+    let uri = value
+        .as_object()
+        .and_then(|map| map.get("fileUri").or_else(|| map.get("uri")))
+        .and_then(|value| value.as_str());
+
+    match uri {
+        Some(uri) if !uri.is_empty() => {
+            format!("[fileData omitted: mimeType={mime_type}, uri={uri}]")
+        }
+        _ => format!("[fileData omitted: mimeType={mime_type}]"),
+    }
+}
+
+fn infer_project_hint_from_gemini_message(message: &GeminiMessage) -> Option<String> {
+    message
+        .content
+        .as_ref()
+        .and_then(infer_project_hint_from_json_value)
+        .or_else(|| {
+            message
+                .display_content
+                .as_ref()
+                .and_then(infer_project_hint_from_json_value)
+        })
+        .or_else(|| {
+            render_gemini_message_content(message)
+                .as_deref()
+                .and_then(infer_project_hint_from_text)
+        })
+}
+
+fn gemini_message_matches_filter(message: &GeminiMessage, filters_lower: &[String]) -> bool {
+    let content = render_gemini_message_content(message);
+    let project_hint = infer_project_hint_from_gemini_message(message);
+
+    filters_lower.iter().any(|filter| {
+        content
+            .as_ref()
+            .is_some_and(|text| text.to_lowercase().contains(filter))
+            || project_hint
+                .as_ref()
+                .is_some_and(|cwd| cwd.to_lowercase().contains(filter))
+    })
+}
+
+#[derive(Debug, Clone)]
+struct GeminiAntigravityInput {
+    conversation_id: String,
+    input_path: PathBuf,
+    brain_dir: PathBuf,
+    raw_pb_path: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+struct GeminiAntigravityRecovery {
+    entries: Vec<TimelineEntry>,
+    used_paths: Vec<PathBuf>,
+    mode: GeminiAntigravityRecoveryMode,
 }
 
 // ============================================================================
@@ -511,6 +764,19 @@ pub fn extract_codex_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
         return Ok(entries);
     }
 
+    // Check for legacy JSON format ({"session": {...}, "items": [...]})
+    // We read the full file because it's usually formatted JSON.
+    if let Ok(content) = sanitize::read_to_string_validated(path) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+            if val.get("session").is_some() && val.get("items").is_some() {
+                anyhow::bail!(
+                    "Legacy Codex JSON rollout format is unsupported (no cwd available): {}",
+                    path.display()
+                );
+            }
+        }
+    }
+
     Err(anyhow::anyhow!(
         "Unsupported codex file format: {}",
         path.display()
@@ -525,6 +791,769 @@ pub fn extract_gemini_file(path: &Path, config: &ExtractionConfig) -> Result<Vec
     let mut entries = parse_gemini_session(path, config)?;
     entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
     Ok(entries)
+}
+
+/// Extract timeline entries from a Gemini Antigravity conversation.
+///
+/// Supported inputs:
+/// - `~/.gemini/antigravity/conversations/<uuid>.pb`
+/// - `~/.gemini/antigravity/brain/<uuid>/`
+///
+/// The `.pb` file remains opaque provenance. Readable extraction happens from
+/// the sibling `brain/<uuid>/` directory.
+pub fn extract_gemini_antigravity_file(
+    path: &Path,
+    config: &ExtractionConfig,
+) -> Result<Vec<TimelineEntry>> {
+    let input = resolve_gemini_antigravity_input(path)?;
+
+    let mut recovery = match extract_gemini_antigravity_conversation_artifacts(&input, config)? {
+        Some(recovery) => recovery,
+        None => extract_gemini_antigravity_step_outputs(&input, config)?,
+    };
+
+    let summary = build_gemini_antigravity_summary(&input, &recovery, &recovery.entries);
+    let mut entries = std::mem::take(&mut recovery.entries);
+    if entries.is_empty() {
+        return Ok(entries);
+    }
+
+    entries.push(summary);
+    entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    Ok(entries)
+}
+
+fn resolve_gemini_antigravity_input(path: &Path) -> Result<GeminiAntigravityInput> {
+    let input_path = sanitize::validate_read_path(path)?;
+
+    if input_path.is_dir() {
+        let brain_dir = sanitize::validate_dir_path(&input_path)?;
+        let conversation_id = brain_dir
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .context("Gemini Antigravity brain path is missing a conversation id")?;
+
+        return Ok(GeminiAntigravityInput {
+            raw_pb_path: discover_antigravity_pb_for_brain(&brain_dir, &conversation_id),
+            conversation_id,
+            input_path,
+            brain_dir,
+        });
+    }
+
+    if input_path.extension().is_none_or(|ext| ext != "pb") {
+        anyhow::bail!(
+            "Gemini Antigravity input must be a conversations/<uuid>.pb file or brain/<uuid>/ directory: {}",
+            input_path.display()
+        );
+    }
+
+    let conversation_id = input_path
+        .file_stem()
+        .map(|name| name.to_string_lossy().to_string())
+        .context("Gemini Antigravity .pb file is missing a conversation id")?;
+    let candidate_paths = antigravity_brain_candidates(&input_path, &conversation_id);
+    let brain_dir = candidate_paths
+        .iter()
+        .find(|candidate| candidate.exists() && candidate.is_dir())
+        .cloned()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Gemini Antigravity .pb files are opaque/encrypted and require a readable sibling brain/{id}/ directory. Looked for: {}",
+                candidate_paths
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                id = conversation_id
+            )
+        })?;
+
+    Ok(GeminiAntigravityInput {
+        conversation_id,
+        raw_pb_path: Some(input_path.clone()),
+        input_path,
+        brain_dir: sanitize::validate_dir_path(&brain_dir)?,
+    })
+}
+
+fn antigravity_brain_candidates(pb_path: &Path, conversation_id: &str) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Some(conversations_dir) = pb_path.parent()
+        && conversations_dir
+            .file_name()
+            .is_some_and(|name| name == "conversations")
+        && let Some(antigravity_root) = conversations_dir.parent()
+    {
+        candidates.push(antigravity_root.join("brain").join(conversation_id));
+    }
+
+    if let Some(home) = dirs::home_dir() {
+        let default = home
+            .join(".gemini")
+            .join("antigravity")
+            .join("brain")
+            .join(conversation_id);
+        if !candidates.iter().any(|candidate| candidate == &default) {
+            candidates.push(default);
+        }
+    }
+
+    candidates
+}
+
+fn discover_antigravity_pb_for_brain(brain_dir: &Path, conversation_id: &str) -> Option<PathBuf> {
+    let brain_parent = brain_dir.parent()?;
+    if brain_parent.file_name().is_some_and(|name| name == "brain") {
+        let candidate = brain_parent
+            .parent()?
+            .join("conversations")
+            .join(format!("{conversation_id}.pb"));
+        if candidate.exists() {
+            return sanitize::validate_read_path(&candidate).ok();
+        }
+    }
+    None
+}
+
+fn extract_gemini_antigravity_conversation_artifacts(
+    input: &GeminiAntigravityInput,
+    config: &ExtractionConfig,
+) -> Result<Option<GeminiAntigravityRecovery>> {
+    let step_outputs: HashSet<PathBuf> = antigravity_step_output_paths(&input.brain_dir)
+        .into_iter()
+        .collect();
+    let mut used_paths = Vec::new();
+    let mut entries = Vec::new();
+
+    for path in walk_files(&input.brain_dir) {
+        if step_outputs.contains(&path) || !is_antigravity_conversation_candidate(&path) {
+            continue;
+        }
+
+        let content = match sanitize::read_to_string_validated(&path) {
+            Ok(content) => content,
+            Err(_) => continue,
+        };
+
+        let mut parsed = parse_antigravity_conversation_artifact(
+            &path,
+            &input.conversation_id,
+            &content,
+            config,
+        );
+        if !parsed.is_empty() {
+            used_paths.push(path);
+            entries.append(&mut parsed);
+        }
+    }
+
+    if entries.is_empty() {
+        return Ok(None);
+    }
+
+    apply_default_project_hint(&mut entries);
+    entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+
+    Ok(Some(GeminiAntigravityRecovery {
+        entries,
+        used_paths,
+        mode: GeminiAntigravityRecoveryMode::ConversationArtifacts,
+    }))
+}
+
+fn extract_gemini_antigravity_step_outputs(
+    input: &GeminiAntigravityInput,
+    config: &ExtractionConfig,
+) -> Result<GeminiAntigravityRecovery> {
+    let step_output_paths = antigravity_step_output_paths(&input.brain_dir);
+    if step_output_paths.is_empty() {
+        anyhow::bail!(
+            "No readable Gemini Antigravity artifacts found under {}. The raw .pb remains opaque and there were no .system_generated/steps/*/output.txt fallbacks.",
+            input.brain_dir.display()
+        );
+    }
+
+    let session_default_cwd = infer_default_project_hint_for_paths(&step_output_paths);
+    let mut entries = Vec::new();
+
+    for (index, path) in step_output_paths.iter().enumerate() {
+        let content = match sanitize::read_to_string_validated(path) {
+            Ok(content) => content,
+            Err(_) => continue,
+        };
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let timestamp =
+            file_timestamp(path).unwrap_or_else(|| Utc::now() + Duration::seconds(index as i64));
+        if timestamp < config.cutoff {
+            continue;
+        }
+        if config.watermark.is_some_and(|wm| timestamp <= wm) {
+            continue;
+        }
+
+        entries.push(TimelineEntry {
+            timestamp,
+            agent: "gemini-antigravity".to_string(),
+            session_id: input.conversation_id.clone(),
+            role: "artifact".to_string(),
+            message: format!(
+                "Antigravity step output fallback\nsource: {}\nfull_transcript_available: false\n\n{}",
+                path.display(),
+                trimmed
+            ),
+            branch: None,
+            cwd: infer_project_hint_from_text(trimmed).or_else(|| session_default_cwd.clone()),
+        });
+    }
+
+    if entries.is_empty() {
+        anyhow::bail!(
+            "Gemini Antigravity fallback found step outputs under {}, but none produced usable timeline entries.",
+            input.brain_dir.display()
+        );
+    }
+
+    apply_default_project_hint(&mut entries);
+    entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+
+    Ok(GeminiAntigravityRecovery {
+        entries,
+        used_paths: step_output_paths,
+        mode: GeminiAntigravityRecoveryMode::StepOutputFallback,
+    })
+}
+
+fn antigravity_step_output_paths(brain_dir: &Path) -> Vec<PathBuf> {
+    let steps_dir = brain_dir.join(".system_generated").join("steps");
+    if !steps_dir.exists() || !steps_dir.is_dir() {
+        return Vec::new();
+    }
+
+    let mut step_outputs = Vec::new();
+    if let Ok(read_dir) = fs::read_dir(&steps_dir) {
+        for entry in read_dir.flatten() {
+            let step_dir = entry.path();
+            if !step_dir.is_dir() {
+                continue;
+            }
+
+            let output_path = step_dir.join("output.txt");
+            if output_path.exists()
+                && output_path.is_file()
+                && let Ok(validated) = sanitize::validate_read_path(&output_path)
+            {
+                step_outputs.push(validated);
+            }
+        }
+    }
+
+    step_outputs.sort_by_key(|path| antigravity_step_index(path));
+    step_outputs
+}
+
+fn antigravity_step_index(path: &Path) -> usize {
+    path.parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.parse::<usize>().ok())
+        .unwrap_or(usize::MAX)
+}
+
+fn is_antigravity_conversation_candidate(path: &Path) -> bool {
+    let file_name = match path.file_name().and_then(|name| name.to_str()) {
+        Some(name) => name.to_lowercase(),
+        None => return false,
+    };
+
+    if file_name == ".ds_store" {
+        return false;
+    }
+
+    let extension = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_lowercase());
+
+    if matches!(
+        extension.as_deref(),
+        Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "img" | "pb" | "pdf" | "zip")
+    ) {
+        return false;
+    }
+
+    extension.is_some_and(|ext| {
+        matches!(
+            ext.as_str(),
+            "json" | "jsonl" | "md" | "markdown" | "txt" | "log" | "yaml" | "yml"
+        )
+    }) || [
+        "conversation",
+        "transcript",
+        "dialog",
+        "messages",
+        "turns",
+        "chat",
+    ]
+    .iter()
+    .any(|keyword| file_name.contains(keyword))
+}
+
+fn parse_antigravity_conversation_artifact(
+    path: &Path,
+    session_id: &str,
+    content: &str,
+    config: &ExtractionConfig,
+) -> Vec<TimelineEntry> {
+    let default_timestamp = file_timestamp(path).unwrap_or_else(Utc::now);
+
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(content) {
+        let mut entries = collect_antigravity_json_entries(
+            &value,
+            session_id,
+            infer_project_hint_from_json_value(&value).as_deref(),
+            default_timestamp,
+            config,
+        );
+        dedup_timeline_entries(&mut entries);
+        if !entries.is_empty() {
+            return entries;
+        }
+    }
+
+    let mut entries = parse_antigravity_transcript_text(path, session_id, content, config);
+    dedup_timeline_entries(&mut entries);
+    entries
+}
+
+fn collect_antigravity_json_entries(
+    value: &serde_json::Value,
+    session_id: &str,
+    default_cwd: Option<&str>,
+    fallback_timestamp: DateTime<Utc>,
+    config: &ExtractionConfig,
+) -> Vec<TimelineEntry> {
+    let mut entries = Vec::new();
+    let mut counter = 0usize;
+    collect_antigravity_json_entries_inner(
+        value,
+        session_id,
+        default_cwd,
+        fallback_timestamp,
+        config,
+        &mut counter,
+        &mut entries,
+    );
+    entries
+}
+
+fn collect_antigravity_json_entries_inner(
+    value: &serde_json::Value,
+    session_id: &str,
+    default_cwd: Option<&str>,
+    fallback_timestamp: DateTime<Utc>,
+    config: &ExtractionConfig,
+    counter: &mut usize,
+    entries: &mut Vec<TimelineEntry>,
+) {
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_antigravity_json_entries_inner(
+                    item,
+                    session_id,
+                    default_cwd,
+                    fallback_timestamp,
+                    config,
+                    counter,
+                    entries,
+                );
+            }
+        }
+        serde_json::Value::Object(map) => {
+            if let Some(entry) = antigravity_json_message_to_entry(
+                map,
+                session_id,
+                default_cwd,
+                fallback_timestamp + Duration::seconds(*counter as i64),
+                config,
+            ) {
+                entries.push(entry);
+                *counter += 1;
+            }
+
+            for child in map.values() {
+                collect_antigravity_json_entries_inner(
+                    child,
+                    session_id,
+                    default_cwd,
+                    fallback_timestamp,
+                    config,
+                    counter,
+                    entries,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn antigravity_json_message_to_entry(
+    map: &serde_json::Map<String, serde_json::Value>,
+    session_id: &str,
+    default_cwd: Option<&str>,
+    fallback_timestamp: DateTime<Utc>,
+    config: &ExtractionConfig,
+) -> Option<TimelineEntry> {
+    let role = antigravity_role_from_map(map)?;
+    if role == "assistant" && !config.include_assistant {
+        return None;
+    }
+
+    let message = ["content", "text", "message", "body", "value", "output"]
+        .iter()
+        .filter_map(|key| map.get(*key))
+        .find_map(extract_text_from_json_value)?;
+    if message.trim().is_empty() {
+        return None;
+    }
+
+    let timestamp = ["timestamp", "createdAt", "created_at", "time", "date"]
+        .iter()
+        .filter_map(|key| map.get(*key))
+        .find_map(parse_json_timestamp)
+        .unwrap_or(fallback_timestamp);
+
+    if timestamp < config.cutoff {
+        return None;
+    }
+    if config.watermark.is_some_and(|wm| timestamp <= wm) {
+        return None;
+    }
+
+    Some(TimelineEntry {
+        timestamp,
+        agent: "gemini-antigravity".to_string(),
+        session_id: session_id.to_string(),
+        role: role.to_string(),
+        message,
+        branch: None,
+        cwd: infer_project_hint_from_map(map).or_else(|| default_cwd.map(ToOwned::to_owned)),
+    })
+}
+
+fn antigravity_role_from_map(
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Option<&'static str> {
+    let raw_role = ["role", "speaker", "author", "type", "kind", "from"]
+        .iter()
+        .filter_map(|key| map.get(*key))
+        .find_map(|value| value.as_str())?;
+
+    let normalized = raw_role.to_lowercase();
+    if normalized.contains("user") || normalized.contains("human") || normalized == "prompt" {
+        Some("user")
+    } else if normalized.contains("assistant")
+        || normalized.contains("gemini")
+        || normalized.contains("model")
+        || normalized == "ai"
+    {
+        Some("assistant")
+    } else if normalized.contains("system") {
+        Some("system")
+    } else {
+        None
+    }
+}
+
+fn extract_text_from_json_value(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(text) => {
+            let trimmed = text.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        serde_json::Value::Array(items) => {
+            let parts: Vec<String> = items
+                .iter()
+                .filter_map(extract_text_from_json_value)
+                .collect();
+            (!parts.is_empty()).then(|| parts.join("\n"))
+        }
+        serde_json::Value::Object(map) => ["text", "content", "message", "body", "value"]
+            .iter()
+            .filter_map(|key| map.get(*key))
+            .find_map(extract_text_from_json_value),
+        _ => None,
+    }
+}
+
+fn parse_json_timestamp(value: &serde_json::Value) -> Option<DateTime<Utc>> {
+    match value {
+        serde_json::Value::String(raw) => DateTime::parse_from_rfc3339(raw)
+            .ok()
+            .map(|timestamp| timestamp.with_timezone(&Utc)),
+        serde_json::Value::Number(number) => {
+            let raw = number.as_i64()?;
+            if raw > 10_000_000_000 {
+                Utc.timestamp_millis_opt(raw).single()
+            } else {
+                Utc.timestamp_opt(raw, 0).single()
+            }
+        }
+        _ => None,
+    }
+}
+
+fn parse_antigravity_transcript_text(
+    path: &Path,
+    session_id: &str,
+    content: &str,
+    config: &ExtractionConfig,
+) -> Vec<TimelineEntry> {
+    let default_cwd = infer_project_hint_from_text(content);
+    let base_timestamp = file_timestamp(path).unwrap_or_else(Utc::now);
+    let mut entries = Vec::new();
+
+    for (index, line) in content.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let (role, message) = if let Some(rest) = trimmed.strip_prefix("User:") {
+            ("user", rest.trim())
+        } else if let Some(rest) = trimmed.strip_prefix("Assistant:") {
+            ("assistant", rest.trim())
+        } else if let Some(rest) = trimmed.strip_prefix("Gemini:") {
+            ("assistant", rest.trim())
+        } else if let Some(rest) = trimmed.strip_prefix("System:") {
+            ("system", rest.trim())
+        } else {
+            continue;
+        };
+
+        if role == "assistant" && !config.include_assistant {
+            continue;
+        }
+        if message.is_empty() {
+            continue;
+        }
+
+        let timestamp = base_timestamp + Duration::seconds(index as i64);
+        if timestamp < config.cutoff {
+            continue;
+        }
+        if config.watermark.is_some_and(|wm| timestamp <= wm) {
+            continue;
+        }
+
+        entries.push(TimelineEntry {
+            timestamp,
+            agent: "gemini-antigravity".to_string(),
+            session_id: session_id.to_string(),
+            role: role.to_string(),
+            message: message.to_string(),
+            branch: None,
+            cwd: default_cwd.clone(),
+        });
+    }
+
+    entries
+}
+
+fn build_gemini_antigravity_summary(
+    input: &GeminiAntigravityInput,
+    recovery: &GeminiAntigravityRecovery,
+    entries: &[TimelineEntry],
+) -> TimelineEntry {
+    let inferred_projects = repo_labels_from_entries(entries, &[]);
+    let inferred_label = if inferred_projects.is_empty() {
+        "unknown".to_string()
+    } else {
+        inferred_projects.join(", ")
+    };
+    let raw_pb = input
+        .raw_pb_path
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "(not provided)".to_string());
+    let used_paths = recovery
+        .used_paths
+        .iter()
+        .map(|path| format!("- {}", path.display()))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    TimelineEntry {
+        timestamp: entries
+            .iter()
+            .map(|entry| entry.timestamp)
+            .min()
+            .unwrap_or_else(Utc::now)
+            - Duration::seconds(1),
+        agent: "gemini-antigravity".to_string(),
+        session_id: input.conversation_id.clone(),
+        role: "system".to_string(),
+        message: format!(
+            "Gemini Antigravity recovery report\nmode: {}\nconversation_id: {}\ninput: {}\nbrain: {}\nraw_pb: {}\nreadable_entry_count: {}\ninferred_projects: {}\nrecovery_note: {}\nused_artifacts:\n{}",
+            recovery.mode.as_str(),
+            input.conversation_id,
+            input.input_path.display(),
+            input.brain_dir.display(),
+            raw_pb,
+            entries.len(),
+            inferred_label,
+            recovery.mode.note(),
+            if used_paths.is_empty() {
+                "- (none)".to_string()
+            } else {
+                used_paths
+            }
+        ),
+        branch: None,
+        cwd: None,
+    }
+}
+
+fn file_timestamp(path: &Path) -> Option<DateTime<Utc>> {
+    fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()
+        .map(DateTime::<Utc>::from)
+}
+
+fn infer_default_project_hint_for_paths(paths: &[PathBuf]) -> Option<String> {
+    let mut hints = Vec::new();
+    for path in paths {
+        let content = match sanitize::read_to_string_validated(path) {
+            Ok(content) => content,
+            Err(_) => continue,
+        };
+        if let Some(hint) = infer_project_hint_from_text(&content) {
+            hints.push(hint);
+        }
+    }
+    most_common_project_hint(&hints)
+}
+
+fn apply_default_project_hint(entries: &mut [TimelineEntry]) {
+    let hints: Vec<String> = entries
+        .iter()
+        .filter_map(|entry| entry.cwd.clone())
+        .collect();
+    if let Some(default_hint) = most_common_project_hint(&hints) {
+        for entry in entries {
+            if entry.cwd.is_none() {
+                entry.cwd = Some(default_hint.clone());
+            }
+        }
+    }
+}
+
+fn most_common_project_hint(hints: &[String]) -> Option<String> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for hint in hints {
+        *counts.entry(hint.clone()).or_default() += 1;
+    }
+
+    counts
+        .into_iter()
+        .max_by(|(left_hint, left_count), (right_hint, right_count)| {
+            left_count
+                .cmp(right_count)
+                .then_with(|| right_hint.len().cmp(&left_hint.len()))
+                .then_with(|| right_hint.cmp(left_hint))
+        })
+        .map(|(hint, _)| hint)
+}
+
+fn infer_project_hint_from_text(text: &str) -> Option<String> {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text)
+        && let Some(hint) = infer_project_hint_from_json_value(&value)
+    {
+        return Some(hint);
+    }
+
+    let path_re = regex::Regex::new(r"(/[A-Za-z0-9._~\-]+(?:/[A-Za-z0-9._~\-]+)+)").ok()?;
+    path_re
+        .captures(text)
+        .and_then(|captures| captures.get(1))
+        .and_then(|capture| normalize_project_hint(capture.as_str()))
+}
+
+fn infer_project_hint_from_json_value(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Object(map) => infer_project_hint_from_map(map)
+            .or_else(|| map.values().find_map(infer_project_hint_from_json_value)),
+        serde_json::Value::Array(items) => {
+            items.iter().find_map(infer_project_hint_from_json_value)
+        }
+        _ => None,
+    }
+}
+
+fn infer_project_hint_from_map(map: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    [
+        "project",
+        "projectRoot",
+        "project_root",
+        "cwd",
+        "repo",
+        "repository",
+        "workspace",
+        "root",
+        "rootPath",
+        "workingDirectory",
+    ]
+    .iter()
+    .filter_map(|key| map.get(*key))
+    .find_map(|value| value.as_str())
+    .and_then(normalize_project_hint)
+}
+
+fn normalize_project_hint(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_matches('"');
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let lower = trimmed.to_lowercase();
+    if matches!(
+        lower.as_str(),
+        "unknown" | "none" | "null" | "app" | "src" | "lib" | "tests" | "docs"
+    ) {
+        return None;
+    }
+
+    if trimmed.starts_with("~/") {
+        return dirs::home_dir()
+            .map(|home| {
+                home.join(trimmed.trim_start_matches("~/"))
+                    .display()
+                    .to_string()
+            })
+            .or_else(|| Some(trimmed.to_string()));
+    }
+
+    Some(trimmed.to_string())
+}
+
+fn dedup_timeline_entries(entries: &mut Vec<TimelineEntry>) {
+    let mut seen = HashSet::new();
+    entries.retain(|entry| {
+        seen.insert((
+            entry.timestamp,
+            entry.role.clone(),
+            entry.message.clone(),
+            entry.cwd.clone(),
+        ))
+    });
 }
 
 // ============================================================================
@@ -829,19 +1858,12 @@ fn parse_codex_session_file(path: &Path, config: &ExtractionConfig) -> Result<Ve
         }
     }
 
-    // Extract session metadata
-    let mut session_cwd: Option<String> = None;
+    // Extract global session metadata (like session_id) and the initial cwd
     let mut session_id: Option<String> = None;
+    let mut initial_cwd: Option<String> = None;
 
     for ev in &events {
         if ev.event_type == "session_meta" {
-            if session_cwd.is_none() {
-                session_cwd = ev
-                    .payload
-                    .get("cwd")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-            }
             if session_id.is_none() {
                 session_id = ev
                     .payload
@@ -849,13 +1871,13 @@ fn parse_codex_session_file(path: &Path, config: &ExtractionConfig) -> Result<Ve
                     .and_then(|v| v.as_str())
                     .map(String::from);
             }
-        }
-        if ev.event_type == "turn_context" && session_cwd.is_none() {
-            session_cwd = ev
-                .payload
-                .get("cwd")
-                .and_then(|v| v.as_str())
-                .map(String::from);
+            if initial_cwd.is_none() {
+                initial_cwd = ev
+                    .payload
+                    .get("cwd")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+            }
         }
     }
 
@@ -866,26 +1888,40 @@ fn parse_codex_session_file(path: &Path, config: &ExtractionConfig) -> Result<Ve
             .unwrap_or_default()
     });
 
-    // Project filter: check if session cwd matches
-    if !config.project_filter.is_empty() {
-        let matches = session_cwd.as_ref().is_some_and(|cwd| {
-            let cwd_lower = cwd.to_lowercase();
-            config
-                .project_filter
-                .iter()
-                .any(|f| cwd_lower.contains(&f.to_lowercase()))
-        });
-        if !matches {
-            return Ok(vec![]);
-        }
-    }
-
     // Collect event_msg entries (user_message + agent_message)
     let mut entries = Vec::new();
+    let mut current_cwd = initial_cwd;
 
     for ev in &events {
+        // Update current context per-turn
+        if ev.event_type == "turn_context" {
+            if let Some(cwd) = ev
+                .payload
+                .get("cwd")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+            {
+                current_cwd = Some(cwd);
+            }
+            continue;
+        }
+
         if ev.event_type != "event_msg" {
             continue;
+        }
+
+        // Project filter: check if the current turn's cwd matches
+        if !config.project_filter.is_empty() {
+            let matches = current_cwd.as_ref().is_some_and(|cwd| {
+                let cwd_lower = cwd.to_lowercase();
+                config
+                    .project_filter
+                    .iter()
+                    .any(|f| cwd_lower.contains(&f.to_lowercase()))
+            });
+            if !matches {
+                continue;
+            }
         }
 
         let msg_type = ev
@@ -950,7 +1986,7 @@ fn parse_codex_session_file(path: &Path, config: &ExtractionConfig) -> Result<Ve
             role: role.to_string(),
             message,
             branch: None,
-            cwd: session_cwd.clone(),
+            cwd: current_cwd.clone(),
         });
     }
 
@@ -966,6 +2002,21 @@ fn walk_jsonl_files(dir: &Path) -> Vec<PathBuf> {
             if path.is_dir() {
                 files.extend(walk_jsonl_files(&path));
             } else if path.extension().is_some_and(|e| e == "jsonl") {
+                files.push(path);
+            }
+        }
+    }
+    files
+}
+
+fn walk_files(dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    if let Ok(rd) = fs::read_dir(dir) {
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                files.extend(walk_files(&path));
+            } else if path.is_file() {
                 files.push(path);
             }
         }
@@ -1037,8 +2088,10 @@ fn parse_gemini_session(
         .or_else(|| path.file_stem().map(|s| s.to_string_lossy().to_string()))
         .unwrap_or_default();
 
-    // Use projectHash as a pseudo-cwd for filtering
-    let project_hash = session.project_hash.clone();
+    let session_default_cwd = session
+        .messages
+        .iter()
+        .find_map(infer_project_hint_from_gemini_message);
 
     // Check project filter against message content
     let session_matches_filter = if !config.project_filter.is_empty() {
@@ -1047,13 +2100,10 @@ fn parse_gemini_session(
             .iter()
             .map(|f| f.to_lowercase())
             .collect();
-        filters_lower.iter().any(|fl| {
-            session.messages.iter().any(|m| {
-                m.content
-                    .as_ref()
-                    .is_some_and(|c| c.to_lowercase().contains(fl))
-            })
-        })
+        session
+            .messages
+            .iter()
+            .any(|message| gemini_message_matches_filter(message, &filters_lower))
     } else {
         true
     };
@@ -1101,10 +2151,12 @@ fn parse_gemini_session(
             continue;
         }
 
-        let text = msg.content.as_deref().unwrap_or("").to_string();
-        if text.is_empty() {
+        let Some(text) = render_gemini_message_content(msg) else {
             continue;
-        }
+        };
+
+        let inferred_cwd =
+            infer_project_hint_from_gemini_message(msg).or_else(|| session_default_cwd.clone());
 
         entries.push(TimelineEntry {
             timestamp,
@@ -1113,7 +2165,7 @@ fn parse_gemini_session(
             role,
             message: text,
             branch: None,
-            cwd: project_hash.clone(),
+            cwd: inferred_cwd.clone(),
         });
 
         // Extract thoughts as reasoning entries (only when include_assistant)
@@ -1147,7 +2199,7 @@ fn parse_gemini_session(
                     role: "reasoning".to_string(),
                     message: text,
                     branch: None,
-                    cwd: project_hash.clone(),
+                    cwd: inferred_cwd.clone(),
                 });
             }
         }
@@ -1382,6 +2434,23 @@ pub fn repo_name_from_cwd(cwd: Option<&str>, project_filter: &[String]) -> Strin
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+/// Derive canonical repo labels from extracted entries.
+pub fn repo_labels_from_entries(
+    entries: &[TimelineEntry],
+    project_filter: &[String],
+) -> Vec<String> {
+    let mut labels = BTreeSet::new();
+
+    for entry in entries {
+        let repo = repo_name_from_cwd(entry.cwd.as_deref(), project_filter);
+        if repo != "unknown" {
+            labels.insert(repo);
+        }
+    }
+
+    labels.into_iter().collect()
+}
+
 /// Detect project name from current working directory.
 ///
 /// Strategy: git repo root dirname → cwd dirname → "unknown".
@@ -1503,7 +2572,28 @@ fn extract_message_text(message: &Option<serde_json::Value>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use filetime::{FileTime, set_file_mtime};
     use std::fs;
+    use std::path::PathBuf;
+
+    fn unique_test_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "ai-contexters-{name}-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ))
+    }
+
+    fn write_file(path: &Path, content: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, content).unwrap();
+    }
+
+    fn set_mtime(path: &Path, unix_seconds: i64) {
+        set_file_mtime(path, FileTime::from_unix_time(unix_seconds, 0)).unwrap();
+    }
 
     #[test]
     fn test_repo_name_from_cwd() {
@@ -1576,14 +2666,15 @@ mod tests {
 
     #[test]
     fn test_extract_claude_file_parses_text_only_blocks() {
-        let tmp = std::env::temp_dir().join("ai-ctx-claude-direct.jsonl");
-        let _ = fs::remove_file(&tmp);
+        let root = unique_test_dir("claude-direct");
+        let tmp = root.join("session.jsonl");
+        let _ = fs::remove_dir_all(&root);
 
         let content = r#"{"type":"user","message":{"role":"user","content":"Hello"},"timestamp":"2026-02-09T22:03:06.765Z","sessionId":"sess123","gitBranch":"main","cwd":"/tmp"}
 {"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Hi"}]},"timestamp":"2026-02-09T22:03:07.765Z","sessionId":"sess123"}
 {"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"echo hi"}}]},"timestamp":"2026-02-09T22:03:08.765Z","sessionId":"sess123"}
 {"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]},"timestamp":"2026-02-09T22:03:09.765Z","sessionId":"sess123"}"#;
-        fs::write(&tmp, content).unwrap();
+        write_file(&tmp, content);
 
         let cutoff = Utc.timestamp_opt(0, 0).single().unwrap();
         let config = ExtractionConfig {
@@ -1600,18 +2691,19 @@ mod tests {
         assert_eq!(entries[1].role, "assistant");
         assert_eq!(entries[1].message, "Hi");
 
-        let _ = fs::remove_file(&tmp);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
     fn test_extract_codex_file_history_format() {
-        let tmp = std::env::temp_dir().join("ai-ctx-codex-direct-history.jsonl");
-        let _ = fs::remove_file(&tmp);
+        let root = unique_test_dir("codex-direct-history");
+        let tmp = root.join("history.jsonl");
+        let _ = fs::remove_dir_all(&root);
 
         let content = r#"{"session_id":"s1","text":"hello","ts":1000,"role":"user","cwd":"/tmp/a"}
 {"session_id":"s1","text":"hi back","ts":1001,"role":"assistant","cwd":"/tmp/a"}
 {"session_id":"s2","text":"unrelated","ts":2000,"role":"user","cwd":"/tmp/b"}"#;
-        fs::write(&tmp, content).unwrap();
+        write_file(&tmp, content);
 
         let cutoff = Utc.timestamp_opt(0, 0).single().unwrap();
         let config = ExtractionConfig {
@@ -1627,17 +2719,18 @@ mod tests {
         assert_eq!(entries[0].role, "user");
         assert_eq!(entries[1].role, "assistant");
 
-        let _ = fs::remove_file(&tmp);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
     fn test_extract_codex_file_session_format_detects() {
-        let tmp = std::env::temp_dir().join("ai-ctx-codex-direct-session.jsonl");
-        let _ = fs::remove_file(&tmp);
+        let root = unique_test_dir("codex-direct-session");
+        let tmp = root.join("session.jsonl");
+        let _ = fs::remove_dir_all(&root);
 
         // Minimal session file (no event_msg) should parse and yield 0 entries.
         let content = r#"{"timestamp":"2026-02-01T00:00:00Z","type":"session_meta","payload":{"id":"sess","cwd":"/tmp/x"}}"#;
-        fs::write(&tmp, content).unwrap();
+        write_file(&tmp, content);
 
         let cutoff = Utc.timestamp_opt(0, 0).single().unwrap();
         let config = ExtractionConfig {
@@ -1650,13 +2743,14 @@ mod tests {
         let entries = extract_codex_file(&tmp, &config).unwrap();
         assert!(entries.is_empty());
 
-        let _ = fs::remove_file(&tmp);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
     fn test_extract_gemini_file_session_json() {
-        let tmp = std::env::temp_dir().join("ai-ctx-gemini-direct.json");
-        let _ = fs::remove_file(&tmp);
+        let root = unique_test_dir("gemini-direct");
+        let tmp = root.join("session.json");
+        let _ = fs::remove_dir_all(&root);
 
         let content = r#"{
   "sessionId": "sess-1",
@@ -1667,7 +2761,7 @@ mod tests {
     {"type":"info","content":"skip me","timestamp":"2026-02-01T00:00:02Z","thoughts":[]}
   ]
 }"#;
-        fs::write(&tmp, content).unwrap();
+        write_file(&tmp, content);
 
         let cutoff = Utc.timestamp_opt(0, 0).single().unwrap();
         let config = ExtractionConfig {
@@ -1683,7 +2777,184 @@ mod tests {
         assert_eq!(entries[0].role, "user");
         assert_eq!(entries[1].role, "assistant");
 
-        let _ = fs::remove_file(&tmp);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_extract_gemini_antigravity_prefers_conversation_artifacts_for_brain_input() {
+        let root = unique_test_dir("gemini-antigravity-brain");
+        let brain = root.join("brain").join("conv-1");
+        let conversation_artifact = brain.join("conversation.json");
+        let step_output = brain
+            .join(".system_generated")
+            .join("steps")
+            .join("001")
+            .join("output.txt");
+
+        write_file(
+            &conversation_artifact,
+            r#"{
+  "projectRoot": "/Users/tester/workspace/RepoAlpha",
+  "messages": [
+    {"role":"user","content":"Map the architecture","timestamp":"2026-02-01T00:00:00Z"},
+    {"role":"assistant","content":"We should split extraction and reporting.","timestamp":"2026-02-01T00:00:01Z"}
+  ]
+}"#,
+        );
+        write_file(
+            &step_output,
+            r#"{"project":"/Users/tester/workspace/RepoIgnored","decision":"fallback should stay unused"}"#,
+        );
+        set_mtime(&conversation_artifact, 1_706_745_600);
+        set_mtime(&step_output, 1_706_745_660);
+
+        let config = ExtractionConfig {
+            project_filter: vec![],
+            cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+            include_assistant: true,
+            watermark: None,
+        };
+
+        let entries = extract_gemini_antigravity_file(&brain, &config).unwrap();
+        assert_eq!(entries[0].role, "system");
+        assert!(entries[0].message.contains("mode: conversation-artifacts"));
+        assert!(entries[0].message.contains("RepoAlpha"));
+        assert!(
+            entries[0]
+                .message
+                .contains(&conversation_artifact.display().to_string())
+        );
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| entry.message.contains("step output fallback"))
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.role == "user" || entry.role == "assistant")
+                .count(),
+            2
+        );
+        assert!(
+            entries
+                .iter()
+                .filter(|entry| entry.role != "system")
+                .all(|entry| entry.cwd.as_deref() == Some("/Users/tester/workspace/RepoAlpha"))
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_extract_gemini_antigravity_pb_input_resolves_brain_and_falls_back_to_steps() {
+        let root = unique_test_dir("gemini-antigravity-pb");
+        let pb = root.join("conversations").join("conv-2.pb");
+        let step_output = root
+            .join("brain")
+            .join("conv-2")
+            .join(".system_generated")
+            .join("steps")
+            .join("007")
+            .join("output.txt");
+
+        write_file(&pb, "opaque");
+        write_file(
+            &step_output,
+            r#"{"project":"/Users/tester/workspace/RepoBeta","decision":"Ship the extraction in additive mode."}"#,
+        );
+        set_mtime(&step_output, 1_706_745_720);
+
+        let config = ExtractionConfig {
+            project_filter: vec![],
+            cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+            include_assistant: true,
+            watermark: None,
+        };
+
+        let entries = extract_gemini_antigravity_file(&pb, &config).unwrap();
+        assert_eq!(entries[0].role, "system");
+        assert!(entries[0].message.contains("mode: step-output-fallback"));
+        assert!(
+            entries[0]
+                .message
+                .contains("not a full conversation transcript")
+        );
+        assert!(entries[0].message.contains(&pb.display().to_string()));
+        assert_eq!(entries[1].role, "artifact");
+        assert!(entries[1].message.contains("step output fallback"));
+        assert!(
+            entries[1]
+                .cwd
+                .as_deref()
+                .is_some_and(|cwd| cwd.ends_with("RepoBeta"))
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_extract_gemini_antigravity_missing_brain_errors_honestly() {
+        let root = unique_test_dir("gemini-antigravity-missing-brain");
+        let pb = root.join("conversations").join("conv-3.pb");
+        write_file(&pb, "opaque");
+
+        let config = ExtractionConfig {
+            project_filter: vec![],
+            cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+            include_assistant: true,
+            watermark: None,
+        };
+
+        let err = extract_gemini_antigravity_file(&pb, &config).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("opaque/encrypted"));
+        assert!(message.contains("brain/conv-3/"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_extract_gemini_antigravity_brain_input_falls_back_explicitly() {
+        let root = unique_test_dir("gemini-antigravity-brain-fallback");
+        let brain = root.join("brain").join("conv-4");
+        let step_a = brain
+            .join(".system_generated")
+            .join("steps")
+            .join("002")
+            .join("output.txt");
+        let step_b = brain
+            .join(".system_generated")
+            .join("steps")
+            .join("009")
+            .join("output.txt");
+
+        write_file(
+            &step_a,
+            r#"{"project":"RepoGamma","decision":"Prefer readable artifacts first."}"#,
+        );
+        write_file(
+            &step_b,
+            r#"{"decision":"Degrade to step outputs when chat artifacts are absent."}"#,
+        );
+        set_mtime(&step_a, 1_706_745_780);
+        set_mtime(&step_b, 1_706_745_840);
+
+        let config = ExtractionConfig {
+            project_filter: vec![],
+            cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+            include_assistant: true,
+            watermark: None,
+        };
+
+        let entries = extract_gemini_antigravity_file(&brain, &config).unwrap();
+        assert!(entries[0].message.contains("mode: step-output-fallback"));
+        assert!(entries[1].message.contains(&step_a.display().to_string()));
+        assert!(entries[2].message.contains(&step_b.display().to_string()));
+        assert_eq!(entries[1].cwd.as_deref(), Some("RepoGamma"));
+        assert_eq!(entries[2].cwd.as_deref(), Some("RepoGamma"));
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1872,11 +3143,15 @@ mod tests {
     fn test_gemini_message_with_content() {
         let msg = GeminiMessage {
             msg_type: Some("user".to_string()),
-            content: Some("hello from gemini".to_string()),
+            content: Some(serde_json::Value::String("hello from gemini".to_string())),
+            display_content: None,
             timestamp: Some("2026-01-20T19:50:45.683Z".to_string()),
             thoughts: vec![],
         };
-        assert_eq!(msg.content.as_deref().unwrap_or(""), "hello from gemini");
+        assert_eq!(
+            render_gemini_message_content(&msg).as_deref(),
+            Some("hello from gemini")
+        );
         assert_eq!(msg.msg_type.as_deref().unwrap(), "user");
     }
 
@@ -1885,7 +3160,8 @@ mod tests {
         // "gemini" type maps to "assistant" role
         let msg = GeminiMessage {
             msg_type: Some("gemini".to_string()),
-            content: Some("response text".to_string()),
+            content: Some(serde_json::Value::String("response text".to_string())),
+            display_content: None,
             timestamp: Some("2026-01-20T19:50:51.778Z".to_string()),
             thoughts: vec![],
         };
@@ -1903,7 +3179,8 @@ mod tests {
         for msg_type in &["error", "info"] {
             let msg = GeminiMessage {
                 msg_type: Some(msg_type.to_string()),
-                content: Some("some system message".to_string()),
+                content: Some(serde_json::Value::String("some system message".to_string())),
+                display_content: None,
                 timestamp: Some("2026-01-20T19:16:15.218Z".to_string()),
                 thoughts: vec![],
             };
@@ -1955,11 +3232,318 @@ mod tests {
         );
         assert_eq!(session.messages.len(), 2);
         assert_eq!(session.messages[0].msg_type.as_deref(), Some("user"));
-        assert_eq!(session.messages[0].content.as_deref(), Some("siemka!"));
+        assert_eq!(
+            session.messages[0].content.as_ref(),
+            Some(&serde_json::Value::String("siemka!".to_string()))
+        );
         assert_eq!(session.messages[1].msg_type.as_deref(), Some("gemini"));
         assert_eq!(
-            session.messages[1].content.as_deref(),
-            Some("Cześć Maciej.")
+            session.messages[1].content.as_ref(),
+            Some(&serde_json::Value::String("Cześć Maciej.".to_string()))
         );
+    }
+
+    #[test]
+    fn test_render_gemini_content_value_preserves_structured_blocks() {
+        let value = serde_json::json!([
+            {"text": "co to jest reachy mini? @../../../.gemini/tmp/codescribe/images/clipboard-1773858428029.png"},
+            {"text": "\n--- Content from referenced files ---"},
+            {"inlineData": {"mimeType": "image/png", "data": "abc123"}},
+            {"text": "\n--- End of content ---"}
+        ]);
+
+        let rendered = render_gemini_content_value(&value).unwrap();
+        assert!(rendered.contains("co to jest reachy mini?"));
+        assert!(rendered.contains("--- Content from referenced files ---"));
+        assert!(rendered.contains("[inlineData omitted: mimeType=image/png, data_chars=6]"));
+        assert!(rendered.contains("--- End of content ---"));
+    }
+
+    #[test]
+    fn test_render_gemini_content_value_supports_object_shapes() {
+        let value = serde_json::json!({
+            "content": [
+                {"text": "first line"},
+                {"fileData": {"mimeType": "text/plain", "fileUri": "file:///tmp/note.txt"}}
+            ]
+        });
+
+        let rendered = render_gemini_content_value(&value).unwrap();
+        assert!(rendered.contains("first line"));
+        assert!(rendered.contains("file:///tmp/note.txt"));
+        assert!(rendered.contains("mimeType=text/plain"));
+    }
+
+    #[test]
+    fn test_extract_gemini_file_preserves_user_array_content() {
+        let root = unique_test_dir("gemini-array-user");
+        let tmp = root.join("session.json");
+        let _ = fs::remove_dir_all(&root);
+
+        let content = r##"{
+  "sessionId": "sess-array",
+  "messages": [
+    {
+      "type":"user",
+      "content":[
+        {"text":"# Task: Gemini truth repair"},
+        {"text":"- preserve user arrays honestly"}
+      ],
+      "timestamp":"2026-02-01T00:00:00Z"
+    },
+    {
+      "type":"gemini",
+      "content":"working on it",
+      "timestamp":"2026-02-01T00:00:01Z"
+    }
+  ]
+}"##;
+        write_file(&tmp, content);
+
+        let config = ExtractionConfig {
+            project_filter: vec![],
+            cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+            include_assistant: true,
+            watermark: None,
+        };
+
+        let entries = extract_gemini_file(&tmp, &config).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].role, "user");
+        assert_eq!(
+            entries[0].message,
+            "[\n  {\n    \"text\": \"# Task: Gemini truth repair\"\n  },\n  {\n    \"text\": \"- preserve user arrays honestly\"\n  }\n]"
+        );
+        assert_eq!(entries[1].role, "assistant");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_extract_gemini_file_keeps_inline_data_as_explicit_placeholder() {
+        let root = unique_test_dir("gemini-inline-data");
+        let tmp = root.join("session.json");
+        let _ = fs::remove_dir_all(&root);
+
+        let content = r#"{
+  "sessionId": "sess-inline",
+  "messages": [
+    {
+      "type":"user",
+      "timestamp":"2026-02-01T00:00:00Z",
+      "content":[
+        {"text":"co to jest reachy mini? @../../../.gemini/tmp/codescribe/images/clipboard-1773858428029.png"},
+        {"text":"\n--- Content from referenced files ---"},
+        {"inlineData":{"mimeType":"image/png","data":"abc123"}},
+        {"text":"\n--- End of content ---"}
+      ],
+      "displayContent":[
+        {"text":"co to jest reachy mini? @../../../.gemini/tmp/codescribe/images/clipboard-1773858428029.png"}
+      ]
+    },
+    {
+      "type":"gemini",
+      "timestamp":"2026-02-01T00:00:01Z",
+      "content":"To jest humanoidalny robot."
+    }
+  ]
+}"#;
+        write_file(&tmp, content);
+
+        let config = ExtractionConfig {
+            project_filter: vec![],
+            cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+            include_assistant: true,
+            watermark: None,
+        };
+
+        let entries = extract_gemini_file(&tmp, &config).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].message.contains("co to jest reachy mini?"));
+        assert!(
+            entries[0]
+                .message
+                .contains("[inlineData omitted: mimeType=image/png, data_chars=6]")
+        );
+        assert!(entries[1].message.contains("humanoidalny robot"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod conversation_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    #[test]
+    fn test_conversation_first_excludes_reasoning() {
+        let entries = vec![
+            TimelineEntry {
+                timestamp: Utc.with_ymd_and_hms(2026, 3, 21, 10, 0, 0).unwrap(),
+                agent: "claude".to_string(),
+                session_id: "sess1".to_string(),
+                role: "user".to_string(),
+                message: "Fix the auth middleware".to_string(),
+                branch: Some("main".to_string()),
+                cwd: Some("/home/user/myrepo".to_string()),
+            },
+            TimelineEntry {
+                timestamp: Utc.with_ymd_and_hms(2026, 3, 21, 10, 0, 30).unwrap(),
+                agent: "claude".to_string(),
+                session_id: "sess1".to_string(),
+                role: "assistant".to_string(),
+                message: "I'll refactor the auth module to use JWT tokens.".to_string(),
+                branch: Some("main".to_string()),
+                cwd: Some("/home/user/myrepo".to_string()),
+            },
+            TimelineEntry {
+                timestamp: Utc.with_ymd_and_hms(2026, 3, 21, 10, 1, 0).unwrap(),
+                agent: "codex".to_string(),
+                session_id: "sess2".to_string(),
+                role: "reasoning".to_string(),
+                message: "Thinking about the best approach...".to_string(),
+                branch: None,
+                cwd: Some("/home/user/myrepo".to_string()),
+            },
+            TimelineEntry {
+                timestamp: Utc.with_ymd_and_hms(2026, 3, 21, 10, 1, 30).unwrap(),
+                agent: "gemini".to_string(),
+                session_id: "sess3".to_string(),
+                role: "reasoning".to_string(),
+                message: "**Analysis**: Checking dependencies".to_string(),
+                branch: None,
+                cwd: Some("/home/user/myrepo".to_string()),
+            },
+        ];
+
+        let conv = to_conversation(&entries, &[]);
+        assert_eq!(conv.len(), 2);
+        assert_eq!(conv[0].role, "user");
+        assert_eq!(conv[0].message, "Fix the auth middleware");
+        assert_eq!(conv[1].role, "assistant");
+        assert_eq!(
+            conv[1].message,
+            "I'll refactor the auth module to use JWT tokens."
+        );
+        assert!(conv.iter().all(|m| m.role != "reasoning"));
+    }
+
+    #[test]
+    fn test_conversation_first_preserves_full_messages() {
+        let long_msg = "A".repeat(50_000);
+        let entries = vec![TimelineEntry {
+            timestamp: Utc.with_ymd_and_hms(2026, 3, 21, 10, 0, 0).unwrap(),
+            agent: "claude".to_string(),
+            session_id: "sess1".to_string(),
+            role: "user".to_string(),
+            message: long_msg.clone(),
+            branch: None,
+            cwd: None,
+        }];
+
+        let conv = to_conversation(&entries, &[]);
+        assert_eq!(conv.len(), 1);
+        assert_eq!(conv[0].message.len(), 50_000);
+        assert_eq!(conv[0].message, long_msg);
+    }
+
+    #[test]
+    fn test_conversation_first_repo_project_identity() {
+        let entries = vec![
+            TimelineEntry {
+                timestamp: Utc.with_ymd_and_hms(2026, 3, 21, 10, 0, 0).unwrap(),
+                agent: "claude".to_string(),
+                session_id: "sess1".to_string(),
+                role: "user".to_string(),
+                message: "hello".to_string(),
+                branch: None,
+                cwd: Some("/Users/maciejgad/hosted/VetCoders/ai-contexters".to_string()),
+            },
+            TimelineEntry {
+                timestamp: Utc.with_ymd_and_hms(2026, 3, 21, 10, 1, 0).unwrap(),
+                agent: "codex".to_string(),
+                session_id: "sess2".to_string(),
+                role: "assistant".to_string(),
+                message: "world".to_string(),
+                branch: None,
+                cwd: None,
+            },
+        ];
+
+        let conv = to_conversation(&entries, &["ai-contexters".to_string()]);
+        assert_eq!(conv[0].repo_project, "ai-contexters");
+        assert_eq!(conv[1].repo_project, "ai-contexters");
+        assert_eq!(
+            conv[0].source_path.as_deref(),
+            Some("/Users/maciejgad/hosted/VetCoders/ai-contexters")
+        );
+        assert!(conv[1].source_path.is_none());
+    }
+
+    #[test]
+    fn test_conversation_first_preserves_provenance() {
+        let entries = vec![TimelineEntry {
+            timestamp: Utc.with_ymd_and_hms(2026, 3, 21, 14, 30, 0).unwrap(),
+            agent: "claude".to_string(),
+            session_id: "abc12345-6789-session-uuid".to_string(),
+            role: "user".to_string(),
+            message: "Deploy to production".to_string(),
+            branch: Some("release/v2".to_string()),
+            cwd: Some("/home/user/project".to_string()),
+        }];
+
+        let conv = to_conversation(&entries, &[]);
+        assert_eq!(conv.len(), 1);
+        let msg = &conv[0];
+        assert_eq!(msg.session_id, "abc12345-6789-session-uuid");
+        assert_eq!(msg.agent, "claude");
+        assert_eq!(msg.branch.as_deref(), Some("release/v2"));
+        assert_eq!(
+            msg.timestamp,
+            Utc.with_ymd_and_hms(2026, 3, 21, 14, 30, 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_extract_claude_excludes_tool_blocks_then_conversation_clean() {
+        use std::fs;
+        let tmp = std::env::temp_dir().join(format!(
+            "ai-ctx-conv-tool-blocks-{}-{}.jsonl",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = fs::remove_file(&tmp);
+
+        let content = concat!(
+            r#"{"type":"user","message":{"role":"user","content":"Hello agent"},"timestamp":"2026-03-21T10:00:00.000Z","sessionId":"s1","cwd":"/tmp"}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Let me check."},{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}},{"type":"text","text":"Here are the files."}]},"timestamp":"2026-03-21T10:00:01.000Z","sessionId":"s1"}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]},"timestamp":"2026-03-21T10:00:02.000Z","sessionId":"s1"}"#
+        );
+        fs::write(&tmp, content).unwrap();
+
+        let cutoff = Utc.timestamp_opt(0, 0).single().unwrap();
+        let config = ExtractionConfig {
+            project_filter: vec![],
+            cutoff,
+            include_assistant: true,
+            watermark: None,
+        };
+
+        let entries = extract_claude_file(&tmp, &config).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].message, "Hello agent");
+        assert_eq!(entries[1].message, "Let me check.\nHere are the files.");
+        assert!(!entries[1].message.contains("tool_use"));
+        assert!(!entries[1].message.contains("Bash"));
+
+        let conv = to_conversation(&entries, &[]);
+        assert_eq!(conv.len(), 2);
+        assert_eq!(conv[0].message, "Hello agent");
+        assert_eq!(conv[1].message, "Let me check.\nHere are the files.");
+
+        let _ = fs::remove_file(&tmp);
     }
 }

@@ -430,6 +430,7 @@ pub fn normalize_query(text: &str) -> String {
 
 /// Patterns in messages that indicate aicx's own operational traffic.
 /// These create feedback loops: search → log → extract → search matches own query.
+/// Retired MCP tool names stay here so historical traces remain filterable.
 const SELF_ECHO_PATTERNS: &[&str] = &[
     // MCP tool calls
     "aicx_search",
@@ -455,11 +456,17 @@ const SELF_ECHO_PATTERNS: &[&str] = &[
     "aicx dashboard-serve",
 ];
 
+/// Sentinel brackets for aicx read blocks injected by vc-init / vc-agents.
+/// Content between these markers is recycled context, not original signal.
+const AICX_READ_BEGIN: &str = "【aicx:read】";
+const AICX_READ_END: &str = "【/aicx:read】";
+
 /// Returns true if a message is aicx operational self-echo that should be
 /// filtered from extraction to prevent feedback loops.
 ///
-/// A message is self-echo if >50% of its non-empty lines match patterns.
-/// This avoids false positives on messages that merely *mention* aicx once.
+/// A message is self-echo if >50% of its non-empty lines match patterns,
+/// excluding lines inside 【aicx:read】...【/aicx:read】 blocks (which are
+/// counted as echo unconditionally).
 pub fn is_self_echo(message: &str) -> bool {
     let lines: Vec<&str> = message
         .lines()
@@ -471,15 +478,32 @@ pub fn is_self_echo(message: &str) -> bool {
         return false;
     }
 
-    let echo_lines = lines
-        .iter()
-        .filter(|line| {
-            let lower = line.to_lowercase();
-            SELF_ECHO_PATTERNS
-                .iter()
-                .any(|pat| lower.contains(&pat.to_lowercase()))
-        })
-        .count();
+    let mut echo_lines = 0usize;
+    let mut inside_aicx_block = false;
+
+    for line in &lines {
+        if line.contains(AICX_READ_BEGIN) {
+            inside_aicx_block = true;
+            echo_lines += 1;
+            continue;
+        }
+        if line.contains(AICX_READ_END) {
+            inside_aicx_block = false;
+            echo_lines += 1;
+            continue;
+        }
+        if inside_aicx_block {
+            echo_lines += 1;
+            continue;
+        }
+        let lower = line.to_lowercase();
+        if SELF_ECHO_PATTERNS
+            .iter()
+            .any(|pat| lower.contains(&pat.to_lowercase()))
+        {
+            echo_lines += 1;
+        }
+    }
 
     // Message is self-echo if majority of lines match
     echo_lines > 0 && echo_lines * 2 >= lines.len()

@@ -1,13 +1,14 @@
 [package]
 name = "ai-contexters"
-version = "0.4.3"
+version = "0.5.7"
 edition = "2024"
 rust-version = "1.85"
-description = "Extract timeline and memory from AI agent sessions (Claude Code, Codex, Gemini)"
+description = "Operator CLI + MCP server: canonical corpus first, semantic materialization via memex second (Claude Code, Codex, Gemini)"
 authors = ["Maciej Gad <void@div0.space>", "Monika Szymanska <hello@vetcoders.io>"]
 license = "MIT"
 repository = "https://github.com/VetCoders/ai-contexters"
 homepage = "https://github.com/VetCoders/ai-contexters"
+documentation = "https://docs.rs/ai-contexters"
 readme = "README.md"
 keywords = ["ai", "context", "timeline", "claude", "codex"]
 categories = ["command-line-utilities", "development-tools"]
@@ -22,12 +23,19 @@ clap = { version = "4", features = ["derive"] }
 dirs = "6"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+serde_yaml = "0.9"
+toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 regex = "1"
+globset = "0.4"
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "signal"] }
 rmcp = { version = "1.2", features = ["server", "schemars", "transport-io", "transport-streamable-http-server", "transport-streamable-http-server-session"] }
+libc = "0.2.183"
+# Remote integration boundary: consume the published crate instead of any local workspace checkout
+# or path patching. ai-contexters uses the library surface from crates.io here.
+rmcp-memex = { version = "0.4.1", default-features = false }
 
 [dev-dependencies]
 filetime = "0.2"

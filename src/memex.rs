@@ -1,25 +1,170 @@
-//! Integration with rmcp-memex for vector memory indexing.
+//! Memex integration — the retrieval kernel behind `aicx memex-sync` and `--memex`.
 //!
-//! Shells out to the `rmcp-memex` CLI binary for:
-//! - Batch indexing of chunk files (`rmcp-memex index`)
-//! - Single chunk upsert (`rmcp-memex upsert`)
-//! - Semantic search (`rmcp-memex search`)
+//! This module is the boundary between the aicx orchestrator and the published
+//! `rmcp-memex` 0.4.1 library. Live ai-contexters flows stay inside that
+//! library boundary:
+//!
+//! - Config discovery, embedding resolution, and content hashing
+//! - Canonical chunk materialization via published storage + BM25 APIs
+//! - Read-only BM25 search + LanceDB document lookups without subprocesses
+//! - Explicit embedding-dimension/reindex mismatch detection at the boundary
+//!
+//! This module does not shell out to an `rmcp-memex` binary. The only CLI-shaped
+//! behavior here is the human-facing rebuild command string embedded in
+//! compatibility errors so operators know which `aicx memex-sync --reindex`
+//! command to run.
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use rmcp_memex::{
+    BM25Config, ChromaDocument, DEFAULT_REQUIRED_DIMENSION, EmbeddingClient,
+    EmbeddingConfig as RmcpEmbeddingConfig, MlxConfig, MlxMergeOptions,
+    ProviderConfig as RmcpProviderConfig, RerankerConfig as RmcpRerankerConfig, ServerConfig,
+    StorageManager, compute_content_hash, search::BM25Index,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use crate::sanitize;
 
 // ============================================================================
 // Configuration
 // ============================================================================
+
+const DEFAULT_MEMEX_NAMESPACE: &str = "ai-contexts";
+const SEMANTIC_INDEX_METADATA_VERSION: u32 = 1;
+const RMCP_MEMEX_CONFIG_SEARCH_PATHS: &[&str] = &[
+    "~/.rmcp-servers/rmcp-memex/config.toml",
+    "~/.config/rmcp-memex/config.toml",
+    "~/.rmcp_servers/rmcp_memex/config.toml",
+];
+
+/// Resolved rmcp-memex runtime truth as seen by ai-contexters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemexRuntimeTruth {
+    pub db_path: PathBuf,
+    pub bm25_path: PathBuf,
+    pub embedding_model: String,
+    pub embedding_dimension: usize,
+    pub config_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct SemanticIndexMetadata {
+    format_version: u32,
+    namespace: String,
+    db_path: String,
+    bm25_path: String,
+    embedding_model: String,
+    embedding_dimension: usize,
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct MemexFileConfig {
+    db_path: Option<String>,
+    #[serde(default)]
+    embeddings: Option<MemexEmbeddingsFileConfig>,
+    #[serde(default)]
+    mlx: Option<MemexMlxFileConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct MemexEmbeddingsFileConfig {
+    #[serde(default = "default_required_dimension")]
+    required_dimension: usize,
+    #[serde(default)]
+    providers: Vec<MemexProviderFileConfig>,
+    #[serde(default)]
+    reranker: Option<MemexRerankerFileConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct MemexProviderFileConfig {
+    name: String,
+    base_url: String,
+    model: String,
+    #[serde(default = "default_provider_priority")]
+    priority: u8,
+    #[serde(default = "default_provider_endpoint")]
+    endpoint: String,
+}
+
+impl MemexProviderFileConfig {
+    fn to_rmcp_provider_config(&self) -> RmcpProviderConfig {
+        RmcpProviderConfig {
+            name: self.name.clone(),
+            base_url: self.base_url.clone(),
+            model: self.model.clone(),
+            priority: self.priority,
+            endpoint: self.endpoint.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct MemexRerankerFileConfig {
+    base_url: String,
+    model: String,
+    #[serde(default = "default_reranker_endpoint")]
+    endpoint: String,
+}
+
+impl MemexRerankerFileConfig {
+    fn to_rmcp_reranker_config(&self) -> RmcpRerankerConfig {
+        RmcpRerankerConfig {
+            base_url: Some(self.base_url.clone()),
+            model: Some(self.model.clone()),
+            endpoint: self.endpoint.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct MemexMlxFileConfig {
+    #[serde(default)]
+    disabled: bool,
+    local_port: Option<u16>,
+    dragon_url: Option<String>,
+    dragon_port: Option<u16>,
+    embedder_model: Option<String>,
+    reranker_model: Option<String>,
+    reranker_port_offset: Option<u16>,
+}
+
+impl MemexMlxFileConfig {
+    fn to_mlx_config(&self) -> MlxConfig {
+        let mut config = MlxConfig::from_env();
+        config.merge_file_config(MlxMergeOptions {
+            disabled: Some(self.disabled),
+            local_port: self.local_port,
+            dragon_url: self.dragon_url.clone(),
+            dragon_port: self.dragon_port,
+            embedder_model: self.embedder_model.clone(),
+            reranker_model: self.reranker_model.clone(),
+            reranker_port_offset: self.reranker_port_offset,
+        });
+        config
+    }
+}
+
+#[derive(Debug)]
+struct MemexCompatibilityError {
+    message: String,
+}
+
+impl fmt::Display for MemexCompatibilityError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for MemexCompatibilityError {}
 
 /// Configuration for memex integration.
 #[derive(Debug, Clone)]
@@ -28,18 +173,474 @@ pub struct MemexConfig {
     pub namespace: String,
     /// Override LanceDB path if needed
     pub db_path: Option<PathBuf>,
-    /// Use batch `index` command (true) or per-chunk `upsert` (false)
+    /// Use batched library-backed stores (true) or per-chunk library writes (false).
     pub batch_mode: bool,
+    /// Compatibility flag retained for older callers and CLI surface stability.
+    ///
+    /// The published `rmcp-memex` library boundary does not consume this value,
+    /// so live ai-contexters sync paths ignore it.
+    pub preprocess: bool,
 }
 
 impl Default for MemexConfig {
     fn default() -> Self {
         Self {
-            namespace: "ai-contexts".to_string(),
+            namespace: DEFAULT_MEMEX_NAMESPACE.to_string(),
             db_path: None,
             batch_mode: true,
+            preprocess: true,
         }
     }
+}
+
+fn memex_state_dir() -> Result<PathBuf> {
+    let dir = crate::store::store_base_dir()?.join("memex");
+    fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+fn semantic_index_metadata_path(namespace: &str) -> Result<PathBuf> {
+    Ok(memex_state_dir()?.join(format!(
+        "semantic-index-{}.json",
+        namespace
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>()
+    )))
+}
+
+/// Quote an argument for display in user-facing CLI guidance.
+///
+/// This is only used to render the suggested `aicx memex-sync --reindex`
+/// command in compatibility errors. It is never executed from this module.
+fn cli_display_arg(value: &str) -> String {
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-' | ':'))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+fn expand_home_path(raw: &str) -> PathBuf {
+    if raw == "~" {
+        return dirs::home_dir().unwrap_or_else(|| PathBuf::from(raw));
+    }
+
+    if let Some(stripped) = raw.strip_prefix("~/")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(stripped);
+    }
+
+    PathBuf::from(raw)
+}
+
+fn default_memex_db_path() -> PathBuf {
+    expand_home_path(&ServerConfig::default().db_path)
+}
+
+fn default_memex_bm25_path() -> PathBuf {
+    expand_home_path(&BM25Config::default().index_path)
+}
+
+fn default_required_dimension() -> usize {
+    DEFAULT_REQUIRED_DIMENSION
+}
+
+fn default_provider_priority() -> u8 {
+    RmcpProviderConfig::default().priority
+}
+
+fn default_provider_endpoint() -> String {
+    RmcpProviderConfig::default().endpoint
+}
+
+fn default_reranker_endpoint() -> String {
+    "/v1/rerank".to_string()
+}
+
+fn discover_memex_config_path() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("RMCP_MEMEX_CONFIG") {
+        let expanded = expand_home_path(&path);
+        if expanded.exists() {
+            return Some(expanded);
+        }
+    }
+
+    RMCP_MEMEX_CONFIG_SEARCH_PATHS
+        .iter()
+        .map(|path| expand_home_path(path))
+        .find(|path| path.exists())
+}
+
+fn load_memex_file_config(config_path: Option<&Path>) -> Result<Option<MemexFileConfig>> {
+    let Some(config_path) = config_path else {
+        return Ok(None);
+    };
+
+    let raw = fs::read_to_string(config_path).with_context(|| {
+        format!(
+            "Failed to read rmcp-memex config at {}",
+            config_path.display()
+        )
+    })?;
+
+    toml::from_str(&raw)
+        .with_context(|| {
+            format!(
+                "Failed to parse rmcp-memex config at {}",
+                config_path.display()
+            )
+        })
+        .map(Some)
+}
+
+fn resolve_embedding_config(file_cfg: &MemexFileConfig) -> RmcpEmbeddingConfig {
+    if let Some(embeddings) = file_cfg.embeddings.as_ref() {
+        let mut config = if embeddings.providers.is_empty() {
+            file_cfg.mlx.as_ref().map_or_else(
+                || MlxConfig::from_env().to_embedding_config(),
+                |mlx| mlx.to_mlx_config().to_embedding_config(),
+            )
+        } else {
+            RmcpEmbeddingConfig::default()
+        };
+
+        config.required_dimension = embeddings.required_dimension;
+
+        if !embeddings.providers.is_empty() {
+            config.providers = embeddings
+                .providers
+                .iter()
+                .map(MemexProviderFileConfig::to_rmcp_provider_config)
+                .collect();
+        }
+
+        if let Some(reranker) = embeddings.reranker.as_ref() {
+            config.reranker = reranker.to_rmcp_reranker_config();
+        }
+
+        return config;
+    }
+
+    file_cfg.mlx.as_ref().map_or_else(
+        || MlxConfig::from_env().to_embedding_config(),
+        |mlx| mlx.to_mlx_config().to_embedding_config(),
+    )
+}
+
+fn resolve_runtime_boundary_from_config(
+    db_path_override: Option<&Path>,
+    config_path: Option<&Path>,
+) -> Result<(MemexRuntimeTruth, RmcpEmbeddingConfig)> {
+    let file_cfg = load_memex_file_config(config_path)?;
+    let mut db_path = db_path_override
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_memex_db_path);
+    let embedding_config = file_cfg.as_ref().map_or_else(
+        || MlxConfig::from_env().to_embedding_config(),
+        resolve_embedding_config,
+    );
+
+    if db_path_override.is_none()
+        && let Some(path) = file_cfg.as_ref().and_then(|cfg| cfg.db_path.as_deref())
+    {
+        db_path = expand_home_path(path);
+    }
+
+    Ok((
+        MemexRuntimeTruth {
+            db_path,
+            bm25_path: default_memex_bm25_path(),
+            embedding_model: embedding_config.model_name(),
+            embedding_dimension: embedding_config.dimension(),
+            config_path: config_path.map(Path::to_path_buf),
+        },
+        embedding_config,
+    ))
+}
+
+fn resolve_runtime_truth_from_config(
+    db_path_override: Option<&Path>,
+    config_path: Option<&Path>,
+) -> Result<MemexRuntimeTruth> {
+    resolve_runtime_boundary_from_config(db_path_override, config_path).map(|(truth, _)| truth)
+}
+
+/// Resolve the current rmcp-memex runtime truth from config + defaults.
+pub fn resolve_runtime_truth(db_path_override: Option<&Path>) -> Result<MemexRuntimeTruth> {
+    let config_path = discover_memex_config_path();
+    resolve_runtime_truth_from_config(db_path_override, config_path.as_deref())
+}
+
+fn load_semantic_index_metadata(namespace: &str) -> Option<SemanticIndexMetadata> {
+    let path = semantic_index_metadata_path(namespace).ok()?;
+    let raw = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn save_semantic_index_metadata(namespace: &str, truth: &MemexRuntimeTruth) -> Result<()> {
+    let path = semantic_index_metadata_path(namespace)?;
+    let metadata = SemanticIndexMetadata {
+        format_version: SEMANTIC_INDEX_METADATA_VERSION,
+        namespace: namespace.to_string(),
+        db_path: truth.db_path.display().to_string(),
+        bm25_path: truth.bm25_path.display().to_string(),
+        embedding_model: truth.embedding_model.clone(),
+        embedding_dimension: truth.embedding_dimension,
+        updated_at: Utc::now(),
+    };
+
+    fs::write(path, serde_json::to_vec_pretty(&metadata)?)?;
+    Ok(())
+}
+
+/// Build the human-facing rebuild command shown in compatibility errors.
+fn semantic_reindex_command(namespace: &str, truth: &MemexRuntimeTruth) -> String {
+    let mut command = vec![
+        "aicx".to_string(),
+        "memex-sync".to_string(),
+        "--reindex".to_string(),
+    ];
+
+    if namespace != DEFAULT_MEMEX_NAMESPACE {
+        command.push("--namespace".to_string());
+        command.push(cli_display_arg(namespace));
+    }
+
+    if truth.db_path != default_memex_db_path() {
+        command.push("--db-path".to_string());
+        command.push(cli_display_arg(&truth.db_path.to_string_lossy()));
+    }
+
+    command.join(" ")
+}
+
+fn runtime_truth_source_message(truth: &MemexRuntimeTruth) -> String {
+    match truth.config_path.as_ref() {
+        Some(config_path) => format!(
+            " Embedding/runtime config was loaded from {}.",
+            config_path.display()
+        ),
+        None => {
+            " Embedding/runtime config fell back to published rmcp-memex defaults plus environment."
+                .to_string()
+        }
+    }
+}
+
+fn semantic_compatibility_error(
+    namespace: &str,
+    truth: &MemexRuntimeTruth,
+    metadata: Option<&SemanticIndexMetadata>,
+    actual_dimension: Option<usize>,
+) -> anyhow::Error {
+    let mut message = format!(
+        "Semantic index mismatch for namespace '{namespace}'. rmcp-memex currently expects model '{}' ({} dims) at {}.",
+        truth.embedding_model,
+        truth.embedding_dimension,
+        truth.db_path.display()
+    );
+    message.push_str(&runtime_truth_source_message(truth));
+
+    if let Some(actual_dimension) = actual_dimension {
+        message.push_str(&format!(
+            " Existing namespace data uses {actual_dimension} dims."
+        ));
+    }
+
+    if let Some(metadata) = metadata {
+        message.push_str(&format!(
+            " ai-contexters metadata (format v{}) still points at model '{}' ({} dims) recorded from {} with BM25 at {}.",
+            metadata.format_version,
+            metadata.embedding_model,
+            metadata.embedding_dimension,
+            metadata.db_path,
+            metadata.bm25_path
+        ));
+
+        let mismatched_fields = semantic_metadata_mismatch_fields(namespace, truth, metadata);
+        if !mismatched_fields.is_empty() {
+            message.push_str(&format!(
+                " Diverged fields: {}.",
+                mismatched_fields.join(", ")
+            ));
+        }
+    }
+
+    message.push_str(&format!(
+        " Run `{}` to wipe the current rmcp-memex store and rebuild it for the new embedding truth.",
+        semantic_reindex_command(namespace, truth)
+    ));
+    message.push_str(
+        " This stays explicit because Lance vector schemas are shared across the whole store, so silent reuse would corrupt search semantics.",
+    );
+
+    MemexCompatibilityError { message }.into()
+}
+
+async fn semantic_store_dimension(
+    truth: &MemexRuntimeTruth,
+    namespace: &str,
+) -> Result<Option<usize>> {
+    let storage = StorageManager::new_lance_only(&truth.db_path.to_string_lossy())
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to open rmcp-memex LanceDB at {}",
+                truth.db_path.display()
+            )
+        })?;
+
+    Ok(storage
+        .all_documents(Some(namespace), 1)
+        .await?
+        .into_iter()
+        .next()
+        .map(|doc| doc.embedding.len()))
+}
+
+fn semantic_metadata_mismatch_fields(
+    namespace: &str,
+    truth: &MemexRuntimeTruth,
+    metadata: &SemanticIndexMetadata,
+) -> Vec<&'static str> {
+    let truth_db_path = truth.db_path.to_string_lossy();
+    let truth_bm25_path = truth.bm25_path.to_string_lossy();
+    let mut fields = Vec::new();
+
+    if metadata.format_version != SEMANTIC_INDEX_METADATA_VERSION {
+        fields.push("format_version");
+    }
+    if metadata.namespace != namespace {
+        fields.push("namespace");
+    }
+    if metadata.db_path != truth_db_path.as_ref() {
+        fields.push("db_path");
+    }
+    if metadata.bm25_path != truth_bm25_path.as_ref() {
+        fields.push("bm25_path");
+    }
+    if metadata.embedding_model != truth.embedding_model {
+        fields.push("embedding_model");
+    }
+    if metadata.embedding_dimension != truth.embedding_dimension {
+        fields.push("embedding_dimension");
+    }
+
+    fields
+}
+
+fn semantic_metadata_mismatch(
+    namespace: &str,
+    truth: &MemexRuntimeTruth,
+    metadata: Option<&SemanticIndexMetadata>,
+) -> bool {
+    metadata.is_some_and(|metadata| {
+        !semantic_metadata_mismatch_fields(namespace, truth, metadata).is_empty()
+    })
+}
+
+async fn validate_semantic_index_compatibility_truth(
+    namespace: &str,
+    truth: &MemexRuntimeTruth,
+) -> Result<()> {
+    let actual_dimension = semantic_store_dimension(truth, namespace).await?;
+    let metadata = load_semantic_index_metadata(namespace);
+    let metadata_mismatch = semantic_metadata_mismatch(namespace, truth, metadata.as_ref());
+
+    if metadata_mismatch {
+        return Err(semantic_compatibility_error(
+            namespace,
+            truth,
+            metadata.as_ref(),
+            actual_dimension,
+        ));
+    }
+
+    if let Some(actual_dimension) = actual_dimension {
+        if actual_dimension != truth.embedding_dimension {
+            return Err(semantic_compatibility_error(
+                namespace,
+                truth,
+                metadata.as_ref(),
+                Some(actual_dimension),
+            ));
+        }
+
+        save_semantic_index_metadata(namespace, truth)?;
+    }
+
+    Ok(())
+}
+
+async fn validate_semantic_index_compatibility_from_config(
+    namespace: &str,
+    db_path_override: Option<&Path>,
+    config_path: Option<&Path>,
+) -> Result<MemexRuntimeTruth> {
+    let (truth, _) = resolve_runtime_boundary_from_config(db_path_override, config_path)?;
+    validate_semantic_index_compatibility_truth(namespace, &truth).await?;
+    Ok(truth)
+}
+
+async fn validate_semantic_index_compatibility(
+    namespace: &str,
+    db_path_override: Option<&Path>,
+) -> Result<MemexRuntimeTruth> {
+    let config_path = discover_memex_config_path();
+    validate_semantic_index_compatibility_from_config(
+        namespace,
+        db_path_override,
+        config_path.as_deref(),
+    )
+    .await
+}
+
+/// Returns true when the error came from explicit memex compatibility checks.
+pub fn is_compatibility_error(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.downcast_ref::<MemexCompatibilityError>().is_some())
+}
+
+fn remove_path_if_exists(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+
+    if path.is_dir() {
+        fs::remove_dir_all(path)
+            .with_context(|| format!("Failed to remove directory {}", path.display()))?;
+    } else {
+        fs::remove_file(path)
+            .with_context(|| format!("Failed to remove file {}", path.display()))?;
+    }
+
+    Ok(())
+}
+
+/// Explicitly wipe the current rmcp-memex store so it can be rebuilt for a new embedding truth.
+pub fn reset_semantic_index(
+    namespace: &str,
+    db_path_override: Option<&Path>,
+) -> Result<MemexRuntimeTruth> {
+    let truth = resolve_runtime_truth(db_path_override)?;
+
+    remove_path_if_exists(&truth.db_path)?;
+    remove_path_if_exists(&truth.bm25_path)?;
+    remove_path_if_exists(&semantic_index_metadata_path(namespace)?)?;
+    remove_path_if_exists(&sync_state_path()?)?;
+
+    Ok(truth)
 }
 
 // ============================================================================
@@ -51,32 +652,68 @@ impl Default for MemexConfig {
 pub struct MemexSyncState {
     /// Last time a sync was performed.
     pub last_synced: Option<DateTime<Utc>>,
-    /// Set of chunk IDs already pushed to memex.
+    /// Set of chunk IDs already materialized into memex.
     pub synced_chunks: HashSet<String>,
-    /// Total number of pushes across all syncs.
-    pub total_pushes: usize,
+    /// Total number of chunks materialized across all syncs.
+    #[serde(alias = "total_pushes")]
+    pub total_materialized: usize,
 }
 
 /// Result of a sync operation.
 #[derive(Debug, Default)]
 pub struct SyncResult {
-    /// Number of chunks successfully pushed.
-    pub chunks_pushed: usize,
+    /// Number of chunks successfully materialized.
+    pub chunks_materialized: usize,
     /// Number of chunks skipped (already synced or dedup).
     pub chunks_skipped: usize,
+    /// Number of chunks excluded by `.aicxignore`.
+    pub chunks_ignored: usize,
     /// Errors encountered during sync.
     pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncProgressPhase {
+    Discovering,
+    Embedding,
+    Writing,
+    Completed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncProgress {
+    pub phase: SyncProgressPhase,
+    pub done: usize,
+    pub total: usize,
+    pub detail: String,
+}
+
+const EMBEDDING_BATCH_SIZE: usize = 64;
+
+#[derive(Debug, Serialize)]
+struct MemexRecord {
+    id: String,
+    text: String,
+    metadata: serde_json::Value,
+    content_hash: String,
+}
+
+#[derive(Debug)]
+struct PendingSyncRecord {
+    chunk_path: PathBuf,
+    id: String,
+    text: String,
+    metadata: serde_json::Value,
+    content_hash: String,
 }
 
 // ============================================================================
 // Sync state persistence
 // ============================================================================
 
-/// Path to sync state file: `~/.ai-contexters/memex/sync_state.json`
+/// Path to sync state file: `~/.aicx/memex/sync_state.json`
 fn sync_state_path() -> Result<PathBuf> {
-    let dir = crate::store::store_base_dir()?.join("memex");
-    fs::create_dir_all(&dir)?;
-    Ok(dir.join("sync_state.json"))
+    Ok(memex_state_dir()?.join("sync_state.json"))
 }
 
 /// Load sync state from disk. Returns default if missing or unparseable.
@@ -107,161 +744,519 @@ pub fn save_sync_state(state: &MemexSyncState) -> Result<()> {
 }
 
 // ============================================================================
-// Availability check
+// Library-backed sync methods
 // ============================================================================
 
-/// Check if the `rmcp-memex` binary is available in PATH.
-pub fn check_memex_available() -> bool {
-    Command::new("rmcp-memex")
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| o.status.success())
+async fn sync_chunk_library(
+    storage: &StorageManager,
+    bm25: &BM25Index,
+    embedding_client: &mut EmbeddingClient,
+    namespace: &str,
+    record: PendingSyncRecord,
+) -> Result<()> {
+    let embedding = embedding_client.embed(&record.text).await?;
+    let bm25_docs = vec![(
+        record.id.clone(),
+        namespace.to_string(),
+        record.text.clone(),
+    )];
+    let doc = ChromaDocument::new_flat_with_hash(
+        record.id,
+        namespace.to_string(),
+        embedding,
+        record.metadata,
+        record.text,
+        record.content_hash,
+    );
+
+    storage.add_to_store(vec![doc]).await?;
+    bm25.add_documents(&bm25_docs).await?;
+    Ok(())
 }
 
-// ============================================================================
-// Batch sync (primary method)
-// ============================================================================
-
-/// Sync all chunk files in a directory to memex using batch `index` command.
-///
-/// Runs: `rmcp-memex index <chunks_dir> -n <namespace> -s flat --dedup true`
-///
-/// This is the fastest method — rmcp-memex handles deduplication internally
-/// via content hashing.
-pub fn sync_chunks_batch(chunks_dir: &Path, config: &MemexConfig) -> Result<SyncResult> {
-    if !check_memex_available() {
-        bail!("rmcp-memex not found in PATH. Install with: cargo install rmcp-memex");
+async fn sync_chunks_library<F>(
+    chunk_paths: &[PathBuf],
+    namespace: &str,
+    truth: &MemexRuntimeTruth,
+    embedding_config: &RmcpEmbeddingConfig,
+    batch_mode: bool,
+    mut progress: F,
+) -> Result<(SyncResult, Vec<PathBuf>)>
+where
+    F: FnMut(SyncProgress),
+{
+    if chunk_paths.is_empty() {
+        return Ok((SyncResult::default(), Vec::new()));
     }
 
-    if !chunks_dir.exists() || !chunks_dir.is_dir() {
-        return Ok(SyncResult::default());
+    let storage = StorageManager::new_lance_only(&truth.db_path.to_string_lossy())
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to open rmcp-memex LanceDB for sync at {}",
+                truth.db_path.display()
+            )
+        })?;
+    storage.ensure_collection().await?;
+
+    let bm25_config =
+        BM25Config::default().with_path(truth.bm25_path.to_string_lossy().to_string());
+    let bm25 = BM25Index::new(&bm25_config).context("Failed to open BM25 index for sync")?;
+    let mut embedding_client = EmbeddingClient::new(embedding_config)
+        .await
+        .context("Failed to initialize rmcp-memex embedding client for sync")?;
+
+    let mut result = SyncResult::default();
+    let mut completed_paths = Vec::new();
+    let mut seen_hashes = HashSet::new();
+    let mut pending = Vec::new();
+
+    for chunk_path in chunk_paths {
+        let validated_path = sanitize::validate_read_path(chunk_path)?;
+        let id = validated_path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let text = sanitize::read_to_string_validated(&validated_path)?;
+        let record = chunk_memex_record(&validated_path, &id, &text);
+
+        if !seen_hashes.insert(record.content_hash.clone())
+            || storage
+                .has_content_hash(namespace, &record.content_hash)
+                .await?
+        {
+            result.chunks_skipped += 1;
+            completed_paths.push(chunk_path.clone());
+            continue;
+        }
+
+        pending.push(PendingSyncRecord {
+            chunk_path: chunk_path.clone(),
+            id: record.id,
+            text: record.text,
+            metadata: record.metadata,
+            content_hash: record.content_hash,
+        });
     }
 
-    let validated_dir = sanitize::validate_dir_path(chunks_dir)?;
-
-    // SECURITY: dir sanitized via validate_dir_path (traversal + canonicalize + allowlist)
-    let file_count = fs::read_dir(&validated_dir)? // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "txt"))
-        .count();
-
-    if file_count == 0 {
-        return Ok(SyncResult::default());
+    if pending.is_empty() {
+        return Ok((result, completed_paths));
     }
 
-    let mut cmd = Command::new("rmcp-memex");
-    cmd.arg("index")
-        .arg(chunks_dir)
-        .arg("-n")
-        .arg(&config.namespace)
-        .arg("-s")
-        .arg("flat")
-        .arg("--dedup")
-        .arg("true");
+    if batch_mode {
+        let pending_total = pending.len();
 
-    if let Some(ref db_path) = config.db_path {
-        cmd.arg("--db-path").arg(db_path);
-    }
+        for (batch_index, chunk_batch) in pending.chunks(EMBEDDING_BATCH_SIZE).enumerate() {
+            let batch_start = batch_index * EMBEDDING_BATCH_SIZE;
+            let batch_end = batch_start + chunk_batch.len();
 
-    let output = cmd.output().context("Failed to run rmcp-memex index")?;
+            emit_sync_progress(
+                &mut progress,
+                SyncProgressPhase::Embedding,
+                batch_end,
+                pending_total,
+                format!(
+                    "Embedding batch {} ({}-{} of {})",
+                    batch_index + 1,
+                    batch_start + 1,
+                    batch_end,
+                    pending_total
+                ),
+            );
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("rmcp-memex index failed: {}", stderr.trim());
-    }
+            let texts: Vec<String> = chunk_batch
+                .iter()
+                .map(|record| record.text.clone())
+                .collect();
+            let embeddings = embedding_client.embed_batch(&texts).await?;
+            let mut bm25_docs = Vec::with_capacity(chunk_batch.len());
+            let mut docs = Vec::with_capacity(chunk_batch.len());
 
-    // Parse output for stats
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr_str = String::from_utf8_lossy(&output.stderr);
-    let combined = format!("{}\n{}", stdout, stderr_str);
-
-    let chunks_pushed = parse_indexed_count(&combined).unwrap_or(file_count);
-
-    Ok(SyncResult {
-        chunks_pushed,
-        chunks_skipped: file_count.saturating_sub(chunks_pushed),
-        errors: vec![],
-    })
-}
-
-/// Try to parse the number of indexed documents from rmcp-memex output.
-fn parse_indexed_count(output: &str) -> Option<usize> {
-    // Look for patterns like "Indexed 42 documents" or "42 chunks indexed"
-    for line in output.lines() {
-        let lower = line.to_lowercase();
-        if lower.contains("index") || lower.contains("chunk") || lower.contains("document") {
-            // Try to find a number in this line
-            for word in line.split_whitespace() {
-                if let Ok(n) = word.parse::<usize>() {
-                    return Some(n);
-                }
+            for (record, embedding) in chunk_batch.iter().zip(embeddings.into_iter()) {
+                bm25_docs.push((
+                    record.id.clone(),
+                    namespace.to_string(),
+                    record.text.clone(),
+                ));
+                docs.push(ChromaDocument::new_flat_with_hash(
+                    record.id.clone(),
+                    namespace.to_string(),
+                    embedding,
+                    record.metadata.clone(),
+                    record.text.clone(),
+                    record.content_hash.clone(),
+                ));
             }
+
+            storage.add_to_store(docs).await?;
+            bm25.add_documents(&bm25_docs).await?;
+
+            result.chunks_materialized += chunk_batch.len();
+            completed_paths.extend(chunk_batch.iter().map(|record| record.chunk_path.clone()));
+
+            emit_sync_progress(
+                &mut progress,
+                SyncProgressPhase::Writing,
+                result.chunks_materialized,
+                pending_total,
+                format!(
+                    "Indexed {} of {} chunks",
+                    result.chunks_materialized, pending_total
+                ),
+            );
+        }
+
+        return Ok((result, completed_paths));
+    }
+
+    let pending_total = pending.len();
+    for (idx, record) in pending.into_iter().enumerate() {
+        let chunk_path = record.chunk_path.clone();
+        let record_id = record.id.clone();
+
+        emit_sync_progress(
+            &mut progress,
+            SyncProgressPhase::Embedding,
+            idx + 1,
+            pending_total,
+            format!("Embedding {}", chunk_path.display()),
+        );
+
+        match sync_chunk_library(&storage, &bm25, &mut embedding_client, namespace, record).await {
+            Ok(()) => {
+                result.chunks_materialized += 1;
+                completed_paths.push(chunk_path);
+                emit_sync_progress(
+                    &mut progress,
+                    SyncProgressPhase::Writing,
+                    result.chunks_materialized,
+                    pending_total,
+                    format!(
+                        "Indexed {} of {} chunks",
+                        result.chunks_materialized, pending_total
+                    ),
+                );
+            }
+            Err(err) => result.errors.push(format!("{record_id}: {err}")),
         }
     }
-    None
+
+    Ok((result, completed_paths))
 }
 
-// ============================================================================
-// Single chunk sync
-// ============================================================================
+#[cfg(test)]
+fn chunk_sidecar_path(chunk_path: &Path) -> PathBuf {
+    chunk_path.with_extension("meta.json")
+}
 
-/// Push a single chunk to memex using the `upsert` command.
-///
-/// Runs: `rmcp-memex upsert -n <ns> -i <id> -t <text> -m <metadata>`
-pub fn sync_chunk_single(
-    chunk_id: &str,
-    text: &str,
-    metadata: &serde_json::Value,
-    config: &MemexConfig,
-) -> Result<()> {
-    if !check_memex_available() {
-        bail!("rmcp-memex not found in PATH");
+fn insert_optional_string(
+    metadata: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: Option<String>,
+) {
+    if let Some(value) = value {
+        metadata.insert(key.to_string(), serde_json::Value::String(value));
+    }
+}
+
+fn insert_optional_u64(
+    metadata: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: Option<u64>,
+) {
+    if let Some(value) = value {
+        metadata.insert(key.to_string(), serde_json::Value::from(value));
+    }
+}
+
+fn insert_optional_u32(
+    metadata: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: Option<u32>,
+) {
+    if let Some(value) = value {
+        metadata.insert(key.to_string(), serde_json::Value::from(value));
+    }
+}
+
+fn chunk_metadata_from_header(text: &str) -> serde_json::Map<String, serde_json::Value> {
+    let mut metadata = serde_json::Map::new();
+    let Some(first_line) = text.lines().next() else {
+        return metadata;
+    };
+
+    if !first_line.starts_with('[') || !first_line.ends_with(']') {
+        return metadata;
     }
 
-    let meta_str = serde_json::to_string(metadata)?;
-
-    let mut cmd = Command::new("rmcp-memex");
-    cmd.arg("upsert")
-        .arg("-n")
-        .arg(&config.namespace)
-        .arg("-i")
-        .arg(chunk_id)
-        .arg("-t")
-        .arg(text)
-        .arg("-m")
-        .arg(&meta_str);
-
-    if let Some(ref db_path) = config.db_path {
-        cmd.arg("--db-path").arg(db_path);
-    }
-
-    let output = cmd
-        .output()
-        .with_context(|| format!("Failed to upsert chunk: {}", chunk_id))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!(
-            "rmcp-memex upsert failed for {}: {}",
-            chunk_id,
-            stderr.trim()
+    let inner = &first_line[1..first_line.len() - 1];
+    for part in inner.split('|') {
+        let Some((key, value)) = part.split_once(':') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        if key.is_empty() || value.is_empty() {
+            continue;
+        }
+        metadata.insert(
+            key.to_string(),
+            serde_json::Value::String(value.to_string()),
         );
     }
 
-    Ok(())
+    metadata
+}
+
+fn chunk_metadata_for_memex(chunk_path: &Path, chunk_id: &str, text: &str) -> serde_json::Value {
+    let content_hash = compute_content_hash(text);
+    let mut metadata = serde_json::Map::from_iter([
+        (
+            "source".to_string(),
+            serde_json::Value::String("ai-contexters".to_string()),
+        ),
+        (
+            "chunk_id".to_string(),
+            serde_json::Value::String(chunk_id.to_string()),
+        ),
+        (
+            "path".to_string(),
+            serde_json::Value::String(chunk_path.to_string_lossy().to_string()),
+        ),
+        (
+            "content_hash".to_string(),
+            serde_json::Value::String(content_hash),
+        ),
+    ]);
+
+    let sidecar = crate::store::load_sidecar(chunk_path);
+
+    if let Some(sidecar) = sidecar {
+        metadata.insert(
+            "project".to_string(),
+            serde_json::Value::String(sidecar.project),
+        );
+        metadata.insert(
+            "agent".to_string(),
+            serde_json::Value::String(sidecar.agent),
+        );
+        metadata.insert("date".to_string(), serde_json::Value::String(sidecar.date));
+        metadata.insert(
+            "session_id".to_string(),
+            serde_json::Value::String(sidecar.session_id),
+        );
+        metadata.insert(
+            "kind".to_string(),
+            serde_json::Value::String(sidecar.kind.dir_name().to_string()),
+        );
+        insert_optional_string(&mut metadata, "cwd", sidecar.cwd);
+        insert_optional_string(&mut metadata, "run_id", sidecar.run_id);
+        insert_optional_string(&mut metadata, "prompt_id", sidecar.prompt_id);
+        insert_optional_string(&mut metadata, "agent_model", sidecar.agent_model);
+        insert_optional_string(&mut metadata, "started_at", sidecar.started_at);
+        insert_optional_string(&mut metadata, "completed_at", sidecar.completed_at);
+        insert_optional_u64(&mut metadata, "token_usage", sidecar.token_usage);
+        insert_optional_u32(&mut metadata, "findings_count", sidecar.findings_count);
+        insert_optional_string(&mut metadata, "workflow_phase", sidecar.workflow_phase);
+        insert_optional_string(&mut metadata, "mode", sidecar.mode);
+        insert_optional_string(&mut metadata, "skill_code", sidecar.skill_code);
+        insert_optional_string(
+            &mut metadata,
+            "framework_version",
+            sidecar.framework_version,
+        );
+    } else {
+        metadata.extend(chunk_metadata_from_header(text));
+    }
+
+    serde_json::Value::Object(metadata)
+}
+
+fn chunk_memex_record(chunk_path: &Path, chunk_id: &str, text: &str) -> MemexRecord {
+    MemexRecord {
+        id: chunk_id.to_string(),
+        text: text.to_string(),
+        metadata: chunk_metadata_for_memex(chunk_path, chunk_id, text),
+        content_hash: compute_content_hash(text),
+    }
 }
 
 // ============================================================================
 // High-level sync
 // ============================================================================
 
+fn emit_sync_progress<F>(
+    progress: &mut F,
+    phase: SyncProgressPhase,
+    done: usize,
+    total: usize,
+    detail: impl Into<String>,
+) where
+    F: FnMut(SyncProgress),
+{
+    progress(SyncProgress {
+        phase,
+        done,
+        total,
+        detail: detail.into(),
+    });
+}
+
 /// Sync only new chunks (not previously synced) to memex.
 ///
 /// Loads sync state, determines which chunk files are new,
-/// syncs them via batch mode, and updates state.
-pub fn sync_new_chunks(chunks_dir: &Path, config: &MemexConfig) -> Result<SyncResult> {
-    let mut state = load_sync_state();
+/// syncs them through the published rmcp-memex library boundary, and updates
+/// state plus semantic-index metadata.
+pub fn sync_new_chunk_paths(chunk_paths: &[PathBuf], config: &MemexConfig) -> Result<SyncResult> {
+    sync_new_chunk_paths_with_progress(chunk_paths, config, |_| {})
+}
 
+pub fn sync_new_chunk_paths_with_progress<F>(
+    chunk_paths: &[PathBuf],
+    config: &MemexConfig,
+    progress: F,
+) -> Result<SyncResult>
+where
+    F: FnMut(SyncProgress),
+{
+    let rt =
+        tokio::runtime::Runtime::new().context("Failed to start Tokio runtime for memex sync")?;
+    rt.block_on(sync_new_chunk_paths_async(chunk_paths, config, progress))
+}
+
+async fn sync_new_chunk_paths_async<F>(
+    chunk_paths: &[PathBuf],
+    config: &MemexConfig,
+    mut progress: F,
+) -> Result<SyncResult>
+where
+    F: FnMut(SyncProgress),
+{
+    let mut state = load_sync_state();
+    let store_base = crate::store::store_base_dir()?;
+    let (filtered_paths, ignored_count) =
+        crate::store::filter_ignored_paths_at(&store_base, chunk_paths)?;
+
+    let all_files: Vec<PathBuf> = filtered_paths
+        .iter()
+        .filter(|path| {
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext == "md" || ext == "txt")
+        })
+        .cloned()
+        .collect();
+
+    let total_candidates = all_files.len();
+    if total_candidates == 0 {
+        emit_sync_progress(
+            &mut progress,
+            SyncProgressPhase::Completed,
+            ignored_count,
+            ignored_count,
+            format!(
+                "Completed: 0 materialized, 0 skipped, {} ignored",
+                ignored_count
+            ),
+        );
+        return Ok(SyncResult {
+            chunks_ignored: ignored_count,
+            ..SyncResult::default()
+        });
+    }
+
+    let new_files: Vec<PathBuf> = all_files
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, p)| {
+            let id = p
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            emit_sync_progress(
+                &mut progress,
+                SyncProgressPhase::Discovering,
+                idx + 1,
+                total_candidates,
+                format!("Scanning {}", p.display()),
+            );
+            (!state.synced_chunks.contains(&id)).then_some(p.clone())
+        })
+        .collect();
+
+    let config_path = discover_memex_config_path();
+    let (truth, embedding_config) =
+        resolve_runtime_boundary_from_config(config.db_path.as_deref(), config_path.as_deref())?;
+    validate_semantic_index_compatibility_truth(&config.namespace, &truth).await?;
+
+    if new_files.is_empty() {
+        emit_sync_progress(
+            &mut progress,
+            SyncProgressPhase::Completed,
+            all_files.len() + ignored_count,
+            all_files.len() + ignored_count,
+            format!(
+                "Completed: 0 materialized, {} skipped, {} ignored",
+                all_files.len(),
+                ignored_count
+            ),
+        );
+        return Ok(SyncResult {
+            chunks_materialized: 0,
+            chunks_skipped: all_files.len(),
+            chunks_ignored: ignored_count,
+            errors: vec![],
+        });
+    }
+
+    let (mut result, synced_files) = sync_chunks_library(
+        &new_files,
+        &config.namespace,
+        &truth,
+        &embedding_config,
+        config.batch_mode,
+        &mut progress,
+    )
+    .await?;
+
+    result.chunks_skipped += all_files.len().saturating_sub(new_files.len());
+    result.chunks_ignored = ignored_count;
+
+    if result.errors.is_empty() {
+        save_semantic_index_metadata(&config.namespace, &truth)?;
+    }
+
+    let path_refs: Vec<&PathBuf> = new_files.iter().collect();
+    if let Err(e) = crate::steer_index::sync_steer_index(&path_refs).await {
+        tracing::warn!("Failed to sync steer index: {}", e);
+    }
+
+    for file in &synced_files {
+        let id = file
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        state.synced_chunks.insert(id);
+    }
+    state.last_synced = Some(Utc::now());
+    state.total_materialized += result.chunks_materialized;
+    save_sync_state(&state)?;
+
+    emit_sync_progress(
+        &mut progress,
+        SyncProgressPhase::Completed,
+        result.chunks_materialized + result.chunks_skipped + result.chunks_ignored,
+        total_candidates + ignored_count,
+        format!(
+            "Completed: {} materialized, {} skipped, {} ignored",
+            result.chunks_materialized, result.chunks_skipped, result.chunks_ignored
+        ),
+    );
+
+    Ok(result)
+}
+
+pub fn sync_new_chunks(chunks_dir: &Path, config: &MemexConfig) -> Result<SyncResult> {
     if !chunks_dir.exists() {
         return Ok(SyncResult::default());
     }
@@ -272,109 +1267,149 @@ pub fn sync_new_chunks(chunks_dir: &Path, config: &MemexConfig) -> Result<SyncRe
     let all_files: Vec<PathBuf> = fs::read_dir(&validated_dir)? // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|ext| ext == "txt"))
-        .collect();
-
-    let new_files: Vec<&PathBuf> = all_files
-        .iter()
         .filter(|p| {
-            let id = p
-                .file_stem()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_default();
-            !state.synced_chunks.contains(&id)
+            let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("");
+            ext == "txt" || ext == "md"
         })
         .collect();
-
-    if new_files.is_empty() {
-        return Ok(SyncResult {
-            chunks_pushed: 0,
-            chunks_skipped: all_files.len(),
-            errors: vec![],
-        });
-    }
-
-    // For batch mode: sync entire directory (rmcp-memex dedup handles already-indexed)
-    let result = if config.batch_mode {
-        sync_chunks_batch(chunks_dir, config)?
-    } else {
-        // Per-file upsert mode
-        let mut result = SyncResult::default();
-        for file in &new_files {
-            let id = file
-                .file_stem()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let validated_file = match sanitize::validate_read_path(file) {
-                Ok(p) => p,
-                Err(e) => {
-                    result.errors.push(format!("{}: {}", id, e));
-                    continue;
-                }
-            };
-            let text = match fs::read_to_string(&validated_file) {
-                Ok(t) => t,
-                Err(e) => {
-                    result.errors.push(format!("{}: {}", id, e));
-                    continue;
-                }
-            };
-
-            let metadata = serde_json::json!({
-                "source": "ai-contexters",
-                "chunk_id": id,
-            });
-
-            match sync_chunk_single(&id, &text, &metadata, config) {
-                Ok(()) => result.chunks_pushed += 1,
-                Err(e) => result.errors.push(format!("{}: {}", id, e)),
-            }
-        }
-        result
-    };
-
-    // Update sync state with newly synced chunks
-    for file in &new_files {
-        let id = file
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default();
-        state.synced_chunks.insert(id);
-    }
-    state.last_synced = Some(Utc::now());
-    state.total_pushes += result.chunks_pushed;
-    save_sync_state(&state)?;
-
-    Ok(result)
+    sync_new_chunk_paths(&all_files, config)
 }
 
+use crate::rank::{FuzzyResult, score_chunk_content};
+
 // ============================================================================
-// Search (utility)
+// High-level fast search via rmcp-memex library
 // ============================================================================
 
-/// Search memex for relevant chunks. Utility for testing/debugging.
+/// Fast keyword-first search using `rmcp_memex`'s published BM25 index and
+/// LanceDB document lookups.
 ///
-/// Runs: `rmcp-memex search -n <namespace> -q <query>`
-pub fn search_memex(query: &str, namespace: &str) -> Result<String> {
-    if !check_memex_available() {
-        bail!("rmcp-memex not found in PATH");
+/// This path stays fully library-backed and validates the embedding/runtime
+/// boundary up front, but it does not execute vector similarity search.
+pub async fn fast_memex_search(
+    query: &str,
+    limit: usize,
+    project_filter: Option<&str>,
+) -> Result<(Vec<FuzzyResult>, usize)> {
+    let truth = validate_semantic_index_compatibility(DEFAULT_MEMEX_NAMESPACE, None).await?;
+    let config = BM25Config::default()
+        .with_path(truth.bm25_path.to_string_lossy().to_string())
+        .with_read_only(true);
+    let index = BM25Index::new(&config).context("Failed to load BM25 index")?;
+
+    let raw_results = index.search(query, Some(DEFAULT_MEMEX_NAMESPACE), limit * 5)?;
+    let total_scanned = raw_results.len(); // Approximate
+
+    let storage = StorageManager::new_lance_only(&truth.db_path.to_string_lossy())
+        .await
+        .context("Failed to open LanceDB")?;
+
+    let mut results = Vec::new();
+    let project_lower = project_filter.map(|s| s.to_lowercase());
+
+    for (id, hit_namespace, score) in raw_results {
+        if results.len() >= limit {
+            break;
+        }
+
+        if let Ok(Some(doc)) = storage.get_document(&hit_namespace, &id).await {
+            // Apply project filter if any
+            let doc_project = doc
+                .metadata
+                .get("project")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            if let Some(ref pf) = project_lower {
+                if !doc_project.to_lowercase().contains(pf) {
+                    continue;
+                }
+            }
+
+            let kind = doc
+                .metadata
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let agent = doc
+                .metadata
+                .get("agent")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let date = doc
+                .metadata
+                .get("date")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let session_id = doc
+                .metadata
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let cwd = doc
+                .metadata
+                .get("cwd")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
+            // Score content to get density and matched lines
+            let chunk_score = score_chunk_content(&doc.document);
+
+            // Extract matching lines
+            let query_terms: Vec<&str> = query.split_whitespace().collect();
+            let matched_lines: Vec<String> = doc
+                .document
+                .lines()
+                .filter(|line| {
+                    let lower = line.to_lowercase();
+                    query_terms
+                        .iter()
+                        .any(|&term| lower.contains(&term.to_lowercase()))
+                })
+                .take(5)
+                .map(|s| s.trim().to_string())
+                .collect();
+
+            // Calculate final score using BM25 score and signal density
+            // BM25 score usually > 0. The higher the better.
+            let final_score = ((chunk_score.score as f32 * 5.0 + score * 10.0) as u8).min(100);
+
+            results.push(FuzzyResult {
+                file: format!("{}.md", id),
+                path: doc
+                    .metadata
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&format!("{}.md", id))
+                    .to_string(),
+                project: doc_project,
+                kind,
+                agent,
+                date,
+                score: final_score,
+                label: if final_score >= 80 {
+                    "HIGH".to_string()
+                } else if final_score >= 60 {
+                    "MEDIUM".to_string()
+                } else {
+                    "LOW".to_string()
+                },
+                density: chunk_score.density,
+                matched_lines,
+                session_id,
+                cwd,
+            });
+        }
     }
 
-    let output = Command::new("rmcp-memex")
-        .arg("search")
-        .arg("-n")
-        .arg(namespace)
-        .arg("-q")
-        .arg(query)
-        .output()
-        .context("Failed to run rmcp-memex search")?;
+    // Sort by score
+    results.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| b.date.cmp(&a.date)));
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("rmcp-memex search failed: {}", stderr.trim());
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    Ok((results, total_scanned))
 }
 
 // ============================================================================
@@ -384,13 +1419,365 @@ pub fn search_memex(query: &str, namespace: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rmcp_memex::ChromaDocument;
+    use serde_json::json;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_test_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("aicx-memex-{label}-{}-{nanos}", std::process::id()))
+    }
+
+    fn unique_test_namespace(label: &str) -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after epoch")
+            .as_nanos();
+        format!("aicx-test-{label}-{}-{nanos}", std::process::id())
+    }
 
     #[test]
     fn test_memex_config_default() {
         let config = MemexConfig::default();
-        assert_eq!(config.namespace, "ai-contexts");
+        assert_eq!(config.namespace, DEFAULT_MEMEX_NAMESPACE);
         assert!(config.db_path.is_none());
         assert!(config.batch_mode);
+        assert!(config.preprocess);
+    }
+
+    #[test]
+    fn test_resolve_runtime_truth_from_explicit_config() {
+        let root = unique_test_dir("runtime-truth");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create temp root");
+
+        let db_path = root.join("memex-db");
+        let config_path = root.join("config.toml");
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+db_path = "{}"
+
+[embeddings]
+required_dimension = 2560
+
+[[embeddings.providers]]
+name = "ollama-local"
+base_url = "http://localhost:11434"
+model = "qwen3-embedding:4b"
+"#,
+                db_path.display()
+            ),
+        )
+        .expect("write config");
+
+        let truth =
+            resolve_runtime_truth_from_config(None, Some(&config_path)).expect("resolve truth");
+        assert_eq!(truth.db_path, db_path);
+        assert_eq!(truth.embedding_model, "qwen3-embedding:4b");
+        assert_eq!(truth.embedding_dimension, 2560);
+        assert_eq!(truth.config_path.as_deref(), Some(config_path.as_path()));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_resolve_runtime_truth_without_config_matches_rmcp_memex_defaults() {
+        let truth = resolve_runtime_truth_from_config(None, None).expect("resolve truth");
+        let embedding_config = MlxConfig::from_env().to_embedding_config();
+
+        assert_eq!(truth.db_path, default_memex_db_path());
+        assert_eq!(truth.embedding_model, embedding_config.model_name());
+        assert_eq!(truth.embedding_dimension, embedding_config.dimension());
+        assert!(truth.config_path.is_none());
+    }
+
+    #[test]
+    fn test_resolve_runtime_truth_from_embeddings_config_keeps_rmcp_memex_dimension_default() {
+        let root = unique_test_dir("runtime-truth-embeddings-default");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create temp root");
+
+        let config_path = root.join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[embeddings]
+
+[[embeddings.providers]]
+name = "alt"
+base_url = "http://localhost:11434"
+model = "nomic-embed-text"
+"#,
+        )
+        .expect("write config");
+
+        let truth =
+            resolve_runtime_truth_from_config(None, Some(&config_path)).expect("resolve truth");
+
+        assert_eq!(truth.embedding_model, "nomic-embed-text");
+        assert_eq!(truth.embedding_dimension, DEFAULT_REQUIRED_DIMENSION);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_resolve_runtime_boundary_from_embeddings_config_keeps_reranker_truth() {
+        let root = unique_test_dir("runtime-boundary-reranker");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create temp root");
+
+        let config_path = root.join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[embeddings]
+required_dimension = 2560
+
+[[embeddings.providers]]
+name = "alt"
+base_url = "http://localhost:11434"
+model = "nomic-embed-text"
+
+[embeddings.reranker]
+base_url = "http://localhost:11435"
+model = "bge-reranker-v2"
+"#,
+        )
+        .expect("write config");
+
+        let (_truth, embedding_config) =
+            resolve_runtime_boundary_from_config(None, Some(&config_path))
+                .expect("resolve boundary");
+
+        assert_eq!(
+            embedding_config.reranker.base_url.as_deref(),
+            Some("http://localhost:11435")
+        );
+        assert_eq!(
+            embedding_config.reranker.model.as_deref(),
+            Some("bge-reranker-v2")
+        );
+        assert_eq!(embedding_config.reranker.endpoint, "/v1/rerank");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_resolve_runtime_truth_rejects_partial_provider_config() {
+        let root = unique_test_dir("runtime-truth-invalid-provider");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create temp root");
+
+        let config_path = root.join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[embeddings]
+
+[[embeddings.providers]]
+name = "alt"
+model = "nomic-embed-text"
+"#,
+        )
+        .expect("write config");
+
+        let err = resolve_runtime_truth_from_config(None, Some(&config_path))
+            .expect_err("partial provider config should be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("Failed to parse rmcp-memex config")
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_resolve_runtime_truth_from_legacy_mlx_config() {
+        let root = unique_test_dir("runtime-truth-mlx");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create temp root");
+
+        let config_path = root.join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[mlx]
+embedder_model = "nomic-embed-text"
+"#,
+        )
+        .expect("write config");
+
+        let truth =
+            resolve_runtime_truth_from_config(None, Some(&config_path)).expect("resolve truth");
+        let mut mlx_config = MlxConfig::from_env();
+        mlx_config.merge_file_config(MlxMergeOptions {
+            disabled: Some(false),
+            local_port: None,
+            dragon_url: None,
+            dragon_port: None,
+            embedder_model: Some("nomic-embed-text".to_string()),
+            reranker_model: None,
+            reranker_port_offset: None,
+        });
+        let embedding_config = mlx_config.to_embedding_config();
+
+        assert_eq!(truth.embedding_model, embedding_config.model_name());
+        assert_eq!(truth.embedding_dimension, embedding_config.dimension());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_semantic_reindex_command_quotes_display_guidance() {
+        let truth = MemexRuntimeTruth {
+            db_path: PathBuf::from("/tmp/memex store/lancedb"),
+            bm25_path: PathBuf::from("/tmp/memex store/bm25"),
+            embedding_model: "qwen3-embedding:4b".to_string(),
+            embedding_dimension: 2560,
+            config_path: None,
+        };
+
+        let command = semantic_reindex_command("team docs", &truth);
+
+        assert_eq!(
+            command,
+            "aicx memex-sync --reindex --namespace 'team docs' --db-path '/tmp/memex store/lancedb'"
+        );
+    }
+
+    #[test]
+    fn test_validate_semantic_index_compatibility_rejects_dimension_mismatch() {
+        let root = unique_test_dir("dimension-mismatch");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create temp root");
+
+        let db_path = root.join("memex-db");
+        let config_path = root.join("config.toml");
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+db_path = "{}"
+
+[embeddings]
+required_dimension = 2560
+
+[[embeddings.providers]]
+name = "ollama-local"
+base_url = "http://localhost:11434"
+model = "qwen3-embedding:4b"
+"#,
+                db_path.display()
+            ),
+        )
+        .expect("write config");
+
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let storage = StorageManager::new_lance_only(&db_path.to_string_lossy())
+                .await
+                .expect("open lance");
+            storage
+                .add_to_store(vec![ChromaDocument::new_flat(
+                    "legacy-doc".to_string(),
+                    DEFAULT_MEMEX_NAMESPACE.to_string(),
+                    vec![0.0; 4096],
+                    json!({"project": "VetCoders/ai-contexters"}),
+                    "legacy body".to_string(),
+                )])
+                .await
+                .expect("insert legacy document");
+        });
+
+        let err = runtime
+            .block_on(validate_semantic_index_compatibility_from_config(
+                DEFAULT_MEMEX_NAMESPACE,
+                Some(db_path.as_path()),
+                Some(config_path.as_path()),
+            ))
+            .expect_err("mismatch should be rejected");
+
+        assert!(is_compatibility_error(&err));
+        let message = err.to_string();
+        assert!(message.contains("qwen3-embedding:4b"));
+        assert!(message.contains("2560 dims"));
+        assert!(message.contains("4096 dims"));
+        assert!(message.contains(&config_path.to_string_lossy().to_string()));
+        assert!(message.contains("aicx memex-sync --reindex"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_validate_semantic_index_compatibility_rejects_stale_metadata_without_documents() {
+        let root = unique_test_dir("metadata-mismatch");
+        let namespace = unique_test_namespace("metadata-mismatch");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create temp root");
+
+        let metadata_path =
+            semantic_index_metadata_path(&namespace).expect("metadata path should resolve");
+        let _ = remove_path_if_exists(&metadata_path);
+
+        let db_path = root.join("memex-db");
+        let config_path = root.join("config.toml");
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+db_path = "{}"
+
+[embeddings]
+required_dimension = 2560
+
+[[embeddings.providers]]
+name = "ollama-local"
+base_url = "http://localhost:11434"
+model = "qwen3-embedding:4b"
+"#,
+                db_path.display()
+            ),
+        )
+        .expect("write config");
+
+        let stale_truth = MemexRuntimeTruth {
+            db_path: root.join("legacy-db"),
+            bm25_path: root.join("legacy-bm25"),
+            embedding_model: "legacy-embedding".to_string(),
+            embedding_dimension: 4096,
+            config_path: None,
+        };
+        save_semantic_index_metadata(&namespace, &stale_truth).expect("save stale metadata");
+
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let err = runtime
+            .block_on(validate_semantic_index_compatibility_from_config(
+                &namespace,
+                Some(db_path.as_path()),
+                Some(config_path.as_path()),
+            ))
+            .expect_err("stale metadata should force an explicit compatibility error");
+
+        assert!(is_compatibility_error(&err));
+        let message = err.to_string();
+        assert!(message.contains("qwen3-embedding:4b"));
+        assert!(message.contains("legacy-embedding"));
+        assert!(message.contains("Diverged fields:"));
+        assert!(message.contains("db_path"));
+        assert!(message.contains("bm25_path"));
+        assert!(message.contains("embedding_model"));
+        assert!(message.contains("embedding_dimension"));
+        assert!(message.contains(&config_path.to_string_lossy().to_string()));
+        assert!(message.contains("aicx memex-sync --reindex"));
+
+        let _ = remove_path_if_exists(&metadata_path);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -402,7 +1789,7 @@ mod tests {
         let state = MemexSyncState {
             last_synced: Some(Utc::now()),
             synced_chunks,
-            total_pushes: 42,
+            total_materialized: 42,
         };
 
         let json = serde_json::to_string_pretty(&state).unwrap();
@@ -412,7 +1799,22 @@ mod tests {
         assert_eq!(restored.synced_chunks.len(), 2);
         assert!(restored.synced_chunks.contains("chunk_001"));
         assert!(restored.synced_chunks.contains("chunk_002"));
-        assert_eq!(restored.total_pushes, 42);
+        assert_eq!(restored.total_materialized, 42);
+    }
+
+    #[test]
+    fn test_sync_state_deserializes_legacy_total_pushes() {
+        let restored: MemexSyncState = serde_json::from_str(
+            r#"{
+                "last_synced": null,
+                "synced_chunks": ["chunk_001"],
+                "total_pushes": 7
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(restored.total_materialized, 7);
+        assert!(restored.synced_chunks.contains("chunk_001"));
     }
 
     #[test]
@@ -431,25 +1833,101 @@ mod tests {
     #[test]
     fn test_sync_result_default() {
         let result = SyncResult::default();
-        assert_eq!(result.chunks_pushed, 0);
+        assert_eq!(result.chunks_materialized, 0);
         assert_eq!(result.chunks_skipped, 0);
+        assert_eq!(result.chunks_ignored, 0);
         assert!(result.errors.is_empty());
     }
 
     #[test]
-    fn test_parse_indexed_count() {
-        assert_eq!(parse_indexed_count("Indexed 42 documents"), Some(42));
-        assert_eq!(
-            parse_indexed_count("Processing... 10 chunks indexed"),
-            Some(10)
-        );
-        assert_eq!(parse_indexed_count("no numbers here"), None);
-        assert_eq!(parse_indexed_count(""), None);
+    fn test_chunk_metadata_from_header() {
+        let text = "[project: prview-rs | agent: claude | date: 2026-03-24]\n\nhello";
+        let metadata = chunk_metadata_from_header(text);
+
+        assert_eq!(metadata.get("project").unwrap(), "prview-rs");
+        assert_eq!(metadata.get("agent").unwrap(), "claude");
+        assert_eq!(metadata.get("date").unwrap(), "2026-03-24");
     }
 
     #[test]
-    fn test_check_memex_available() {
-        // Just verify it doesn't panic — actual result depends on system
-        let _ = check_memex_available();
+    fn test_chunk_metadata_for_memex_prefers_sidecar() {
+        let tmp = std::env::temp_dir().join(format!("ai-ctx-memex-sidecar-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        let chunk_path = tmp.join("chunk.txt");
+        fs::write(
+            &chunk_path,
+            "[project: wrong | agent: wrong | date: 2026-01-01]\n\nbody",
+        )
+        .unwrap();
+        fs::write(
+            chunk_sidecar_path(&chunk_path),
+            serde_json::to_vec_pretty(&crate::chunker::ChunkMetadataSidecar {
+                id: "chunk".to_string(),
+                project: "prview-rs".to_string(),
+                agent: "claude".to_string(),
+                date: "2026-03-24".to_string(),
+                session_id: "sess-1".to_string(),
+                cwd: Some("/Users/tester/workspaces/prview-rs".to_string()),
+                kind: crate::store::Kind::Conversations,
+                run_id: Some("mrbl-001".to_string()),
+                prompt_id: Some("api-redesign_20260327".to_string()),
+                agent_model: Some("gpt-5.4".to_string()),
+                started_at: Some("2026-03-27T10:00:00Z".to_string()),
+                completed_at: Some("2026-03-27T10:01:00Z".to_string()),
+                token_usage: Some(1234),
+                findings_count: Some(4),
+                workflow_phase: Some("implement".to_string()),
+                mode: Some("session-first".to_string()),
+                skill_code: Some("vc-workflow".to_string()),
+                framework_version: Some("2026-03".to_string()),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let metadata = chunk_metadata_for_memex(&chunk_path, "chunk", "body");
+        let object = metadata.as_object().unwrap();
+
+        assert_eq!(object.get("project").unwrap(), "prview-rs");
+        assert_eq!(object.get("agent").unwrap(), "claude");
+        assert_eq!(object.get("date").unwrap(), "2026-03-24");
+        assert_eq!(object.get("session_id").unwrap(), "sess-1");
+        assert_eq!(object.get("kind").unwrap(), "conversations");
+        assert_eq!(
+            object.get("cwd").unwrap(),
+            "/Users/tester/workspaces/prview-rs"
+        );
+        assert_eq!(object.get("run_id").unwrap(), "mrbl-001");
+        assert_eq!(object.get("prompt_id").unwrap(), "api-redesign_20260327");
+        assert_eq!(object.get("agent_model").unwrap(), "gpt-5.4");
+        assert_eq!(object.get("started_at").unwrap(), "2026-03-27T10:00:00Z");
+        assert_eq!(object.get("completed_at").unwrap(), "2026-03-27T10:01:00Z");
+        assert_eq!(object.get("token_usage").unwrap(), 1234);
+        assert_eq!(object.get("findings_count").unwrap(), 4);
+        assert_eq!(object.get("workflow_phase").unwrap(), "implement");
+        assert_eq!(object.get("mode").unwrap(), "session-first");
+        assert_eq!(object.get("skill_code").unwrap(), "vc-workflow");
+        assert_eq!(object.get("framework_version").unwrap(), "2026-03");
+        assert_eq!(
+            object.get("path").unwrap(),
+            &serde_json::Value::String(chunk_path.to_string_lossy().to_string())
+        );
+        assert_eq!(
+            object.get("content_hash").unwrap(),
+            &serde_json::Value::String(compute_content_hash("body"))
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_chunk_memex_record_includes_content_hash() {
+        let chunk_path = PathBuf::from("/tmp/ctx/chunk.md");
+        let record = chunk_memex_record(&chunk_path, "chunk", "body");
+
+        assert_eq!(record.id, "chunk");
+        assert_eq!(record.content_hash, compute_content_hash("body"));
     }
 }

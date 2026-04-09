@@ -1,17 +1,24 @@
 # AI Contexters
 
-Memory extraction + context distillation for AI agent sessions.
+Operator front door for agent session history.
 
-`aicx` turns local agent logs into:
-- a clean, deduped timeline,
-- chunked “agent-readable” context stored in `~/.ai-contexters/`,
-- optional `.ai-context/` artifacts for repo-level “bring new agent up to speed” workflows,
-- optional sync into memex (vector memory).
+`aicx` orchestrates a two-layer pipeline:
+
+1. **Canonical corpus** (`~/.aicx/`) — extract, deduplicate, chunk, and store
+   agent session logs as steerable markdown with frontmatter metadata.
+   This is ground truth. Built by extractors (`claude`, `codex`, `all`) and `store`.
+
+2. **Semantic materialization** (memex) — embed the canonical corpus into a
+   vector + BM25 index for retrieval by agents and MCP tools.
+   Built by `memex-sync`, or the `--memex` shortcut on any extractor.
+
+`aicx` is the orchestrator; memex is the retrieval kernel.
 
 Supported sources:
 - Claude Code: `~/.claude/projects/*/*.jsonl`
 - Codex: `~/.codex/history.jsonl`
 - Gemini CLI: `~/.gemini/tmp/<hash>/chats/session-*.json`
+- Gemini Antigravity direct extract: `~/.gemini/antigravity/conversations/<uuid>.pb` or `~/.gemini/antigravity/brain/<uuid>/`
 
 ## Install
 
@@ -52,17 +59,37 @@ cargo install --path . --locked --bin aicx --bin aicx-mcp
 
 ## Quickstart
 
-Store recent context from the last 4 hours. Extractor/store commands are quiet on stdout by default (`--emit none`), but still write chunked context into `~/.ai-contexters/`.
+### Layer 1 — build the canonical corpus
+
+Extract the last 4 hours into `~/.aicx/`. Extractors are quiet on stdout by default (`--emit none`).
 
 ```bash
-aicx all -H 4 --incremental
+aicx all -H 4 --incremental        # daily driver: watermark-tracked, skips already-processed entries
+aicx store -p MyProject -H 720     # store-first: full re-extraction, no watermark, good for backfills
 ```
 
-See what landed in the store:
+See what landed:
 
 ```bash
 aicx refs -H 4
 aicx refs -H 4 --emit paths
+```
+
+### Layer 2 — materialize into memex
+
+Materialization is operator-driven — nothing syncs automatically.
+You decide when to embed the canonical corpus into the memex retrieval
+kernel (vector + BM25):
+
+```bash
+aicx memex-sync              # first build or incremental update
+aicx memex-sync --reindex    # full rebuild (after model/dimension change)
+```
+
+Or do both layers in one shot:
+
+```bash
+aicx all -H 4 --incremental --memex
 ```
 
 Pipe one JSON payload (handy for automation):
@@ -71,24 +98,30 @@ Pipe one JSON payload (handy for automation):
 aicx all -H 4 --emit json | jq '.store_paths'
 ```
 
-Bootstrap a repo context (`.ai-context/`) and run an agent:
-
-```bash
-aicx init --agent codex --no-confirm --action "Map the repo and propose next steps"
-```
-
 ## What Gets Written Where
 
-Central store (always, for extractors):
-- `~/.ai-contexters/<project>/<date>/<time>_<agent>-<seq>.md`
-- `~/.ai-contexters/index.json`
-- `~/.ai-contexters/memex/chunks/` (when memex is used)
+### Layer 1 — canonical store (extractors, `store`)
+- `~/.aicx/store/<organization>/<repository>/<YYYY_MMDD>/<kind>/<agent>/<YYYY_MMDD>_<agent>_<session-id>_<chunk>.md`
+- `~/.aicx/non-repository-contexts/<YYYY_MMDD>/<kind>/<agent>/<YYYY_MMDD>_<agent>_<session-id>_<chunk>.md`
+- `~/.aicx/index.json`
 
-Repo-local init artifacts:
+### Layer 2 — semantic index (`memex-sync`, `--memex`) — operator-driven
+- `~/.aicx/memex/sync_state.json` (sync watermark — tracks what has been materialized)
+- LanceDB tables + Tantivy BM25 index (managed by rmcp-memex)
+
+Framework-owned repo-local context artifacts (not written by the `aicx` CLI itself):
 - `.ai-context/share/artifacts/SUMMARY.md`
 - `.ai-context/share/artifacts/TIMELINE.md`
 - `.ai-context/share/artifacts/TRIAGE.md`
-- `.ai-context/share/artifacts/prompts/`
+
+Store ignore contract:
+- Optional `~/.aicx/.aicxignore` excludes matching canonical chunk paths from memex materialization and steer indexing.
+- Patterns are matched relative to `~/.aicx/` using glob syntax, for example:
+
+```gitignore
+store/VetCoders/ai-contexters/**/reports/**
+!store/VetCoders/ai-contexters/**/reports/2026_0406_codex_important_001.md
+```
 
 ## Common Workflows
 
@@ -111,18 +144,50 @@ User-only mode (smaller output; excludes assistant + reasoning):
 aicx claude -p CodeScribe -H 48 --user-only
 ```
 
-Memex sync (vector memory):
+Steering retrieval (filter chunks by frontmatter metadata):
 
 ```bash
+aicx steer --run-id mrbl-001
+aicx steer --project ai-contexters --kind reports --date 2026-03-28
+aicx steer --agent claude --date 2026-03-20..2026-03-28
+```
+
+Semantic materialization — turning canonical chunks into an embedding index.
+Materialization is always operator-driven; nothing happens until you run it:
+
+```bash
+# First build: embed all unsynced canonical chunks into the memex index
+aicx memex-sync
+
+# Incremental: only new chunks since last sync (same command, watermark-tracked)
+aicx memex-sync
+
+# Full rebuild: wipe the index and re-embed everything
+# Use after an embedding model or dimension change
+aicx memex-sync --reindex
+
+# One-shot shortcut: extract + materialize in a single pass
 aicx all -H 48 --memex
-aicx memex-sync --namespace ai-contexts
+
+# Fine-grained: per-chunk upsert instead of batch JSONL import
+aicx memex-sync --per-chunk
+```
+
+Batch sync (default) uses metadata-rich JSONL import, preserving `project`, `agent`, `date`, `session_id`, and `kind`. Use `--per-chunk` only when you need single-document granularity.
+
+Single-session Gemini Antigravity extract (conversation artifacts first, explicit step-output fallback):
+
+```bash
+aicx extract --format gemini-antigravity \
+  ~/.gemini/antigravity/conversations/<uuid>.pb \
+  -o /tmp/antigravity-report.md
 ```
 
 ## Docs
 
 - `docs/ARCHITECTURE.md` (module map + data flows)
 - `docs/COMMANDS.md` (exact CLI reference + examples)
-- `docs/STORE_LAYOUT.md` (store + `.ai-context/` layouts)
+- `docs/STORE_LAYOUT.md` (store + framework-owned `.ai-context/` layouts)
 - `docs/REDACTION.md` (secret redaction, regex engine notes)
 - `docs/DISTILLATION.md` (chunking/distillation model + tuning ideas)
 - `docs/RELEASES.md` (release/distribution workflow + maintainer checklist)
@@ -130,7 +195,8 @@ aicx memex-sync --namespace ai-contexts
 ## Notes
 
 - Secrets are redacted by default. Disable only if you know what you’re doing: `--no-redact-secrets`.
-- `init` expects `loct` in `PATH` (or `LOCT_BIN=/full/path/to/loct`).
+- Framework integration expects `aicx` or `aicx-mcp` in `PATH`.
+- `aicx memex-sync` now emits live scan/embed/index progress on TTY stderr instead of going silent after preflight.
 
 ---
 
