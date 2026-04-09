@@ -16,7 +16,9 @@ For the shortest “it works” path, see `README.md`.
 
 - **Layer 1 commands** (`claude`, `codex`, `all`, `store`) write to the canonical store and print nothing to stdout unless you pass `--emit`.
 - **Layer 2** never runs automatically — you either call `memex-sync` explicitly or add `--memex` to an extractor.
-- `refs` prints a compact summary by default; use `--emit paths` for raw file paths.
+- `refs` is the active CLI inventory command for canonical chunks. It prints a compact summary by default; use `--emit paths` for raw file paths.
+- There is currently no `aicx rank` CLI subcommand. Ranking stays on the MCP surface as `aicx_rank`.
+- `init` is retired; framework bootstrap now lives in `/vc-init`.
 - `all --incremental` is the daily-driver watermark-tracked refresh path. `store` is store-first with no watermarks — best for backfills and targeted re-extraction.
 
 ## Global Options
@@ -347,6 +349,7 @@ aicx refs -H 72 -p CodeScribe
 
 There is currently no `aicx rank` CLI subcommand.
 
+`refs` is not deprecated; it remains the canonical CLI inventory/readiness surface.
 Ranking is exposed through the MCP surface as `aicx_rank`. For terminal use,
 prefer `aicx search`, `aicx refs --strict`, or the dashboard views until a CLI
 rank surface is intentionally reintroduced.

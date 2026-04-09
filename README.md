@@ -75,6 +75,11 @@ aicx refs -H 4
 aicx refs -H 4 --emit paths
 ```
 
+Surface contract:
+- `aicx refs` is the active CLI inventory command for canonical chunks.
+- There is currently no `aicx rank` CLI subcommand; ranking stays on the MCP surface as `aicx_rank`.
+- `aicx init` is retired; framework bootstrap now lives in `/vc-init`.
+
 ### Layer 2 — materialize into memex
 
 Materialization is operator-driven — nothing syncs automatically.
