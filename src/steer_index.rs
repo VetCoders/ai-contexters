@@ -1,3 +1,12 @@
+//! BM25 + LanceDB steer index for fast session retrieval.
+//!
+//! The steer index is a dual-layer search structure over the canonical store:
+//! a BM25 text index for keyword ranking and a LanceDB vector store for
+//! metadata-filtered recall.  Public functions delegate to the store base
+//! directory discovered at runtime, keeping callers free of path logic.
+//!
+//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use rmcp_memex::{
