@@ -17,6 +17,7 @@ pub struct ReportFrontmatterTelemetry {
     pub agent: Option<String>,
     pub run_id: Option<String>,
     pub prompt_id: Option<String>,
+    pub status: Option<String>,
     pub model: Option<String>,
     pub started_at: Option<String>,
     pub completed_at: Option<String>,
@@ -30,6 +31,7 @@ pub struct ReportFrontmatterSteering {
     #[serde(alias = "phase")]
     pub workflow_phase: Option<String>,
     pub mode: Option<String>,
+    #[serde(alias = "skill")]
     pub skill_code: Option<String>,
     pub framework_version: Option<String>,
 }
@@ -70,7 +72,7 @@ mod tests {
 
     #[test]
     fn parses_valid_frontmatter() {
-        let input = "---\nagent: codex\nrun_id: mrbl-001\nprompt_id: api-redesign_20260327\nphase: implement\nmode: session-first\nskill_code: vc-workflow\nframework_version: 2026-03\n---\n# Report\nContent here";
+        let input = "---\nagent: codex\nrun_id: mrbl-001\nprompt_id: api-redesign_20260327\nstatus: completed\nphase: implement\nmode: session-first\nskill: vc-workflow\nframework_version: 2026-03\n---\n# Report\nContent here";
         let (frontmatter, body) = parse(input);
         let frontmatter = frontmatter.unwrap();
 
@@ -80,6 +82,7 @@ mod tests {
             frontmatter.telemetry.prompt_id.as_deref(),
             Some("api-redesign_20260327")
         );
+        assert_eq!(frontmatter.telemetry.status.as_deref(), Some("completed"));
         assert_eq!(
             frontmatter.steering.workflow_phase.as_deref(),
             Some("implement")
