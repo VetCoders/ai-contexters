@@ -19,7 +19,7 @@
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{NaiveDate, Utc};
 use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -34,6 +34,7 @@ use ai_contexters::mcp::{self, McpTransport};
 use ai_contexters::memex::{self, MemexConfig, SyncProgress, SyncProgressPhase};
 use ai_contexters::output::{self, OutputConfig, OutputFormat, OutputMode, ReportMetadata};
 use ai_contexters::rank;
+use ai_contexters::reports_extractor::{self, ReportsExtractorConfig};
 use ai_contexters::sources::{self, ExtractionConfig};
 use ai_contexters::state::StateManager;
 use ai_contexters::store;
@@ -509,6 +510,49 @@ enum Commands {
         preview_chars: usize,
     },
 
+    /// Extract Vibecrafted workflow and marbles reports into a standalone HTML explorer.
+    ReportsExtractor {
+        /// Vibecrafted artifact root (default: ~/.vibecrafted/artifacts)
+        #[arg(long)]
+        artifacts_root: Option<PathBuf>,
+
+        /// Artifact organization bucket
+        #[arg(long, default_value = "VetCoders")]
+        org: String,
+
+        /// Repository bucket (defaults to the current directory name)
+        #[arg(long)]
+        repo: Option<String>,
+
+        /// Workflow filter (matches workflow label, skill code, run/prompt IDs, lane, and title)
+        #[arg(long)]
+        workflow: Option<String>,
+
+        /// Inclusive start date (YYYY-MM-DD or YYYY_MMDD)
+        #[arg(long)]
+        date_from: Option<String>,
+
+        /// Inclusive end date (YYYY-MM-DD or YYYY_MMDD)
+        #[arg(long)]
+        date_to: Option<String>,
+
+        /// Output HTML path
+        #[arg(short, long, default_value = "aicx-reports.html")]
+        output: PathBuf,
+
+        /// Optional JSON bundle output path for later import/merge
+        #[arg(long)]
+        bundle_output: Option<PathBuf>,
+
+        /// Document title
+        #[arg(long, default_value = "AI Contexters Report Explorer")]
+        title: String,
+
+        /// Max preview characters per record (0 = no truncation)
+        #[arg(long, default_value = "280")]
+        preview_chars: usize,
+    },
+
     /// Run a local dashboard server with live search and regeneration endpoints (layer 1).
     DashboardServe {
         /// Store root directory (default: ~/.aicx)
@@ -953,6 +997,31 @@ fn main() -> Result<()> {
             run_dashboard(DashboardRunArgs {
                 store_root,
                 output,
+                title,
+                preview_chars,
+            })?;
+        }
+        Some(Commands::ReportsExtractor {
+            artifacts_root,
+            org,
+            repo,
+            workflow,
+            date_from,
+            date_to,
+            output,
+            bundle_output,
+            title,
+            preview_chars,
+        }) => {
+            run_reports_extractor(ReportsExtractorRunArgs {
+                artifacts_root,
+                org,
+                repo,
+                workflow,
+                date_from,
+                date_to,
+                output,
+                bundle_output,
                 title,
                 preview_chars,
             })?;
@@ -2633,6 +2702,127 @@ fn run_dashboard(args: DashboardRunArgs) -> Result<()> {
 
     println!("{}", output_path.display());
     Ok(())
+}
+
+/// Build a standalone HTML explorer for Vibecrafted report artifacts.
+struct ReportsExtractorRunArgs {
+    artifacts_root: Option<PathBuf>,
+    org: String,
+    repo: Option<String>,
+    workflow: Option<String>,
+    date_from: Option<String>,
+    date_to: Option<String>,
+    output: PathBuf,
+    bundle_output: Option<PathBuf>,
+    title: String,
+    preview_chars: usize,
+}
+
+fn run_reports_extractor(args: ReportsExtractorRunArgs) -> Result<()> {
+    let artifacts_root = if let Some(path) = args.artifacts_root {
+        path
+    } else {
+        default_vibecrafted_artifacts_root()?
+    };
+    let repo = if let Some(repo) = args.repo {
+        repo
+    } else {
+        infer_repo_name_from_cwd()?
+    };
+    let date_from = parse_cli_date(args.date_from.as_deref(), "--date-from")?;
+    let date_to = parse_cli_date(args.date_to.as_deref(), "--date-to")?;
+    let date = match (date_from, date_to) {
+        (Some(from), Some(to)) => Some(format!(
+            "{}..{}",
+            from.format("%Y-%m-%d"),
+            to.format("%Y-%m-%d")
+        )),
+        (Some(from), None) => Some(from.format("%Y-%m-%d").to_string()),
+        (None, Some(to)) => Some(format!("..{}", to.format("%Y-%m-%d"))),
+        (None, None) => None,
+    };
+    let config = ReportsExtractorConfig {
+        artifacts_root: artifacts_root.clone(),
+        org: Some(args.org),
+        repo: repo.clone(),
+        date,
+        workflow: args.workflow,
+        agent: None,
+        status: None,
+        include_legacy: false,
+        title: args.title,
+        preview_chars: args.preview_chars,
+    };
+
+    let artifact = reports_extractor::build_reports_extractor(&config)?;
+    write_text_output(&args.output, &artifact.html, "report explorer HTML")?;
+    if let Some(bundle_output) = args.bundle_output.as_ref() {
+        write_text_output(
+            bundle_output,
+            &artifact.bundle_json,
+            "report explorer JSON bundle",
+        )?;
+    }
+
+    eprintln!("✓ Vibecrafted reports extracted");
+    eprintln!("  Repo: {}/{}", config.org.as_deref().unwrap_or("*"), repo);
+    eprintln!("  Artifacts: {}", artifacts_root.display());
+    eprintln!("  HTML: {}", args.output.display());
+    if let Some(bundle_output) = args.bundle_output {
+        eprintln!("  Bundle: {}", bundle_output.display());
+    }
+    eprintln!(
+        "  Stats: {} records, {} completed, {} incomplete, {} workflows",
+        artifact.stats.total_records,
+        artifact.stats.total_completed,
+        artifact.stats.total_incomplete,
+        artifact.stats.total_workflows
+    );
+    Ok(())
+}
+
+fn default_vibecrafted_artifacts_root() -> Result<PathBuf> {
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
+    Ok(home.join(".vibecrafted").join("artifacts"))
+}
+
+fn infer_repo_name_from_cwd() -> Result<String> {
+    let cwd = std::env::current_dir().context("Cannot determine current directory")?;
+    let repo = cwd
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("Could not infer --repo from the current directory"))?;
+    Ok(repo.to_string())
+}
+
+fn parse_cli_date(value: Option<&str>, flag_name: &str) -> Result<Option<NaiveDate>> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let formats = ["%Y-%m-%d", "%Y_%m%d"];
+    for format in formats {
+        if let Ok(date) = NaiveDate::parse_from_str(value, format) {
+            return Ok(Some(date));
+        }
+    }
+    Err(anyhow::anyhow!(
+        "Invalid {} value '{}'. Use YYYY-MM-DD or YYYY_MMDD.",
+        flag_name,
+        value
+    ))
+}
+
+fn write_text_output(path: &Path, content: &str, label: &str) -> Result<()> {
+    let mut validated = ai_contexters::sanitize::validate_write_path(path)?;
+    if let Some(parent) = validated.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create output directory: {}", parent.display()))?;
+    }
+    validated = ai_contexters::sanitize::validate_write_path(&validated)?;
+    fs::write(&validated, content)
+        .with_context(|| format!("Failed to write {}: {}", label, validated.display()))
 }
 
 #[cfg(test)]
