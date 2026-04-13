@@ -13,7 +13,7 @@
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Duration, TimeZone, Utc};
+use chrono::{DateTime, Duration, NaiveDate, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
@@ -184,6 +184,10 @@ struct GeminiThought {
     #[serde(default)]
     timestamp: Option<String>,
 }
+
+const JUNIE_SESSION_DIR_PREFIX: &str = "session-";
+const JUNIE_REQUEST_ID_PREFIX: &str = "prompt-";
+const JUNIE_EVENTS_FILENAME: &str = "events.jsonl";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GeminiAntigravityRecoveryMode {
@@ -2208,6 +2212,317 @@ fn parse_gemini_session(
     Ok(entries)
 }
 
+/// Extract timeline entries from a single Junie session event log.
+///
+/// Junie stores very noisy UI/runtime session traces under:
+/// `~/.junie/sessions/session-<YYMMDD>-<HHMMSS>-<id>/events.jsonl`
+///
+/// This extractor intentionally keeps only the conversational truth:
+/// - `UserPromptEvent.prompt`          -> `user`
+/// - `UserResponseEvent.prompt`        -> `user`
+/// - `ResultBlockUpdatedEvent.result`  -> `assistant`
+///
+/// The rest of the block/update noise (terminal snapshots, tool blocks, file
+/// views, status churn, env updates) is ignored.
+pub fn extract_junie_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
+    let path = sanitize::validate_read_path(path)?;
+    let file = sanitize::open_file_validated(&path)?;
+    let mut reader = BufReader::new(file);
+    let session_id = junie_session_id_from_path(&path);
+    let session_anchor = infer_junie_session_anchor(&path)
+        .or_else(|| infer_junie_file_anchor(&path))
+        .unwrap_or_else(Utc::now);
+
+    let mut entries = Vec::new();
+    let mut current_cwd: Option<String> = None;
+    let mut cursor = session_anchor;
+    let mut last_result_by_step: HashMap<String, String> = HashMap::new();
+    let mut line = String::new();
+
+    loop {
+        let bytes = reader.read_line(&mut line)?;
+        if bytes == 0 {
+            break;
+        }
+
+        if line.trim().is_empty() {
+            reset_stream_buffer(&mut line);
+            continue;
+        }
+
+        let interesting_kind = detect_junie_interesting_kind(&line);
+        if interesting_kind.is_none() {
+            reset_stream_buffer(&mut line);
+            continue;
+        }
+
+        let raw: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(value) => value,
+            Err(_) => {
+                reset_stream_buffer(&mut line);
+                continue;
+            }
+        };
+
+        match interesting_kind {
+            Some("UserPromptEvent") => {
+                let message = raw
+                    .get("prompt")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .map(ToOwned::to_owned);
+                let Some(message) = message else {
+                    reset_stream_buffer(&mut line);
+                    continue;
+                };
+
+                let candidate = raw
+                    .get("requestId")
+                    .and_then(|value| value.as_str())
+                    .and_then(parse_junie_request_timestamp);
+                let timestamp = next_junie_timestamp(&mut cursor, candidate);
+                if junie_timestamp_in_window(timestamp, config) {
+                    entries.push(TimelineEntry {
+                        timestamp,
+                        agent: "junie".to_string(),
+                        session_id: session_id.clone(),
+                        role: "user".to_string(),
+                        message,
+                        branch: None,
+                        cwd: current_cwd.clone(),
+                    });
+                }
+            }
+            Some("UserResponseEvent") => {
+                let message = raw
+                    .get("prompt")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .map(ToOwned::to_owned);
+                let Some(message) = message else {
+                    reset_stream_buffer(&mut line);
+                    continue;
+                };
+
+                let timestamp = next_junie_timestamp(&mut cursor, None);
+                if junie_timestamp_in_window(timestamp, config) {
+                    entries.push(TimelineEntry {
+                        timestamp,
+                        agent: "junie".to_string(),
+                        session_id: session_id.clone(),
+                        role: "user".to_string(),
+                        message,
+                        branch: None,
+                        cwd: current_cwd.clone(),
+                    });
+                }
+            }
+            Some("CurrentDirectoryUpdatedEvent") => {
+                current_cwd = raw
+                    .get("event")
+                    .and_then(|value| value.get("agentEvent"))
+                    .and_then(|value| value.get("currentDirectory"))
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .map(ToOwned::to_owned);
+            }
+            Some("ResultBlockUpdatedEvent") => {
+                if !config.include_assistant {
+                    reset_stream_buffer(&mut line);
+                    continue;
+                }
+
+                let agent_event = raw.get("event").and_then(|value| value.get("agentEvent"));
+                let step_id = agent_event
+                    .and_then(|value| value.get("stepId"))
+                    .and_then(|value| value.as_str())
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| format!("{session_id}:result"));
+                let message = agent_event
+                    .and_then(|value| value.get("result"))
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .map(ToOwned::to_owned);
+
+                let Some(message) = message else {
+                    reset_stream_buffer(&mut line);
+                    continue;
+                };
+
+                if last_result_by_step
+                    .get(&step_id)
+                    .is_some_and(|previous| previous == &message)
+                {
+                    reset_stream_buffer(&mut line);
+                    continue;
+                }
+                last_result_by_step.insert(step_id, message.clone());
+
+                let timestamp = next_junie_timestamp(&mut cursor, None);
+                if junie_timestamp_in_window(timestamp, config) {
+                    entries.push(TimelineEntry {
+                        timestamp,
+                        agent: "junie".to_string(),
+                        session_id: session_id.clone(),
+                        role: "assistant".to_string(),
+                        message,
+                        branch: None,
+                        cwd: current_cwd.clone(),
+                    });
+                }
+            }
+            _ => {}
+        }
+
+        reset_stream_buffer(&mut line);
+    }
+
+    entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    Ok(entries)
+}
+
+/// Extract timeline entries from all Junie session logs under `~/.junie/sessions/`.
+pub fn extract_junie(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
+    let sessions_dir = dirs::home_dir()
+        .context("No home dir")?
+        .join(".junie")
+        .join("sessions");
+
+    if !sessions_dir.exists() || !sessions_dir.is_dir() {
+        return Ok(vec![]);
+    }
+
+    let mut entries = Vec::new();
+    for path in walk_jsonl_files(&sessions_dir) {
+        if path.file_name().and_then(|name| name.to_str()) != Some(JUNIE_EVENTS_FILENAME) {
+            continue;
+        }
+
+        if let Some(modified) = infer_junie_file_anchor(&path) {
+            if modified < config.cutoff
+                && config
+                    .watermark
+                    .is_none_or(|watermark| modified <= watermark)
+            {
+                continue;
+            }
+        }
+
+        match extract_junie_file(&path, config) {
+            Ok(mut file_entries) => entries.append(&mut file_entries),
+            Err(_) => continue,
+        }
+    }
+
+    entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    Ok(entries)
+}
+
+fn detect_junie_interesting_kind(line: &str) -> Option<&'static str> {
+    if line.contains("\"UserPromptEvent\"") {
+        Some("UserPromptEvent")
+    } else if line.contains("\"UserResponseEvent\"") {
+        Some("UserResponseEvent")
+    } else if line.contains("\"CurrentDirectoryUpdatedEvent\"") {
+        Some("CurrentDirectoryUpdatedEvent")
+    } else if line.contains("\"ResultBlockUpdatedEvent\"") {
+        Some("ResultBlockUpdatedEvent")
+    } else {
+        None
+    }
+}
+
+fn reset_stream_buffer(buffer: &mut String) {
+    if buffer.capacity() > 16 * 1024 * 1024 {
+        *buffer = String::new();
+    } else {
+        buffer.clear();
+    }
+}
+
+fn junie_session_id_from_path(path: &Path) -> String {
+    path.parent()
+        .and_then(|parent| parent.file_name())
+        .or_else(|| path.file_stem())
+        .map(|segment| {
+            let raw = segment.to_string_lossy();
+            raw.strip_prefix(JUNIE_SESSION_DIR_PREFIX)
+                .unwrap_or(raw.as_ref())
+                .to_string()
+        })
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn infer_junie_session_anchor(path: &Path) -> Option<DateTime<Utc>> {
+    let session_dir = path.parent()?.file_name()?.to_str()?;
+    let suffix = session_dir.strip_prefix(JUNIE_SESSION_DIR_PREFIX)?;
+    let mut parts = suffix.split('-');
+    let compact_date = parts.next()?;
+    let compact_time = parts.next()?;
+    parse_compact_junie_timestamp(compact_date, compact_time)
+}
+
+fn infer_junie_file_anchor(path: &Path) -> Option<DateTime<Utc>> {
+    let metadata = fs::metadata(path).ok()?;
+    let modified = metadata.modified().ok()?;
+    Some(DateTime::<Utc>::from(modified))
+}
+
+fn parse_junie_request_timestamp(request_id: &str) -> Option<DateTime<Utc>> {
+    let suffix = request_id.strip_prefix(JUNIE_REQUEST_ID_PREFIX)?;
+    let mut parts = suffix.split('-');
+    let compact_date = parts.next()?;
+    let compact_time = parts.next()?;
+    parse_compact_junie_timestamp(compact_date, compact_time)
+}
+
+fn parse_compact_junie_timestamp(compact_date: &str, compact_time: &str) -> Option<DateTime<Utc>> {
+    if compact_date.len() != 6 || compact_time.len() != 6 {
+        return None;
+    }
+
+    let year = 2000 + compact_date[0..2].parse::<i32>().ok()?;
+    let month = compact_date[2..4].parse::<u32>().ok()?;
+    let day = compact_date[4..6].parse::<u32>().ok()?;
+    let hour = compact_time[0..2].parse::<u32>().ok()?;
+    let minute = compact_time[2..4].parse::<u32>().ok()?;
+    let second = compact_time[4..6].parse::<u32>().ok()?;
+
+    let naive = NaiveDate::from_ymd_opt(year, month, day)?.and_hms_opt(hour, minute, second)?;
+    Some(DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
+}
+
+fn next_junie_timestamp(
+    cursor: &mut DateTime<Utc>,
+    candidate: Option<DateTime<Utc>>,
+) -> DateTime<Utc> {
+    let next = match candidate {
+        Some(ts) if ts > *cursor => ts,
+        _ => *cursor + Duration::milliseconds(1),
+    };
+    *cursor = next;
+    next
+}
+
+fn junie_timestamp_in_window(timestamp: DateTime<Utc>, config: &ExtractionConfig) -> bool {
+    if timestamp < config.cutoff {
+        return false;
+    }
+
+    if config
+        .watermark
+        .is_some_and(|watermark| timestamp <= watermark)
+    {
+        return false;
+    }
+
+    true
+}
+
 // ============================================================================
 // Combined extractor
 // ============================================================================
@@ -2232,6 +2547,12 @@ pub fn extract_all(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
     match extract_gemini(config) {
         Ok(entries) => all.extend(entries),
         Err(e) => eprintln!("Gemini extraction warning: {}", e),
+    }
+
+    // Junie
+    match extract_junie(config) {
+        Ok(entries) => all.extend(entries),
+        Err(e) => eprintln!("Junie extraction warning: {}", e),
     }
 
     // Claude history.jsonl
@@ -2386,6 +2707,30 @@ pub fn list_available_sources() -> Result<Vec<SourceInfo>> {
                     size_bytes: total_size,
                 });
             }
+        }
+    }
+
+    // Junie sessions: ~/.junie/sessions/session-*/events.jsonl
+    let junie_sessions = home.join(".junie").join("sessions");
+    if junie_sessions.exists() && junie_sessions.is_dir() {
+        let files: Vec<PathBuf> = walk_jsonl_files(&junie_sessions)
+            .into_iter()
+            .filter(|path| {
+                path.file_name().and_then(|name| name.to_str()) == Some(JUNIE_EVENTS_FILENAME)
+            })
+            .collect();
+        let total_size: u64 = files
+            .iter()
+            .filter_map(|file| fs::metadata(file).ok())
+            .map(|metadata| metadata.len())
+            .sum();
+        if !files.is_empty() {
+            sources.push(SourceInfo {
+                agent: "junie".to_string(),
+                path: junie_sessions,
+                sessions: files.len(),
+                size_bytes: total_size,
+            });
         }
     }
 
@@ -2776,6 +3121,82 @@ mod tests {
         assert_eq!(entries[0].agent, "gemini");
         assert_eq!(entries[0].role, "user");
         assert_eq!(entries[1].role, "assistant");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_extract_junie_file_keeps_conversation_truth_and_dedups_results() {
+        let root = unique_test_dir("junie-direct");
+        let session_dir = root.join("session-260408-214715-abcd");
+        let tmp = session_dir.join("events.jsonl");
+        let _ = fs::remove_dir_all(&root);
+
+        let content = r#"{"kind":"SessionA2uxEvent","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"CurrentDirectoryUpdatedEvent","currentDirectory":"/tmp/repo"}}}
+{"kind":"UserPromptEvent","requestId":"prompt-260408-214823-br8l","prompt":"vc-init","presentablePrompt":"vc-init"}
+{"kind":"SessionA2uxEvent","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"ResultBlockUpdatedEvent","stepId":"step-1","cancelled":false,"result":"Initial plan","changes":[],"errorCode":"Submit"}}}
+{"kind":"SessionA2uxEvent","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"ResultBlockUpdatedEvent","stepId":"step-1","cancelled":false,"result":"Initial plan","changes":[],"errorCode":"Submit"}}}
+{"kind":"UserResponseEvent","prompt":"jedziemy","isChoice":true}
+{"kind":"SessionA2uxEvent","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"ResultBlockUpdatedEvent","stepId":"step-1","cancelled":false,"result":"Refined plan","changes":[],"errorCode":"Submit"}}}
+{"kind":"SessionA2uxEvent","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"TerminalBlockUpdatedEvent","command":"rg foo","output":"this should stay ignored"}}}"#;
+        write_file(&tmp, content);
+
+        let cutoff = Utc.timestamp_opt(0, 0).single().unwrap();
+        let config = ExtractionConfig {
+            project_filter: vec![],
+            cutoff,
+            include_assistant: true,
+            watermark: None,
+        };
+
+        let entries = extract_junie_file(&tmp, &config).unwrap();
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[0].agent, "junie");
+        assert_eq!(entries[0].session_id, "260408-214715-abcd");
+        assert_eq!(entries[0].role, "user");
+        assert_eq!(entries[0].message, "vc-init");
+        assert_eq!(entries[1].role, "assistant");
+        assert_eq!(entries[1].message, "Initial plan");
+        assert_eq!(entries[2].role, "user");
+        assert_eq!(entries[2].message, "jedziemy");
+        assert_eq!(entries[3].role, "assistant");
+        assert_eq!(entries[3].message, "Refined plan");
+        assert!(
+            entries
+                .windows(2)
+                .all(|pair| pair[0].timestamp < pair[1].timestamp)
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.cwd.as_deref() == Some("/tmp/repo"))
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_extract_junie_file_honors_user_only_mode() {
+        let root = unique_test_dir("junie-direct-user-only");
+        let session_dir = root.join("session-260408-214715-efgh");
+        let tmp = session_dir.join("events.jsonl");
+        let _ = fs::remove_dir_all(&root);
+
+        let content = r#"{"kind":"UserPromptEvent","requestId":"prompt-260408-214823-br8l","prompt":"hello","presentablePrompt":"hello"}
+{"kind":"SessionA2uxEvent","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"ResultBlockUpdatedEvent","stepId":"step-1","cancelled":false,"result":"assistant reply","changes":[],"errorCode":"Submit"}}}"#;
+        write_file(&tmp, content);
+
+        let config = ExtractionConfig {
+            project_filter: vec![],
+            cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+            include_assistant: false,
+            watermark: None,
+        };
+
+        let entries = extract_junie_file(&tmp, &config).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].role, "user");
+        assert_eq!(entries[0].message, "hello");
 
         let _ = fs::remove_dir_all(&root);
     }
