@@ -1333,6 +1333,7 @@ enum SourceFormat {
     Codex,
     Gemini,
     GeminiAntigravity,
+    Junie,
 }
 
 #[derive(Debug, Clone)]
@@ -2025,6 +2026,20 @@ fn source_format_hint(path: &Path, agent_hint: Option<&str>) -> Option<SourceFor
             }
             return None;
         }
+        Some("junie") => {
+            if extension.as_deref() == Some("jsonl")
+                && file_name == "events.jsonl"
+                && (path_str.contains("/.junie/sessions/")
+                    || path
+                        .parent()
+                        .and_then(|parent| parent.file_name())
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("session-")))
+            {
+                return Some(SourceFormat::Junie);
+            }
+            return None;
+        }
         Some(_) => return None,
         None => {}
     }
@@ -2040,6 +2055,18 @@ fn source_format_hint(path: &Path, agent_hint: Option<&str>) -> Option<SourceFor
         && (file_name.starts_with("session-") || path_str.contains("/.gemini/tmp/"))
     {
         return Some(SourceFormat::Gemini);
+    }
+
+    if extension.as_deref() == Some("jsonl")
+        && file_name == "events.jsonl"
+        && (path_str.contains("/.junie/sessions/")
+            || path
+                .parent()
+                .and_then(|parent| parent.file_name())
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("session-")))
+    {
+        return Some(SourceFormat::Junie);
     }
 
     if extension.as_deref() == Some("jsonl")
@@ -2158,6 +2185,7 @@ fn extract_entries_from_source(source: &ResolvedSource) -> Result<Vec<TimelineEn
         SourceFormat::GeminiAntigravity => {
             sources::extract_gemini_antigravity_file(&source.path, &config)
         }
+        SourceFormat::Junie => sources::extract_junie_file(&source.path, &config),
     }
 }
 

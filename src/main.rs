@@ -15,6 +15,7 @@
 //! - Codex: ~/.codex/history.jsonl
 //! - Gemini: ~/.gemini/tmp/<hash>/chats/session-*.json
 //! - Gemini Antigravity: ~/.gemini/antigravity/{conversations/<uuid>.pb,brain/<uuid>/}
+//! - Junie: ~/.junie/sessions/session-*/events.jsonl
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
@@ -102,6 +103,7 @@ enum ExtractInputFormat {
     Codex,
     Gemini,
     GeminiAntigravity,
+    Junie,
 }
 
 #[derive(Debug, Subcommand)]
@@ -251,7 +253,7 @@ enum Commands {
         conversation: bool,
     },
 
-    /// Extract + store from all agents (Claude + Codex + Gemini) into the canonical corpus (layer 1).
+    /// Extract + store from all agents (Claude + Codex + Gemini + Junie) into the canonical corpus (layer 1).
     ///
     /// The daily-driver command: runs each extractor, deduplicates, chunks, and
     /// writes steerable markdown to ~/.aicx/. With --incremental, uses per-source
@@ -331,7 +333,7 @@ enum Commands {
         #[command(flatten)]
         redaction: RedactionArgs,
 
-        /// Input format (agent): claude | codex | gemini | gemini-antigravity
+        /// Input format (agent): claude | codex | gemini | gemini-antigravity | junie
         #[arg(long, value_enum, alias = "input-format")]
         format: ExtractInputFormat,
 
@@ -878,7 +880,7 @@ fn main() -> Result<()> {
         }) => {
             let include_assistant = include_assistant_flag || !user_only;
             run_extraction(ExtractionParams {
-                agents: &["claude", "codex", "gemini"],
+                agents: &["claude", "codex", "gemini", "junie"],
                 project,
                 hours,
                 output_dir: output.as_deref(),
@@ -1183,6 +1185,7 @@ fn run_extract_file(
         ExtractInputFormat::GeminiAntigravity => {
             sources::extract_gemini_antigravity_file(&input, &config)?
         }
+        ExtractInputFormat::Junie => sources::extract_junie_file(&input, &config)?,
     };
 
     // Sort by timestamp (extractors should already do this).
@@ -1524,6 +1527,7 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
             "claude" => sources::extract_claude(&config)?,
             "codex" => sources::extract_codex(&config)?,
             "gemini" => sources::extract_gemini(&config)?,
+            "junie" => sources::extract_junie(&config)?,
             _ => Vec::new(),
         };
 
@@ -1845,7 +1849,8 @@ fn run_store(
         Some("claude") => vec!["claude"],
         Some("codex") => vec!["codex"],
         Some("gemini") => vec!["gemini"],
-        _ => vec!["claude", "codex", "gemini"],
+        Some("junie") => vec!["junie"],
+        _ => vec!["claude", "codex", "gemini", "junie"],
     };
 
     let config = ExtractionConfig {
@@ -1865,6 +1870,7 @@ fn run_store(
             "claude" => sources::extract_claude(&config)?,
             "codex" => sources::extract_codex(&config)?,
             "gemini" => sources::extract_gemini(&config)?,
+            "junie" => sources::extract_junie(&config)?,
             _ => Vec::new(),
         };
         eprintln!("  [{}] {} entries", ag, agent_entries.len());
@@ -3203,6 +3209,27 @@ mod tests {
         match cli.command {
             Some(Commands::Extract { format, .. }) => {
                 assert!(matches!(format, ExtractInputFormat::GeminiAntigravity));
+            }
+            _ => panic!("expected extract command"),
+        }
+    }
+
+    #[test]
+    fn extract_accepts_junie_format() {
+        let cli = Cli::try_parse_from([
+            "aicx",
+            "extract",
+            "--format",
+            "junie",
+            "/tmp/session/events.jsonl",
+            "-o",
+            "/tmp/report.md",
+        ])
+        .expect("extract command with junie should parse");
+
+        match cli.command {
+            Some(Commands::Extract { format, .. }) => {
+                assert!(matches!(format, ExtractInputFormat::Junie));
             }
             _ => panic!("expected extract command"),
         }
